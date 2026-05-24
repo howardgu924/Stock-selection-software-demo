@@ -1,0 +1,2 @@
+"""Stock picker MVP package."""
+
