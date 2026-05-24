@@ -9,6 +9,12 @@ The first version focuses only on market data:
 - Normalize output fields
 - Cache historical data in local SQLite
 
+Default data sources:
+
+- Historical daily prices: BaoStock
+- Realtime quotes: Sina quote API
+- AkShare remains available as a fallback provider
+
 ## Setup
 
 ```powershell
@@ -26,7 +32,7 @@ python examples\fetch_history.py --symbol 600519 --start 20240101 --end 20240501
 ## Check Realtime Quotes
 
 ```powershell
-python examples\check_realtime.py --symbols 600519,000001
+python examples\check_realtime.py --symbols "600519,000001"
 ```
 
 ## Historical Data Fields

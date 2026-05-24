@@ -5,17 +5,19 @@ from collections.abc import Iterable
 import pandas as pd
 
 from stock_picker.data.models import normalize_symbol
-from stock_picker.data.providers import AkShareProvider
+from stock_picker.data.providers import BaoStockProvider, SinaProvider
 from stock_picker.data.storage import SQLiteMarketDataStore
 
 
 class MarketDataService:
     def __init__(
         self,
-        provider: AkShareProvider | None = None,
+        history_provider: BaoStockProvider | None = None,
+        realtime_provider: SinaProvider | None = None,
         store: SQLiteMarketDataStore | None = None,
     ) -> None:
-        self.provider = provider or AkShareProvider()
+        self.history_provider = history_provider or BaoStockProvider()
+        self.realtime_provider = realtime_provider or SinaProvider()
         self.store = store or SQLiteMarketDataStore()
 
     def get_history(
@@ -33,7 +35,7 @@ class MarketDataService:
             if not cached.empty:
                 return cached
 
-        frame = self.provider.get_history(
+        frame = self.history_provider.get_history(
             symbol=symbol,
             start_date=start_date,
             end_date=end_date,
@@ -63,4 +65,4 @@ class MarketDataService:
     def get_realtime_quotes(
         self, symbols: Iterable[str] | None = None
     ) -> pd.DataFrame:
-        return self.provider.get_realtime_quotes(symbols=symbols)
+        return self.realtime_provider.get_realtime_quotes(symbols=symbols)

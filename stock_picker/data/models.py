@@ -32,3 +32,25 @@ def normalize_symbol(symbol: str) -> str:
 
 def symbol_code(symbol: str) -> str:
     return StockSymbol(symbol).code
+
+
+def baostock_symbol(symbol: str) -> str:
+    normalized = normalize_symbol(symbol)
+    if normalized.endswith(".SH"):
+        return f"sh.{symbol_code(normalized)}"
+    if normalized.endswith(".SZ"):
+        return f"sz.{symbol_code(normalized)}"
+    if normalized.endswith(".BJ"):
+        return f"bj.{symbol_code(normalized)}"
+    return normalized.lower()
+
+
+def sina_symbol(symbol: str) -> str:
+    normalized = normalize_symbol(symbol)
+    if normalized.endswith(".SH"):
+        return f"sh{symbol_code(normalized)}"
+    if normalized.endswith(".SZ"):
+        return f"sz{symbol_code(normalized)}"
+    if normalized.endswith(".BJ"):
+        return f"bj{symbol_code(normalized)}"
+    return symbol_code(normalized).lower()
