@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from stock_picker.data.models import StockInfo
+
 
 class SQLiteMarketDataStore:
     def __init__(self, db_path: str | Path = "data/market_data.sqlite3") -> None:
@@ -42,6 +44,27 @@ class SQLiteMarketDataStore:
                 rows,
             )
 
+    def save_stock_symbols(self, symbols: list[StockInfo]) -> None:
+        if not symbols:
+            return
+
+        rows = [
+            {"symbol": item.symbol, "code": item.code, "name": item.name}
+            for item in symbols
+        ]
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO stock_symbols (symbol, code, name, updated_at)
+                VALUES (:symbol, :code, :name, CURRENT_TIMESTAMP)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    code = excluded.code,
+                    name = excluded.name,
+                    updated_at = excluded.updated_at
+                """,
+                rows,
+            )
+
     def load_history(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         start = self._date_for_query(start_date)
         end = self._date_for_query(end_date)
@@ -58,6 +81,21 @@ class SQLiteMarketDataStore:
                 conn,
                 params=(symbol, start, end),
             )
+
+    def load_stock_symbols(self) -> list[StockInfo]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, code, name
+                FROM stock_symbols
+                ORDER BY symbol
+                """
+            ).fetchall()
+
+        return [
+            StockInfo(symbol=row[0], code=row[1], name=row[2])
+            for row in rows
+        ]
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -77,6 +115,16 @@ class SQLiteMarketDataStore:
                     change REAL,
                     turnover REAL,
                     PRIMARY KEY (symbol, date)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stock_symbols (
+                    symbol TEXT NOT NULL PRIMARY KEY,
+                    code TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )

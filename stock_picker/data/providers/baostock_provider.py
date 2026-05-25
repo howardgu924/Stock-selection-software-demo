@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, redirect_stdout
+from io import StringIO
+
 import pandas as pd
 
-from stock_picker.data.models import baostock_symbol, normalize_symbol
+from stock_picker.data.models import StockInfo, baostock_symbol, normalize_symbol
 
 
 class BaoStockProvider:
@@ -23,7 +26,7 @@ class BaoStockProvider:
         ]
     )
 
-    def __init__(self) -> None:
+    def __init__(self, quiet: bool = True) -> None:
         try:
             import baostock as bs
         except ImportError as exc:
@@ -31,6 +34,9 @@ class BaoStockProvider:
                 "BaoStock is not installed. Run: pip install -r requirements.txt"
             ) from exc
         self._bs = bs
+        self.quiet = quiet
+        self._session_depth = 0
+        self._logged_in = False
 
     def get_history(
         self,
@@ -43,11 +49,7 @@ class BaoStockProvider:
         if period != "daily":
             raise ValueError("BaoStockProvider currently supports only daily history.")
 
-        login = self._bs.login()
-        if login.error_code != "0":
-            raise RuntimeError(f"BaoStock login failed: {login.error_msg}")
-
-        try:
+        with self._login_session():
             result = self._bs.query_history_k_data_plus(
                 baostock_symbol(symbol),
                 self.FIELDS,
@@ -106,8 +108,68 @@ class BaoStockProvider:
                     "turnover",
                 ]
             ]
+
+    def get_trade_dates(self, start_date: str, end_date: str) -> list[str]:
+        with self._login_session():
+            result = self._bs.query_trade_dates(
+                start_date=self._format_date(start_date),
+                end_date=self._format_date(end_date),
+            )
+            if result.error_code != "0":
+                raise RuntimeError(f"BaoStock trade dates query failed: {result.error_msg}")
+
+            rows = []
+            while result.next():
+                row = dict(zip(result.fields, result.get_row_data(), strict=False))
+                if row.get("is_trading_day") == "1":
+                    rows.append(row["calendar_date"])
+            return rows
+
+    def get_stock_symbols(self) -> list[StockInfo]:
+        with self._login_session():
+            result = self._bs.query_all_stock()
+            if result.error_code != "0":
+                raise RuntimeError(f"BaoStock stock list query failed: {result.error_msg}")
+
+            rows = []
+            while result.next():
+                row = dict(zip(result.fields, result.get_row_data(), strict=False))
+                raw_code = row.get("code", "")
+                name = row.get("code_name", "")
+                trade_status = row.get("tradeStatus", "1")
+                if not raw_code or not name or trade_status != "1":
+                    continue
+                if not raw_code.startswith(("sh.", "sz.", "bj.")):
+                    continue
+                rows.append(StockInfo.from_code_name(raw_code.split(".", 1)[1], name))
+            return rows
+
+    @contextmanager
+    def _login_session(self):
+        should_login = self._session_depth == 0 and not self._logged_in
+        if should_login:
+            login = self._call_quietly(self._bs.login)
+            if login.error_code != "0":
+                raise RuntimeError(f"BaoStock login failed: {login.error_msg}")
+            self._logged_in = True
+
+        self._session_depth += 1
+        try:
+            yield
         finally:
-            self._bs.logout()
+            self._session_depth -= 1
+            if should_login:
+                self._call_quietly(self._bs.logout)
+                self._logged_in = False
+
+    def batch_session(self):
+        return self._login_session()
+
+    def _call_quietly(self, func):
+        if not self.quiet:
+            return func()
+        with redirect_stdout(StringIO()):
+            return func()
 
     @staticmethod
     def _format_date(value: str) -> str:

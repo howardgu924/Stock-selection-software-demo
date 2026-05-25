@@ -4,28 +4,22 @@ import argparse
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stock_picker.data import MarketDataService
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Check A-share realtime quotes.")
-    parser.add_argument(
-        "--symbols",
-        required=True,
-        help="Comma separated stock codes, e.g. 600519,000001.",
-    )
+    parser = argparse.ArgumentParser(description="List all A-share stock codes.")
+    parser.add_argument("--refresh", action="store_true", help="Force provider fetch")
     parser.add_argument("--debug", action="store_true", help="Show full Python traceback")
     args = parser.parse_args()
 
-    symbols = [item.strip() for item in args.symbols.split(",") if item.strip()]
-    if not symbols:
-        parser.error("--symbols must contain at least one stock code")
-
     try:
         service = MarketDataService()
-        frame = service.get_realtime_quotes(symbols=symbols)
+        symbols = service.get_stock_symbols(refresh=args.refresh)
     except Exception as exc:
         if args.debug:
             raise
@@ -33,7 +27,13 @@ def main() -> None:
         print("Run again with --debug to show the full Python traceback.", file=sys.stderr)
         sys.exit(1)
 
-    print(frame.head(20).to_string(index=False))
+    frame = pd.DataFrame(
+        [
+            {"symbol": item.symbol, "code": item.code, "name": item.name}
+            for item in symbols
+        ]
+    )
+    print(frame.head(50).to_string(index=False))
     print(f"\nrows={len(frame)}")
 
 

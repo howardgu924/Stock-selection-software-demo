@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
+from io import StringIO
 from typing import Iterable
 
 import pandas as pd
 
-from stock_picker.data.models import normalize_symbol, symbol_code
+from stock_picker.data.models import StockInfo, normalize_symbol, symbol_code
 
 
 class AkShareProvider:
@@ -104,6 +105,22 @@ class AkShareProvider:
             df = df[df["symbol"].isin(wanted)]
 
         return df[["symbol", *self._realtime_columns()]].reset_index(drop=True)
+
+    def get_stock_symbols(self) -> list[StockInfo]:
+        with redirect_stderr(StringIO()):
+            raw = self._ak.stock_info_a_code_name()
+        if raw.empty:
+            return []
+
+        df = raw.rename(columns={"\u4ee3\u7801": "code", "\u540d\u79f0": "name"})
+        missing = [column for column in ["code", "name"] if column not in df]
+        if missing:
+            raise ValueError(f"AkShare stock list response missing columns: {missing}")
+
+        return [
+            StockInfo.from_code_name(str(row.code).zfill(6), str(row.name))
+            for row in df[["code", "name"]].itertuples(index=False)
+        ]
 
     @staticmethod
     def _history_columns() -> list[str]:

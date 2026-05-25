@@ -54,3 +54,15 @@ def sina_symbol(symbol: str) -> str:
     if normalized.endswith(".BJ"):
         return f"bj{symbol_code(normalized)}"
     return symbol_code(normalized).lower()
+
+
+@dataclass(frozen=True)
+class StockInfo:
+    symbol: str
+    code: str
+    name: str
+
+    @classmethod
+    def from_code_name(cls, code: str, name: str) -> "StockInfo":
+        normalized = normalize_symbol(code)
+        return cls(symbol=normalized, code=symbol_code(normalized), name=name)
