@@ -2,46 +2,133 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping, Sequence
 
 import pandas as pd
 
+from stock_picker.data.indicators import add_technical_indicators
 from stock_picker.data.models import StockInfo, normalize_symbol
-from stock_picker.data.providers import AkShareProvider, BaoStockProvider, SinaProvider
+from stock_picker.data.providers import (
+    AkShareProvider,
+    BaoStockProvider,
+    JoinQuantProvider,
+    SinaProvider,
+)
 from stock_picker.data.storage import SQLiteMarketDataStore
 
 
+@dataclass(frozen=True)
+class DataSourceCallResult:
+    feature: str
+    source: str
+    fallback_from: str | None = None
+    fallback_errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DataSourceConfig:
+    history_source: str | None = None
+    realtime_source: str | None = None
+    minute_source: str | None = None
+    stock_source: str | None = None
+    market_source: str | None = None
+    fallback_sources: Mapping[str, Sequence[str]] | Sequence[str] | None = None
+
+    def source_for(self, feature: str) -> str | None:
+        return getattr(self, f"{feature}_source")
+
+    def fallbacks_for(self, feature: str) -> tuple[str, ...]:
+        fallbacks = self.fallback_sources
+        if fallbacks is None:
+            return ()
+        if isinstance(fallbacks, Mapping):
+            values = fallbacks.get(feature, ())
+        else:
+            values = fallbacks
+        if isinstance(values, str):
+            return (values,)
+        return tuple(values)
+
+    def has_routing(self, feature: str) -> bool:
+        return self.source_for(feature) is not None or bool(self.fallbacks_for(feature))
+
+
+class DataSourceError(RuntimeError):
+    pass
+
+
 class MarketDataService:
+    DEFAULT_SOURCES = {
+        "history": "baostock",
+        "realtime": "sina",
+        "minute": "baostock",
+        "stock": "akshare",
+        "market": "akshare",
+    }
+    SUPPORTED_SOURCES = {
+        "history": {"baostock", "akshare", "joinquant"},
+        "realtime": {"sina", "akshare"},
+        "minute": {"baostock", "akshare", "joinquant"},
+        "stock": {"akshare", "baostock", "joinquant"},
+        "market": {"akshare"},
+    }
+    PROVIDER_FACTORIES = {
+        "akshare": AkShareProvider,
+        "baostock": BaoStockProvider,
+        "joinquant": JoinQuantProvider,
+        "sina": SinaProvider,
+    }
+
     def __init__(
         self,
         history_provider: BaoStockProvider | None = None,
         realtime_provider: SinaProvider | None = None,
         stock_provider: AkShareProvider | None = None,
+        market_provider: AkShareProvider | None = None,
         store: SQLiteMarketDataStore | None = None,
+        data_source_config: DataSourceConfig | None = None,
     ) -> None:
-        self.history_provider = history_provider or BaoStockProvider()
-        self.realtime_provider = realtime_provider or SinaProvider()
-        self.stock_provider = stock_provider or AkShareProvider()
+        self.data_source_config = data_source_config or DataSourceConfig()
+        self._provider_cache: dict[str, object] = {}
+        self.last_source_results: dict[str, DataSourceCallResult] = {}
+        self.history_provider = history_provider or self._provider_for_feature("history")
+        self.realtime_provider = realtime_provider or self._provider_for_feature(
+            "realtime"
+        )
+        self.stock_provider = stock_provider or self._provider_for_feature("stock")
+        if market_provider is not None:
+            self.market_provider = market_provider
+        elif stock_provider is not None and not self.data_source_config.has_routing(
+            "market"
+        ):
+            self.market_provider = self.stock_provider
+        else:
+            self.market_provider = self._provider_for_feature("market")
         self.store = store or SQLiteMarketDataStore()
 
     def get_stock_symbols(self, refresh: bool = False) -> list[StockInfo]:
-        if not refresh:
+        routed = self.data_source_config.has_routing("stock")
+        if not refresh and not routed:
             cached = self.store.load_stock_symbols()
             if cached:
                 return cached
 
-        try:
-            symbols = self.stock_provider.get_stock_symbols()
-        except Exception as primary_exc:
+        if routed:
+            symbols = self._call_provider("stock", "get_stock_symbols")
+        else:
             try:
-                symbols = self.history_provider.get_stock_symbols()
-            except Exception as fallback_exc:
-                raise RuntimeError(
-                    "Stock symbol fetch failed. "
-                    f"AkShare: {primary_exc}; BaoStock fallback: {fallback_exc}"
-                ) from fallback_exc
+                symbols = self.stock_provider.get_stock_symbols()
+            except Exception as primary_exc:
+                try:
+                    symbols = self.history_provider.get_stock_symbols()
+                except Exception as fallback_exc:
+                    raise RuntimeError(
+                        "Stock symbol fetch failed. "
+                        f"AkShare: {primary_exc}; BaoStock fallback: {fallback_exc}"
+                    ) from fallback_exc
         self.store.save_stock_symbols(symbols)
         return symbols
 
@@ -53,8 +140,23 @@ class MarketDataService:
         period: str = "daily",
         adjust: str = "qfq",
         refresh: bool = False,
+        indicators: bool = False,
     ) -> pd.DataFrame:
         normalized = normalize_symbol(symbol)
+        routed = self.data_source_config.has_routing("history")
+        if routed:
+            frame = self._call_provider(
+                "history",
+                "get_history",
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                period=period,
+                adjust=adjust,
+            )
+            self.store.save_history(frame)
+            return add_technical_indicators(frame) if indicators else frame
+
         if refresh:
             frame = self.history_provider.get_history(
                 symbol=symbol,
@@ -64,7 +166,7 @@ class MarketDataService:
                 adjust=adjust,
             )
             self.store.save_history(frame)
-            return frame
+            return add_technical_indicators(frame) if indicators else frame
 
         cached = self.store.load_history(normalized, start_date, end_date)
         if cached.empty:
@@ -76,7 +178,7 @@ class MarketDataService:
                 adjust=adjust,
             )
             self.store.save_history(frame)
-            return frame
+            return add_technical_indicators(frame) if indicators else frame
 
         trade_dates = self.history_provider.get_trade_dates(start_date, end_date)
         cached_dates = set(cached["date"].tolist())
@@ -92,7 +194,8 @@ class MarketDataService:
             )
             self.store.save_history(frame)
 
-        return self.store.load_history(normalized, start_date, end_date)
+        frame = self.store.load_history(normalized, start_date, end_date)
+        return add_technical_indicators(frame) if indicators else frame
 
     def refresh_history(
         self,
@@ -114,7 +217,89 @@ class MarketDataService:
     def get_realtime_quotes(
         self, symbols: Iterable[str] | None = None
     ) -> pd.DataFrame:
+        if self.data_source_config.has_routing("realtime"):
+            return self._call_provider(
+                "realtime",
+                "get_realtime_quotes",
+                symbols=symbols,
+            )
         return self.realtime_provider.get_realtime_quotes(symbols=symbols)
+
+    def get_minute_history(
+        self,
+        symbol: str,
+        start_datetime: str,
+        end_datetime: str,
+        period: str = "5",
+        adjust: str = "",
+    ) -> pd.DataFrame:
+        if self.data_source_config.has_routing("minute"):
+            return self._call_provider(
+                "minute",
+                "get_minute_history",
+                symbol=symbol,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                period=period,
+                adjust=adjust,
+            )
+
+        if period in {"5", "15", "30", "60"} and hasattr(
+            self.history_provider, "get_minute_history"
+        ):
+            return self.history_provider.get_minute_history(
+                symbol=symbol,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                period=period,
+                adjust=adjust,
+            )
+
+        return self.market_provider.get_minute_history(
+            symbol=symbol,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            period=period,
+            adjust=adjust,
+        )
+
+    def get_boards(self, board_type: str) -> pd.DataFrame:
+        if self.data_source_config.has_routing("market"):
+            return self._call_provider("market", "get_boards", board_type=board_type)
+        return self.market_provider.get_boards(board_type=board_type)
+
+    def get_board_members(self, board_type: str, board: str) -> pd.DataFrame:
+        if self.data_source_config.has_routing("market"):
+            return self._call_provider(
+                "market",
+                "get_board_members",
+                board_type=board_type,
+                board=board,
+            )
+        return self.market_provider.get_board_members(
+            board_type=board_type,
+            board=board,
+        )
+
+    def get_board_minute_history(
+        self,
+        board_type: str,
+        board: str,
+        period: str = "5",
+    ) -> pd.DataFrame:
+        if self.data_source_config.has_routing("market"):
+            return self._call_provider(
+                "market",
+                "get_board_minute_history",
+                board_type=board_type,
+                board=board,
+                period=period,
+            )
+        return self.market_provider.get_board_minute_history(
+            board_type=board_type,
+            board=board,
+            period=period,
+        )
 
     def update_history(
         self,
@@ -251,3 +436,86 @@ class MarketDataService:
         path.parent.mkdir(parents=True, exist_ok=True)
         frame = pd.DataFrame(failures)
         frame.to_csv(path, mode="a", header=not path.exists(), index=False)
+
+    def _call_provider(self, feature: str, method_name: str, **kwargs):
+        source = self.data_source_config.source_for(feature) or self.DEFAULT_SOURCES[
+            feature
+        ]
+        candidates = (
+            self._normalize_source(source),
+            *(
+                self._normalize_source(item)
+                for item in self.data_source_config.fallbacks_for(feature)
+            ),
+        )
+        errors: list[str] = []
+
+        for index, candidate in enumerate(candidates):
+            try:
+                provider = self._provider_for_source(feature, candidate)
+                method = getattr(provider, method_name, None)
+                if method is None:
+                    raise DataSourceError(
+                        f"{candidate} does not support {feature} data."
+                    )
+                result = method(**kwargs)
+            except Exception as exc:
+                errors.append(f"{candidate}: {exc}")
+                continue
+
+            self.last_source_results[feature] = DataSourceCallResult(
+                feature=feature,
+                source=candidate,
+                fallback_from=candidates[0] if index > 0 else None,
+                fallback_errors=tuple(errors),
+            )
+            return result
+
+        raise DataSourceError(
+            self._format_source_error(
+                feature=feature,
+                primary=candidates[0],
+                fallbacks=candidates[1:],
+                errors=errors,
+            )
+        )
+
+    def _provider_for_feature(self, feature: str):
+        source = self.data_source_config.source_for(feature) or self.DEFAULT_SOURCES[
+            feature
+        ]
+        return self._provider_for_source(feature, source)
+
+    def _provider_for_source(self, feature: str, source: str):
+        normalized = self._normalize_source(source)
+        supported = self.SUPPORTED_SOURCES[feature]
+        if normalized not in supported:
+            raise DataSourceError(
+                f"{normalized} does not support {feature} data. "
+                f"Supported sources: {', '.join(sorted(supported))}"
+            )
+
+        provider = self._provider_cache.get(normalized)
+        if provider is None:
+            provider = self.PROVIDER_FACTORIES[normalized]()
+            self._provider_cache[normalized] = provider
+        return provider
+
+    @staticmethod
+    def _normalize_source(source: str) -> str:
+        return source.strip().lower()
+
+    @staticmethod
+    def _format_source_error(
+        feature: str,
+        primary: str,
+        fallbacks: Sequence[str],
+        errors: Sequence[str],
+    ) -> str:
+        fallback_text = ", ".join(fallbacks) if fallbacks else "none configured"
+        return (
+            f"{feature} data fetch failed. "
+            f"Selected source: {primary}. "
+            f"Fallback sources: {fallback_text}. "
+            f"Errors: {'; '.join(errors)}"
+        )

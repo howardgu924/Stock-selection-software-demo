@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from stock_picker.data import MarketDataService
+from stock_picker.data import DataSourceConfig, MarketDataService
 
 
 def main() -> None:
@@ -25,6 +25,11 @@ def main() -> None:
     parser.add_argument("--start", required=True, help="Start date, e.g. 20240101")
     parser.add_argument("--end", required=True, help="End date, e.g. 20240501")
     parser.add_argument("--refresh", action="store_true", help="Force provider fetch")
+    parser.add_argument(
+        "--indicators",
+        action="store_true",
+        help="Add MA5, MA10, MA30 and MACD columns to single-stock output",
+    )
     parser.add_argument(
         "--refresh-symbols",
         action="store_true",
@@ -51,11 +56,29 @@ def main() -> None:
         default=50,
         help="Print batch progress every N stocks",
     )
+    parser.add_argument(
+        "--source",
+        choices=["baostock", "akshare", "joinquant"],
+        help="History data source. Defaults to the current BaoStock workflow.",
+    )
+    parser.add_argument(
+        "--fallback",
+        action="append",
+        choices=["baostock", "akshare", "joinquant"],
+        default=[],
+        help="Explicit fallback history source. Can be provided more than once.",
+    )
     parser.add_argument("--debug", action="store_true", help="Show full Python traceback")
     args = parser.parse_args()
 
     try:
-        service = MarketDataService()
+        service = MarketDataService(
+            data_source_config=_data_source_config(
+                feature="history",
+                source=args.source,
+                fallbacks=args.fallback,
+            )
+        )
         progress_callback = _progress_printer(args.progress_every)
         if args.all:
             frame = service.update_all_history(
@@ -87,7 +110,9 @@ def main() -> None:
                 start_date=args.start,
                 end_date=args.end,
                 refresh=args.refresh,
+                indicators=args.indicators,
             )
+        _print_source_result(service, "history")
     except Exception as exc:
         if args.debug:
             raise
@@ -120,6 +145,30 @@ def _progress_printer(every: int):
             print(message, flush=True)
 
     return print_progress
+
+
+def _data_source_config(
+    feature: str,
+    source: str | None,
+    fallbacks: list[str],
+) -> DataSourceConfig | None:
+    if not source and not fallbacks:
+        return None
+    return DataSourceConfig(
+        history_source=source if feature == "history" else None,
+        fallback_sources={feature: fallbacks},
+    )
+
+
+def _print_source_result(service: MarketDataService, feature: str) -> None:
+    result = service.last_source_results.get(feature)
+    if result is None or result.fallback_from is None:
+        return
+    print(
+        f"Warning: {feature} source {result.fallback_from} failed; "
+        f"used fallback {result.source}. Errors: {'; '.join(result.fallback_errors)}",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

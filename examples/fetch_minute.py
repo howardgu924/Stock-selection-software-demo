@@ -4,27 +4,47 @@ import argparse
 import sys
 from pathlib import Path
 
-import pandas as pd
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stock_picker.data import DataSourceConfig, MarketDataService
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="List all A-share stock codes.")
-    parser.add_argument("--refresh", action="store_true", help="Force provider fetch")
+    parser = argparse.ArgumentParser(description="Fetch A-share minute data.")
+    parser.add_argument("--symbol", required=True, help="Stock code, e.g. 600519")
+    parser.add_argument(
+        "--start",
+        required=True,
+        help='Start datetime, e.g. "2024-05-01 09:30:00"',
+    )
+    parser.add_argument(
+        "--end",
+        required=True,
+        help='End datetime, e.g. "2024-05-01 15:00:00"',
+    )
+    parser.add_argument(
+        "--period",
+        default="5",
+        choices=["1", "5", "15", "30", "60"],
+        help="Minute period",
+    )
+    parser.add_argument(
+        "--adjust",
+        default="",
+        choices=["", "qfq", "hfq"],
+        help="Adjustment for stock minute data",
+    )
     parser.add_argument(
         "--source",
-        choices=["akshare", "baostock", "joinquant"],
-        help="Stock list data source. Defaults to the current AkShare workflow.",
+        choices=["baostock", "akshare", "joinquant"],
+        help="Minute data source. Defaults to the current provider workflow.",
     )
     parser.add_argument(
         "--fallback",
         action="append",
-        choices=["akshare", "baostock", "joinquant"],
+        choices=["baostock", "akshare", "joinquant"],
         default=[],
-        help="Explicit fallback stock list source. Can be provided more than once.",
+        help="Explicit fallback minute data source. Can be provided more than once.",
     )
     parser.add_argument("--debug", action="store_true", help="Show full Python traceback")
     args = parser.parse_args()
@@ -33,8 +53,14 @@ def main() -> None:
         service = MarketDataService(
             data_source_config=_data_source_config(args.source, args.fallback)
         )
-        symbols = service.get_stock_symbols(refresh=args.refresh)
-        _print_source_result(service, "stock")
+        frame = service.get_minute_history(
+            symbol=args.symbol,
+            start_datetime=args.start,
+            end_datetime=args.end,
+            period=args.period,
+            adjust=args.adjust,
+        )
+        _print_source_result(service, "minute")
     except Exception as exc:
         if args.debug:
             raise
@@ -42,13 +68,7 @@ def main() -> None:
         print("Run again with --debug to show the full Python traceback.", file=sys.stderr)
         sys.exit(1)
 
-    frame = pd.DataFrame(
-        [
-            {"symbol": item.symbol, "code": item.code, "name": item.name}
-            for item in symbols
-        ]
-    )
-    print(frame.head(50).to_string(index=False))
+    print(frame.tail(20).to_string(index=False))
     print(f"\nrows={len(frame)}")
 
 
@@ -56,8 +76,8 @@ def _data_source_config(source: str | None, fallbacks: list[str]) -> DataSourceC
     if not source and not fallbacks:
         return None
     return DataSourceConfig(
-        stock_source=source,
-        fallback_sources={"stock": fallbacks},
+        minute_source=source,
+        fallback_sources={"minute": fallbacks},
     )
 
 
