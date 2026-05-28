@@ -245,6 +245,101 @@ signal bar, then executes at the first available afternoon minute-bar open.
 `--warmup-days` reads earlier daily bars only for channel/indicator state; the
 equity curve and performance summary still start at `--start`.
 
+## Full Turtle System
+
+`examples/run_strategy.py --strategy turtle` remains a lightweight 20-day
+breakout signal list. For the complete Turtle Trading state machine, use
+`examples/run_turtle_system.py` and `examples/backtest_turtle_system.py`.
+
+The full turtle system supports S1 `20/10` and S2 `55/20`, ATR/N based unit
+sizing, A-share 100-share lots, `0.5N` pyramiding up to four units, `2N` hard
+stops, channel exits, and the S1 profitable-exit skip rule. It is long-only
+and designed for manual A-share execution assistance.
+
+Run current/as-of signals and an execution plan:
+
+```powershell
+.\.venv\Scripts\python.exe examples\run_turtle_system.py --symbols "600519,000001,600036" --cash 5000 --as-of 20260528 --signals-output data\turtle_system_signals.csv --plan-output data\turtle_system_plan.csv
+```
+
+Run a state-machine backtest:
+
+```powershell
+.\.venv\Scripts\python.exe examples\backtest_turtle_system.py --symbols "600519,000001,600036" --start 20260228 --end 20260527 --cash 100000 --output data\turtle_system_summary.csv --equity-output data\turtle_system_equity.csv --trades-output data\turtle_system_trades.csv --positions-output data\turtle_system_positions.csv --drawdowns-output data\turtle_system_drawdowns.csv --symbol-pnl-output data\turtle_system_symbol_pnl.csv
+```
+
+Run a simple robustness sweep:
+
+```powershell
+.\.venv\Scripts\python.exe examples\backtest_turtle_system.py --symbols "600519,000001,600036" --start 20260228 --end 20260527 --cash 100000 --sweep-risk-pct "0.005,0.01,0.02" --sweep-slippage-rate "0,0.002" --sweep-s1-entry "20,25" --sweep-output data\turtle_system_sweep.csv
+```
+
+## Plan Manual Execution
+
+Strategy signals are not always executable. For example, a stock can break out
+and close at its limit-up price, but a manual trader may not be able to buy it.
+Use the execution planner to combine strategy output with realtime quotes:
+
+```powershell
+.\.venv\Scripts\python.exe examples\plan_execution.py --signals data\strategy_turtle.csv --cash 5000 --next-day-premium 0.02 --output data\execution_plan.csv
+```
+
+The planner identifies limit-up buy signals and returns multiple options:
+
+- `buy_now`: executable under the current quote, cash, volume limit, and lot
+  rules.
+- `queue_limit_up`: buy signal exists but the stock is at limit-up; queue only
+  if you accept uncertain fill.
+- `buy_next_day_below_limit`: fallback plan for a limit-up signal; buy next day
+  only below the generated `next_day_max_price`.
+- `switch_alternative`: fallback to the best executable alternative signal.
+- `skip_insufficient_cash`: signal exists but cash is not enough for one lot.
+- `skip_volume_limit`: suggested shares exceed the configured quote-volume
+  participation cap.
+
+Limit-up rules are approximate and board-aware: main board `10%`, STAR/ChiNext
+`20%`, Beijing-style codes `30%`, and ST names `5%`.
+
+## Manual Portfolio Journal
+
+Use the journal when trades are executed manually rather than by the program.
+It records principal, cash, positions, average cost, target sell price,
+strategy/system metadata, signal/execution dates, realized P&L, win rate,
+profit/loss ratio, and average holding days.
+
+Initialize an account:
+
+```powershell
+.\.venv\Scripts\python.exe examples\portfolio_journal.py init --principal 5000
+```
+
+Record a buy:
+
+```powershell
+.\.venv\Scripts\python.exe examples\portfolio_journal.py buy --symbol 600172 --name "Huanghe Xuanfeng" --price 14.60 --shares 300 --target-sell-price 16.00 --strategy turtle_system --system S1 --entry-reason "20-day breakout" --signal-date 2026-05-28 --execution-date 2026-05-28
+```
+
+Record a buy from an execution plan while still confirming actual price and
+shares manually:
+
+```powershell
+.\.venv\Scripts\python.exe examples\portfolio_journal.py buy --from-plan data\turtle_system_plan.csv --symbol 600172 --price 14.60 --shares 300
+```
+
+Record a sell:
+
+```powershell
+.\.venv\Scripts\python.exe examples\portfolio_journal.py sell --symbol 600172 --price 15.20 --shares 300 --exit-reason "channel exit" --execution-date 2026-06-10
+```
+
+Print account status, optionally marking open positions to market:
+
+```powershell
+.\.venv\Scripts\python.exe examples\portfolio_journal.py summary --mark 600172=15.20
+.\.venv\Scripts\python.exe examples\portfolio_journal.py positions
+.\.venv\Scripts\python.exe examples\portfolio_journal.py trades
+```
+
 ## List A-Share Symbols
 
 ```powershell

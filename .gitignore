@@ -9,4 +9,5 @@ data/*.sqlite3
 data/*.db
 data/*.csv
 data/*.txt
+data/user/
 .tools/
