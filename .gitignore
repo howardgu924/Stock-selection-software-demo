@@ -8,4 +8,5 @@ venv/
 data/*.sqlite3
 data/*.db
 data/*.csv
+data/*.txt
 .tools/

@@ -21,9 +21,11 @@ class FakeHistoryProvider:
         self,
         trade_dates: list[str] | None = None,
         failing_symbols: set[str] | None = None,
+        fail_trade_dates: bool = False,
     ) -> None:
         self.trade_dates = trade_dates or []
         self.failing_symbols = failing_symbols or set()
+        self.fail_trade_dates = fail_trade_dates
         self.history_calls: list[tuple[str, str, str]] = []
 
     def get_history(
@@ -63,6 +65,8 @@ class FakeHistoryProvider:
         )
 
     def get_trade_dates(self, start_date: str, end_date: str) -> list[str]:
+        if self.fail_trade_dates:
+            raise RuntimeError("trade calendar unavailable")
         start = self._date_for_query(start_date)
         end = self._date_for_query(end_date)
         return [date for date in self.trade_dates if start <= date <= end]
@@ -100,6 +104,132 @@ class FakeStockProvider:
 
 
 class FakeMarketProvider(FakeStockProvider):
+    def get_market_snapshot(self, symbols=None) -> pd.DataFrame:
+        frame = pd.DataFrame(
+            [
+                {
+                    "symbol": "600519.SH",
+                    "code": "600519",
+                    "name": "Kweichow Moutai",
+                    "price": 10.0,
+                    "pct_chg": 1.0,
+                    "change": 0.1,
+                    "volume": 100.0,
+                    "amount": 1000.0,
+                    "high": 11.0,
+                    "low": 9.0,
+                    "open": 10.0,
+                    "prev_close": 9.9,
+                    "turnover": 0.5,
+                    "market_cap": 2_500_000_000.0,
+                    "pe_dynamic": 20.0,
+                    "pb": 1.5,
+                },
+                {
+                    "symbol": "000001.SZ",
+                    "code": "000001",
+                    "name": "Ping An Bank",
+                    "price": 8.0,
+                    "pct_chg": 0.5,
+                    "change": 0.04,
+                    "volume": 200.0,
+                    "amount": 1600.0,
+                    "high": 8.2,
+                    "low": 7.8,
+                    "open": 7.9,
+                    "prev_close": 7.96,
+                    "turnover": 0.7,
+                    "market_cap": 3_000_000_000.0,
+                    "pe_dynamic": 10.0,
+                    "pb": 0.8,
+                },
+            ]
+        )
+        if symbols:
+            wanted = set(symbols)
+            frame = frame[frame["symbol"].isin(wanted)]
+        return frame.reset_index(drop=True)
+
+    def get_financial_indicators(
+        self,
+        symbol: str,
+        start_year: str = "1900",
+    ) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "date": "2024-12-31",
+                    "current_ratio": 1.5,
+                    "debt_asset_ratio": 60.0,
+                    "total_assets": 1000.0,
+                }
+            ]
+        )
+
+    def get_valuation_history(
+        self,
+        symbol: str,
+        indicator: str = "总市值",
+        period: str = "近一年",
+    ) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "indicator": indicator,
+                    "date": "2024-12-31",
+                    "value": 25.0,
+                }
+            ]
+        )
+
+    def get_index_members(self, index_code: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "index_code": index_code,
+                    "symbol": "600519.SH",
+                    "code": "600519",
+                    "name": "Kweichow Moutai",
+                    "weight": 10.0,
+                },
+                {
+                    "index_code": index_code,
+                    "symbol": "000001.SZ",
+                    "code": "000001",
+                    "name": "Ping An Bank",
+                    "weight": 8.0,
+                },
+            ]
+        )
+
+    def get_index_history(
+        self,
+        index_code: str,
+        start_date: str,
+        end_date: str,
+        period: str = "daily",
+    ) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "index_code": index_code,
+                    "date": "2024-01-02",
+                    "open": 100.0,
+                    "close": 101.0,
+                    "high": 102.0,
+                    "low": 99.0,
+                    "volume": 1.0,
+                    "amount": 1.0,
+                    "amplitude": None,
+                    "pct_chg": None,
+                    "change": None,
+                    "turnover": None,
+                }
+            ]
+        )
+
     def get_minute_history(
         self,
         symbol: str,
@@ -286,6 +416,24 @@ def test_get_history_fetches_only_missing_trade_dates() -> None:
     ]
 
 
+def test_get_history_returns_cached_rows_when_trade_calendar_fails() -> None:
+    tmp_path = workspace_path("cached-history-calendar-failure")
+    store = SQLiteMarketDataStore(tmp_path / "market.sqlite3")
+    seed_provider = FakeHistoryProvider(trade_dates=["2024-01-02", "2024-01-03"])
+    store.save_history(seed_provider.get_history("600519", "2024-01-02", "2024-01-03"))
+    provider = FakeHistoryProvider(fail_trade_dates=True)
+    service = MarketDataService(
+        history_provider=provider,
+        stock_provider=FakeStockProvider(),
+        store=store,
+    )
+
+    frame = service.get_history("600519", "20240102", "20240103")
+
+    assert provider.history_calls == []
+    assert frame["date"].tolist() == ["2024-01-02", "2024-01-03"]
+
+
 def test_update_history_skips_failures_and_logs_errors() -> None:
     tmp_path = workspace_path("history-errors")
     store = SQLiteMarketDataStore(tmp_path / "market.sqlite3")
@@ -352,11 +500,21 @@ def test_market_provider_minute_and_board_methods_are_exposed() -> None:
     boards = service.get_boards("industry")
     members = service.get_board_members("industry", "BK1036")
     board_minute = service.get_board_minute_history("industry", "BK1036")
+    snapshot = service.get_market_snapshot(symbols=["600519.SH"])
+    financial = service.get_financial_indicators("600519")
+    index_members = service.get_index_members("399951")
+    valuation = service.get_valuation_history("600519")
+    index_history = service.get_index_history("000001", "20240102", "20240102")
 
     assert minute["symbol"].tolist() == ["600519.SH"]
     assert boards["code"].tolist() == ["BK1036"]
     assert members["symbol"].tolist() == ["600519.SH"]
     assert board_minute["board"].tolist() == ["BK1036"]
+    assert snapshot["symbol"].tolist() == ["600519.SH"]
+    assert financial["current_ratio"].tolist() == [1.5]
+    assert index_members["symbol"].tolist() == ["600519.SH", "000001.SZ"]
+    assert valuation["value"].tolist() == [25.0]
+    assert index_history["close"].tolist() == [101.0]
 
 
 def test_explicit_source_can_fallback_and_record_actual_source(monkeypatch) -> None:
@@ -423,6 +581,56 @@ def test_default_history_source_can_fallback_to_joinquant(monkeypatch) -> None:
     assert result.source == "joinquant"
     assert result.fallback_from == "baostock"
     assert "baostock: provider unavailable" in result.fallback_errors
+
+
+def test_eastmoney_request_context_bypasses_broken_environment_proxy(monkeypatch) -> None:
+    import requests
+
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+    def fake_request(session, method, url, **kwargs):
+        captured["trust_env_during_request"] = session.trust_env
+        captured["headers"] = kwargs.get("headers")
+        return FakeResponse()
+
+    monkeypatch.setattr(requests.sessions.Session, "request", fake_request)
+
+    with AkShareProvider._eastmoney_request_context():
+        session = requests.Session()
+        session.trust_env = True
+        response = session.get("https://82.push2.eastmoney.com/api/test")
+
+    assert response.status_code == 200
+    assert captured["trust_env_during_request"] is False
+    assert captured["headers"]["Referer"] == "https://quote.eastmoney.com/"
+    assert session.trust_env is True
+
+
+def test_eastmoney_request_context_can_keep_environment_proxy(monkeypatch) -> None:
+    import requests
+
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+
+    def fake_request(session, method, url, **kwargs):
+        captured["trust_env_during_request"] = session.trust_env
+        return FakeResponse()
+
+    monkeypatch.setattr(requests.sessions.Session, "request", fake_request)
+    monkeypatch.setenv("STOCK_PICKER_EASTMONEY_TRUST_ENV", "1")
+
+    with AkShareProvider._eastmoney_request_context():
+        session = requests.Session()
+        session.trust_env = True
+        session.get("https://82.push2.eastmoney.com/api/test")
+
+    assert captured["trust_env_during_request"] is True
 def test_explicit_source_failure_lists_fallback_errors(monkeypatch) -> None:
     primary = FakeHistoryProvider(failing_symbols={"600519"})
     fallback = FakeHistoryProvider(failing_symbols={"600519"})

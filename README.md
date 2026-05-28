@@ -161,6 +161,90 @@ and whose volume stayed elevated for those three sessions:
 
 Use the latest completed trading day for `--end` if the current day's daily bar is not available yet. Keep JQData optional because account permissions may not cover the requested date range.
 
+## Run Strategy Lists
+
+Strategies under `strategy/` are implemented as selection or rotation lists,
+not as automatic orders or full portfolio backtests. Output columns are:
+
+```text
+strategy, symbol, code, name, date, action, score, rank, weight, reason
+```
+
+Run the turtle breakout strategy for one stock:
+
+```powershell
+.\.venv\Scripts\python.exe examples\run_strategy.py --strategy turtle --symbol 600519 --start 20250527 --end 20260527
+```
+
+Run the small-cap strategy from historical valuation data for a test universe:
+
+```powershell
+.\.venv\Scripts\python.exe examples\run_strategy.py --strategy small_cap --symbols "600519,000001" --as-of 20260527 --top 3 --output data\strategy_small_cap.csv
+```
+
+Available strategies are `ma_cross`, `turtle`, `small_cap`, `undervalued`, and
+`bank_rotation`. The `Dual_Thrust` futures strategy is intentionally not wired
+into this first stock-selection workflow.
+
+`small_cap` and `undervalued` need an explicit stock universe through
+`--symbol`, `--symbols`, or `--all`; they use historical valuation/financial
+data rather than realtime quotes. Start with a small `--symbols` list or
+`--all --limit` before scanning the full market.
+
+Run bank rotation against an explicit bank universe:
+
+```powershell
+.\.venv\Scripts\python.exe examples\run_strategy.py --strategy bank_rotation --symbols "600036,601288,601166,601398,601939,600000,601988,000001,601328,601229,002966" --as-of 20260527 --output data\strategy_bank_rotation.csv
+```
+
+## Backtest Strategies
+
+Backtesting currently supports history-price strategies: `ma_cross` and
+`turtle`, plus `bank_rotation` for an explicit bank universe. It uses daily
+historical bars and historical valuation data, not realtime quotes.
+
+```powershell
+.\.venv\Scripts\python.exe examples\backtest_strategy.py --strategy turtle --symbol 600519 --start 20250527 --end 20260527 --cash 100000 --output data\backtest_turtle_summary.csv --equity-output data\backtest_turtle_equity.csv --trades-output data\backtest_turtle_trades.csv
+```
+
+If cached historical rows exist locally and the online trade calendar is
+temporarily unavailable, the backtest uses the cached rows instead of failing.
+
+Run bank rotation backtests:
+
+```powershell
+.\.venv\Scripts\python.exe examples\backtest_strategy.py --strategy bank_rotation --symbols "600036,601288,601166,601398,601939,600000,601988,000001,601328,601229,002966" --start 20260215 --end 20260527 --cash 100000 --output data\bank_rotation_20260215_20260527_summary.csv --equity-output data\bank_rotation_20260215_20260527_equity.csv --trades-output data\bank_rotation_20260215_20260527_trades.csv
+
+.\.venv\Scripts\python.exe examples\backtest_strategy.py --strategy bank_rotation --symbols "600036,601288,601166,601398,601939,600000,601988,000001,601328,601229,002966" --start 20250613 --end 20250926 --cash 100000 --output data\bank_rotation_20250613_20250926_summary.csv --equity-output data\bank_rotation_20250613_20250926_equity.csv --trades-output data\bank_rotation_20250613_20250926_trades.csv
+```
+
+Run turtle as a portfolio strategy over a stock universe. The backtest checks
+each stock daily, sells positions that break the 10-day exit low, then buys the
+strongest 20-day breakouts up to `--max-positions`.
+
+```powershell
+.\.venv\Scripts\python.exe examples\backtest_strategy.py --strategy turtle --symbols "600519,000001,600036" --start 20250613 --end 20250926 --cash 100000 --max-positions 3 --output data\turtle_portfolio_summary.csv --equity-output data\turtle_portfolio_equity.csv --trades-output data\turtle_portfolio_trades.csv
+```
+
+The default execution timing is conservative for daily-bar strategies:
+
+```text
+--execution-timing next_open
+```
+
+This means a signal is generated after the current daily close and executed at
+the next trading day's open. For intraday turtle experiments, use midday
+signals and afternoon open execution:
+
+```powershell
+.\.venv\Scripts\python.exe examples\backtest_strategy.py --strategy turtle --symbols "600519,000001,600036" --start 20260520 --end 20260527 --cash 100000 --max-positions 3 --execution-timing same_day_pm_open --minute-source akshare --warmup-days 60 --output data\turtle_midday_summary.csv --equity-output data\turtle_midday_equity.csv --trades-output data\turtle_midday_trades.csv
+```
+
+`same_day_pm_open` uses morning minute bars through 11:30 to synthesize the
+signal bar, then executes at the first available afternoon minute-bar open.
+`--warmup-days` reads earlier daily bars only for channel/indicator state; the
+equity curve and performance summary still start at `--start`.
+
 ## List A-Share Symbols
 
 ```powershell

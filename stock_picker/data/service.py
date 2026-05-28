@@ -180,7 +180,10 @@ class MarketDataService:
             self.store.save_history(frame)
             return add_technical_indicators(frame) if indicators else frame
 
-        trade_dates = self.history_provider.get_trade_dates(start_date, end_date)
+        try:
+            trade_dates = self.history_provider.get_trade_dates(start_date, end_date)
+        except Exception:
+            return add_technical_indicators(cached) if indicators else cached
         cached_dates = set(cached["date"].tolist())
         missing_ranges = self._missing_date_ranges(trade_dates, cached_dates)
 
@@ -298,6 +301,87 @@ class MarketDataService:
         return self.market_provider.get_board_minute_history(
             board_type=board_type,
             board=board,
+            period=period,
+        )
+
+    def get_market_snapshot(
+        self,
+        symbols: Iterable[str] | None = None,
+    ) -> pd.DataFrame:
+        if self.data_source_config.has_routing("market"):
+            return self._call_provider(
+                "market",
+                "get_market_snapshot",
+                symbols=symbols,
+            )
+        return self.market_provider.get_market_snapshot(symbols=symbols)
+
+    def get_financial_indicators(
+        self,
+        symbol: str,
+        start_year: str = "1900",
+    ) -> pd.DataFrame:
+        if self.data_source_config.has_routing("market"):
+            return self._call_provider(
+                "market",
+                "get_financial_indicators",
+                symbol=symbol,
+                start_year=start_year,
+            )
+        return self.market_provider.get_financial_indicators(
+            symbol=symbol,
+            start_year=start_year,
+        )
+
+    def get_index_members(self, index_code: str) -> pd.DataFrame:
+        if self.data_source_config.has_routing("market"):
+            return self._call_provider(
+                "market",
+                "get_index_members",
+                index_code=index_code,
+            )
+        return self.market_provider.get_index_members(index_code=index_code)
+
+    def get_valuation_history(
+        self,
+        symbol: str,
+        indicator: str = "总市值",
+        period: str = "近一年",
+    ) -> pd.DataFrame:
+        if self.data_source_config.has_routing("market"):
+            return self._call_provider(
+                "market",
+                "get_valuation_history",
+                symbol=symbol,
+                indicator=indicator,
+                period=period,
+            )
+        return self.market_provider.get_valuation_history(
+            symbol=symbol,
+            indicator=indicator,
+            period=period,
+        )
+
+    def get_index_history(
+        self,
+        index_code: str,
+        start_date: str,
+        end_date: str,
+        period: str = "daily",
+    ) -> pd.DataFrame:
+        if self.data_source_config.has_routing("market"):
+            return self._call_provider(
+                "market",
+                "get_index_history",
+                index_code=index_code,
+                start_date=start_date,
+                end_date=end_date,
+                period=period,
+            )
+        return self.market_provider.get_index_history(
+            index_code=index_code,
+            start_date=start_date,
+            end_date=end_date,
             period=period,
         )
 
