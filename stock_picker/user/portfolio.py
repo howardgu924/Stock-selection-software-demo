@@ -51,6 +51,9 @@ TRADE_COLUMNS = [
 class ManualPortfolio:
     principal: float
     cash: float
+    commission_rate: float
+    min_commission: float
+    stamp_tax_rate: float
     positions: pd.DataFrame
     trades: pd.DataFrame
 
@@ -73,6 +76,9 @@ class ManualPortfolio:
         return {
             "principal": self.principal,
             "cash": self.cash,
+            "commission_rate": self.commission_rate,
+            "min_commission": self.min_commission,
+            "stamp_tax_rate": self.stamp_tax_rate,
             "position_value": position_value,
             "total_asset": total_asset,
             "unrealized_pnl": position_value - cost_value,
@@ -88,6 +94,13 @@ class ManualPortfolio:
             "average_holding_days": float(holding_days.mean()) if len(holding_days) else 0.0,
         }
 
+    def buy_fee(self, price: float, shares: int) -> float:
+        amount = float(price) * int(shares)
+        return max(amount * self.commission_rate, self.min_commission) if amount > 0 else 0.0
+
+    def sell_fee(self, price: float, shares: int) -> float:
+        return self.buy_fee(price, shares)
+
 
 class ManualPortfolioStore:
     def __init__(self, path: str | Path = "data/user/default") -> None:
@@ -96,12 +109,24 @@ class ManualPortfolioStore:
         self.positions_path = self.path / "positions.csv"
         self.trades_path = self.path / "trades.csv"
 
-    def initialize(self, principal: float, cash: float | None = None) -> ManualPortfolio:
+    def initialize(
+        self,
+        principal: float,
+        cash: float | None = None,
+        commission_rate: float = 0.0003,
+        min_commission: float = 5.0,
+        stamp_tax_rate: float = 0.001,
+    ) -> ManualPortfolio:
         if principal <= 0:
             raise ValueError("principal must be greater than 0")
+        if commission_rate < 0 or min_commission < 0 or stamp_tax_rate < 0:
+            raise ValueError("fee rates must be greater than or equal to 0")
         portfolio = ManualPortfolio(
             principal=float(principal),
             cash=float(principal if cash is None else cash),
+            commission_rate=float(commission_rate),
+            min_commission=float(min_commission),
+            stamp_tax_rate=float(stamp_tax_rate),
             positions=_empty_positions(),
             trades=_empty_trades(),
         )
@@ -127,6 +152,9 @@ class ManualPortfolioStore:
         return ManualPortfolio(
             principal=float(account["principal"]),
             cash=float(account["cash"]),
+            commission_rate=float(account.get("commission_rate", 0.0003)),
+            min_commission=float(account.get("min_commission", 5.0)),
+            stamp_tax_rate=float(account.get("stamp_tax_rate", 0.001)),
             positions=_normalize_positions(positions),
             trades=_normalize_trades(trades),
         )
@@ -135,7 +163,13 @@ class ManualPortfolioStore:
         self.path.mkdir(parents=True, exist_ok=True)
         self.account_path.write_text(
             json.dumps(
-                {"principal": portfolio.principal, "cash": portfolio.cash},
+                {
+                    "principal": portfolio.principal,
+                    "cash": portfolio.cash,
+                    "commission_rate": portfolio.commission_rate,
+                    "min_commission": portfolio.min_commission,
+                    "stamp_tax_rate": portfolio.stamp_tax_rate,
+                },
                 ensure_ascii=False,
                 indent=2,
             ),
@@ -150,7 +184,7 @@ class ManualPortfolioStore:
         price: float,
         shares: int,
         name: str = "",
-        fees: float = 5.0,
+        fees: float | None = None,
         target_sell_price: float | None = None,
         timestamp: str | None = None,
         strategy: str = "",
@@ -164,6 +198,7 @@ class ManualPortfolioStore:
             raise ValueError("price and shares must be greater than 0")
         portfolio = self.load()
         symbol = normalize_symbol(symbol)
+        fees = portfolio.buy_fee(price, shares) if fees is None else float(fees)
         cost = price * shares + fees
         if cost > portfolio.cash:
             raise ValueError(f"insufficient cash: need {cost:.2f}, have {portfolio.cash:.2f}")
@@ -247,8 +282,8 @@ class ManualPortfolioStore:
         symbol: str,
         price: float,
         shares: int,
-        fees: float = 5.0,
-        tax_rate: float = 0.001,
+        fees: float | None = None,
+        tax_rate: float | None = None,
         timestamp: str | None = None,
         strategy: str = "",
         system: str = "",
@@ -261,6 +296,8 @@ class ManualPortfolioStore:
             raise ValueError("price and shares must be greater than 0")
         portfolio = self.load()
         symbol = normalize_symbol(symbol)
+        fees = portfolio.sell_fee(price, shares) if fees is None else float(fees)
+        tax_rate = portfolio.stamp_tax_rate if tax_rate is None else float(tax_rate)
         positions = portfolio.positions.copy()
         current = positions[positions["symbol"] == symbol]
         if current.empty:

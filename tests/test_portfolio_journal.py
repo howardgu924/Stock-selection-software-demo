@@ -56,3 +56,22 @@ def test_manual_portfolio_rejects_oversell(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="only 100 shares held"):
         store.sell("600172", price=11.0, shares=200)
+
+
+def test_manual_portfolio_uses_account_fee_settings(tmp_path) -> None:
+    store = ManualPortfolioStore(tmp_path / "account")
+    store.initialize(
+        10_000.0,
+        commission_rate=0.001,
+        min_commission=1.0,
+        stamp_tax_rate=0.002,
+    )
+
+    portfolio = store.buy("600172", price=10.0, shares=100)
+    assert portfolio.trades.loc[0, "fees"] == pytest.approx(1.0)
+    assert portfolio.cash == pytest.approx(8999.0)
+
+    portfolio = store.sell("600172", price=11.0, shares=100)
+    sell = portfolio.trades.iloc[-1]
+    assert sell["fees"] == pytest.approx(1.1)
+    assert sell["tax"] == pytest.approx(2.2)

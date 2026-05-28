@@ -18,6 +18,9 @@ def main() -> None:
     init = subparsers.add_parser("init", help="Initialize account")
     init.add_argument("--principal", type=float, required=True)
     init.add_argument("--cash", type=float)
+    init.add_argument("--commission-rate", type=float, default=0.0003)
+    init.add_argument("--min-commission", type=float, default=5.0)
+    init.add_argument("--stamp-tax-rate", type=float, default=0.001)
 
     buy = subparsers.add_parser("buy", help="Record a manual buy")
     _trade_args(buy)
@@ -27,7 +30,7 @@ def main() -> None:
 
     sell = subparsers.add_parser("sell", help="Record a manual sell")
     _trade_args(sell)
-    sell.add_argument("--tax-rate", type=float, default=0.001)
+    sell.add_argument("--tax-rate", type=float)
     sell.add_argument("--exit-reason", default="")
 
     subparsers.add_parser("positions", help="Print positions")
@@ -45,7 +48,13 @@ def main() -> None:
     store = ManualPortfolioStore(args.path)
     try:
         if args.command == "init":
-            portfolio = store.initialize(args.principal, cash=args.cash)
+            portfolio = store.initialize(
+                args.principal,
+                cash=args.cash,
+                commission_rate=args.commission_rate,
+                min_commission=args.min_commission,
+                stamp_tax_rate=args.stamp_tax_rate,
+            )
             print_summary(portfolio.summary())
             return
         if args.command == "buy":
@@ -107,7 +116,7 @@ def _trade_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--price", type=float)
     parser.add_argument("--shares", type=int)
-    parser.add_argument("--fees", type=float, default=5.0)
+    parser.add_argument("--fees", type=float)
     parser.add_argument("--timestamp")
     parser.add_argument("--strategy", default="")
     parser.add_argument("--system", default="")
