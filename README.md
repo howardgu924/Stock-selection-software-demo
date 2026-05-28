@@ -356,6 +356,25 @@ The symbol list is cached in SQLite after the first successful provider fetch.
 If AkShare fails with a network or SSL error, the service automatically falls
 back to BaoStock's stock list endpoint.
 
+## Local Web App
+
+Run the local browser interface without installing any extra web framework:
+
+```powershell
+.\.venv\Scripts\python.exe examples\web_app.py --host 127.0.0.1 --port 8765
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8765
+```
+
+The web app wraps the existing Python modules. It can run strategy lists, run
+the full Turtle system and execution plan, run Turtle state-machine backtests,
+and record manual portfolio buys/sells. It is local-only; account files still
+live under `data/user/default` unless you choose another path in the page.
+
 ## Check Realtime Quotes
 
 Realtime quotes require explicit stock codes.
