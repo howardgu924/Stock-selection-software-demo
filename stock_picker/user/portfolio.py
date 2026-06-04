@@ -350,6 +350,57 @@ class ManualPortfolioStore:
         self.save(portfolio)
         return portfolio
 
+    def adjust_cost(
+        self,
+        symbol: str,
+        avg_cost: float,
+        timestamp: str | None = None,
+        note: str = "",
+    ) -> ManualPortfolio:
+        if avg_cost <= 0:
+            raise ValueError("avg_cost must be greater than 0")
+        portfolio = self.load()
+        symbol = normalize_symbol(symbol)
+        positions = portfolio.positions.copy()
+        current = positions[positions["symbol"] == symbol]
+        if current.empty:
+            raise ValueError(f"no position for {symbol}")
+        idx = current.index[0]
+        old_cost = float(positions.at[idx, "avg_cost"])
+        shares = int(positions.at[idx, "shares"])
+        name = str(positions.at[idx, "name"] or "")
+        strategy = str(positions.at[idx, "strategy"] or "")
+        system = str(positions.at[idx, "system"] or "")
+        entry_reason = str(positions.at[idx, "entry_reason"] or "")
+        signal_date = positions.at[idx, "signal_date"]
+        execution_date = positions.at[idx, "execution_date"]
+        positions.at[idx, "avg_cost"] = float(avg_cost)
+        portfolio.positions = _normalize_positions(positions)
+        portfolio.trades = _append_trade(
+            portfolio.trades,
+            symbol=symbol,
+            name=name,
+            side="adjust_cost",
+            price=float(avg_cost),
+            shares=shares,
+            fees=0.0,
+            tax=0.0,
+            cash_after=portfolio.cash,
+            realized_pnl=None,
+            realized_pnl_pct=None,
+            timestamp=timestamp,
+            strategy=strategy,
+            system=system,
+            entry_reason=entry_reason,
+            exit_reason="",
+            signal_date=signal_date,
+            execution_date=execution_date,
+            holding_days=None,
+            note=note or f"adjust avg_cost from {old_cost:.6f} to {float(avg_cost):.6f}",
+        )
+        self.save(portfolio)
+        return portfolio
+
 
 def _append_trade(
     trades: pd.DataFrame,

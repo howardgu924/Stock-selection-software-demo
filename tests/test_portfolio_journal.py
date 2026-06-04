@@ -75,3 +75,20 @@ def test_manual_portfolio_uses_account_fee_settings(tmp_path) -> None:
     sell = portfolio.trades.iloc[-1]
     assert sell["fees"] == pytest.approx(1.1)
     assert sell["tax"] == pytest.approx(2.2)
+
+
+def test_manual_portfolio_adjusts_average_cost_without_cash_change(tmp_path) -> None:
+    store = ManualPortfolioStore(tmp_path / "account")
+    store.initialize(10_000.0)
+    portfolio = store.buy("002579", name="中京电子", price=16.922, shares=100, fees=5.0)
+    cash_before = portfolio.cash
+
+    portfolio = store.adjust_cost("002579", avg_cost=19.922, timestamp="2026-06-04T10:30:00")
+
+    assert portfolio.cash == pytest.approx(cash_before)
+    assert portfolio.positions.loc[0, "avg_cost"] == pytest.approx(19.922)
+    adjustment = portfolio.trades.iloc[-1]
+    assert adjustment["side"] == "adjust_cost"
+    assert adjustment["price"] == pytest.approx(19.922)
+    assert adjustment["shares"] == 100
+    assert "adjust avg_cost" in adjustment["note"]

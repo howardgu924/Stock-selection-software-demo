@@ -27,20 +27,9 @@ def main() -> None:
     if args.top < 1:
         parser.error("--top must be greater than 0")
 
-    frame = fetch_lhb_detail(args.start, args.end, page_size=args.page_size)
-    if frame.empty:
+    top, ranked = build_lhb_candidates(args.start, args.end, args.top, page_size=args.page_size)
+    if top.empty:
         raise SystemExit("No Longhu Bang rows returned.")
-
-    ranked = (
-        frame.assign(
-            code=frame["code"].astype(str).str.zfill(6),
-            net_buy=pd.to_numeric(frame["net_buy"], errors="coerce").fillna(0),
-        )
-        .groupby(["code", "name"], as_index=False)["net_buy"]
-        .sum()
-        .sort_values("net_buy", ascending=False)
-    )
-    top = ranked.head(args.top)
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -55,6 +44,42 @@ def main() -> None:
     if args.detail_output:
         print(f"ranked_csv={args.detail_output}")
     print(",".join(top["code"].head(20).tolist()))
+
+
+def build_lhb_candidates(
+    start_date: str,
+    end_date: str,
+    top: int,
+    page_size: int = 500,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fetch and rank Longhu Bang candidates by total net buy amount."""
+    if top < 1:
+        raise ValueError("top must be greater than 0")
+    frame = fetch_lhb_detail(start_date, end_date, page_size=page_size)
+    ranked = rank_lhb_candidates(frame)
+    return ranked.head(top).reset_index(drop=True), ranked
+
+
+def rank_lhb_candidates(frame: pd.DataFrame) -> pd.DataFrame:
+    """Rank raw Longhu Bang rows by per-symbol total net buy amount."""
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["code", "name", "net_buy", "rank"])
+    required = {"code", "name", "net_buy"}
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"Longhu Bang data missing columns: {', '.join(sorted(missing))}")
+    ranked = (
+        frame.assign(
+            code=frame["code"].astype(str).str.zfill(6),
+            net_buy=pd.to_numeric(frame["net_buy"], errors="coerce").fillna(0),
+        )
+        .groupby(["code", "name"], as_index=False)["net_buy"]
+        .sum()
+        .sort_values(["net_buy", "code"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    ranked["rank"] = range(1, len(ranked) + 1)
+    return ranked
 
 
 def fetch_lhb_detail(start_date: str, end_date: str, page_size: int = 500) -> pd.DataFrame:
