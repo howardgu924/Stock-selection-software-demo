@@ -8,6 +8,7 @@ from stock_picker.data.models import normalize_symbol, symbol_code
 
 PLAN_COLUMNS = [
     "strategy",
+    "strategy_family",
     "symbol",
     "name",
     "signal_action",
@@ -29,9 +30,11 @@ PLAN_COLUMNS = [
     "fallback_action",
     "next_day_max_price",
     "alternative_symbol",
+    "reference_price",
     "stop_price",
     "next_add_price",
     "exit_price",
+    "risk_note",
     "reason",
 ]
 
@@ -61,12 +64,13 @@ def build_execution_plan(
     signals = _prepare_signals(strategy_results)
     quote_map = _quote_map(quotes)
     rows: list[dict[str, object]] = []
-    buy_rows = signals[signals["action"] == "buy"].copy()
-    if buy_rows.empty:
+    actionable_rows = signals[signals["action"].isin(["buy", "add"])].copy()
+    review_rows = signals[~signals["action"].isin(["buy", "add"])].copy()
+    if actionable_rows.empty and review_rows.empty:
         return pd.DataFrame(columns=PLAN_COLUMNS)
 
     allocation = cash / max_positions
-    for signal in buy_rows.itertuples(index=False):
+    for signal in actionable_rows.itertuples(index=False):
         quote = quote_map.get(signal.symbol)
         rows.append(
             _plan_row(
@@ -80,6 +84,8 @@ def build_execution_plan(
                 volume_limit_pct=volume_limit_pct,
             )
         )
+    for signal in review_rows.itertuples(index=False):
+        rows.append(_review_plan_row(signal))
 
     plan = pd.DataFrame(rows, columns=PLAN_COLUMNS)
     alternative = _best_executable_symbol(plan)
@@ -189,6 +195,7 @@ def _plan_row(
 
     return {
         "strategy": signal.strategy,
+        "strategy_family": getattr(signal, "strategy_family", None),
         "symbol": signal.symbol,
         "name": name,
         "signal_action": signal.action,
@@ -210,9 +217,11 @@ def _plan_row(
         "fallback_action": fallback,
         "next_day_max_price": up_price * (1 + next_day_premium),
         "alternative_symbol": None,
+        "reference_price": getattr(signal, "reference_price", None),
         "stop_price": getattr(signal, "stop_price", None),
         "next_add_price": getattr(signal, "next_add_price", None),
         "exit_price": getattr(signal, "exit_price", None),
+        "risk_note": getattr(signal, "risk_note", None),
         "reason": reason,
     }
 
@@ -225,6 +234,7 @@ def _empty_plan_row(
 ) -> dict[str, object]:
     return {
         "strategy": signal.strategy,
+        "strategy_family": getattr(signal, "strategy_family", None),
         "symbol": signal.symbol,
         "name": name or signal.name,
         "signal_action": signal.action,
@@ -246,9 +256,47 @@ def _empty_plan_row(
         "fallback_action": None,
         "next_day_max_price": None,
         "alternative_symbol": None,
+        "reference_price": getattr(signal, "reference_price", None),
         "stop_price": getattr(signal, "stop_price", None),
         "next_add_price": getattr(signal, "next_add_price", None),
         "exit_price": getattr(signal, "exit_price", None),
+        "risk_note": getattr(signal, "risk_note", None),
+        "reason": reason,
+    }
+
+
+def _review_plan_row(signal) -> dict[str, object]:
+    action = str(signal.action)
+    reason = getattr(signal, "reason", None) or getattr(signal, "risk_note", None) or "manual review required"
+    return {
+        "strategy": signal.strategy,
+        "strategy_family": getattr(signal, "strategy_family", None),
+        "symbol": signal.symbol,
+        "name": signal.name,
+        "signal_action": action,
+        "signal_date": getattr(signal, "date", None),
+        "system": getattr(signal, "system", None),
+        "score": signal.score,
+        "rank": signal.rank,
+        "price": None,
+        "prev_close": None,
+        "limit_pct": None,
+        "limit_up_price": None,
+        "limit_status": "unknown",
+        "executable": False,
+        "shares": 0,
+        "suggested_price": getattr(signal, "reference_price", None),
+        "suggested_shares": 0,
+        "estimated_cost": 0.0,
+        "recommended_action": f"manual_{action}_review",
+        "fallback_action": None,
+        "next_day_max_price": None,
+        "alternative_symbol": None,
+        "reference_price": getattr(signal, "reference_price", None),
+        "stop_price": getattr(signal, "stop_price", None),
+        "next_add_price": getattr(signal, "next_add_price", None),
+        "exit_price": getattr(signal, "exit_price", None),
+        "risk_note": getattr(signal, "risk_note", None),
         "reason": reason,
     }
 
@@ -257,6 +305,7 @@ def _prepare_signals(frame: pd.DataFrame) -> pd.DataFrame:
     data = frame.copy()
     for column in [
         "strategy",
+        "strategy_family",
         "symbol",
         "name",
         "action",
@@ -266,9 +315,12 @@ def _prepare_signals(frame: pd.DataFrame) -> pd.DataFrame:
         "system",
         "unit_shares",
         "suggested_shares",
+        "reference_price",
         "stop_price",
         "next_add_price",
         "exit_price",
+        "risk_note",
+        "reason",
     ]:
         if column not in data:
             data[column] = None

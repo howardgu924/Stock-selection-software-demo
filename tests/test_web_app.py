@@ -1,27 +1,23 @@
 from __future__ import annotations
 
 import pandas as pd
-import pytest
 
 from examples import web_app
-from stock_picker.user import ManualPortfolioStore
+from stock_picker.user import ManualPortfolioStore, WatchlistStore
 
 
-def _history(symbol: str, closes: list[float], width: float = 1.0) -> pd.DataFrame:
+def _history(symbol: str, closes: list[float]) -> pd.DataFrame:
     dates = pd.date_range("2026-04-01", periods=len(closes), freq="D")
     return pd.DataFrame(
-        [
-            {
-                "symbol": symbol,
-                "date": date.strftime("%Y-%m-%d"),
-                "open": close,
-                "high": close + width / 2,
-                "low": close - width / 2,
-                "close": close,
-                "volume": 1000,
-            }
-            for date, close in zip(dates, closes)
-        ]
+        {
+            "symbol": symbol,
+            "date": dates.strftime("%Y-%m-%d"),
+            "open": closes,
+            "high": [value * 1.01 for value in closes],
+            "low": [value * 0.99 for value in closes],
+            "close": closes,
+            "volume": [100000] * len(closes),
+        }
     )
 
 
@@ -46,28 +42,7 @@ class FakeWebService:
         return []
 
     def get_index_history(self, index_code: str, start_date: str, end_date: str, period: str = "daily") -> pd.DataFrame:
-        return pd.DataFrame(
-            [
-                {
-                    "index_code": index_code,
-                    "date": "2026-04-01",
-                    "open": 100.0,
-                    "high": 100.0,
-                    "low": 100.0,
-                    "close": 100.0,
-                    "volume": 1000,
-                },
-                {
-                    "index_code": index_code,
-                    "date": "2026-06-04",
-                    "open": 105.0,
-                    "high": 105.0,
-                    "low": 105.0,
-                    "close": 105.0,
-                    "volume": 1000,
-                },
-            ]
-        )
+        return _history("000001.SH", [3000 + i * 10 for i in range(40)])
 
 
 def test_web_app_parses_symbols_and_marks() -> None:
@@ -77,86 +52,269 @@ def test_web_app_parses_symbols_and_marks() -> None:
     assert web_app._marks(form) == {"600519": 1500.5, "000001": 12.3}
 
 
-def test_web_app_renders_table_and_escapes_html() -> None:
-    frame = pd.DataFrame([{"symbol": "600001.SH", "reason": "<breakout>"}])
-
-    html = web_app.render_table("Signals", frame)
-
-    assert "信号" in html
-    assert "股票" in html
-    assert "原因" in html
-    assert 'class="table-wrap"' in html
-    assert "&lt;breakout&gt;" in html
-    assert "<breakout>" not in html
-
-
-def test_web_app_page_contains_core_workflows() -> None:
+def test_web_default_path_is_thermostat_and_hides_old_entries() -> None:
     html = web_app.render_page(page="unknown")
 
-    assert 'action="/strategy"' not in html
-    assert 'action="/turtle"' in html
+    assert "恒温器策略" in html
+    assert 'action="/thermostat"' in html
+    assert 'href="/thermostat"' in html
+    assert 'href="/portfolio"' in html
+    assert 'action="/turtle"' not in html
+    assert 'action="/turtle-backtest"' not in html
+    assert 'href="/turtle"' not in html
+    assert "海龟系统" not in html
+    assert "默认技术筛选" not in html
     assert 'href="/strategy"' not in html
-    assert 'href="/turtle"' in html
-    assert 'value="600519,000001,600036"' not in html
-    assert 'value="600172"' not in html
 
 
-def test_web_app_renders_separate_feature_pages() -> None:
-    turtle = web_app.render_page(page="turtle")
-    backtest = web_app.render_page(page="backtest")
-    portfolio = web_app.render_page(page="portfolio")
+def test_web_pages_use_workbench_shell() -> None:
+    for page, title in [
+        ("thermostat", "恒温器策略"),
+        ("backtest", "恒温器回测诊断"),
+        ("portfolio", "账户"),
+    ]:
+        html = web_app.render_page(page=page)
 
-    assert 'action="/turtle"' in turtle
-    assert 'action="/strategy"' not in turtle
-    assert 'action="/turtle-backtest"' in backtest
-    assert 'name="pool_mode"' in backtest
-    assert 'name="exclude_chinext"' in backtest
-    assert 'action="/portfolio-buy"' in portfolio
-    assert 'action="/portfolio-sell"' in portfolio
-    assert 'action="/portfolio-adjust-cost"' in portfolio
-    assert 'name="cash"' not in turtle
-    assert "20260604" in turtle
+        assert 'class="workbench-page"' in html
+        assert title in html
+        assert "页面状态" in html
+        assert "工作区" in html
+        assert "海龟系统" not in html
 
 
-def test_web_app_localizes_result_titles_and_values() -> None:
-    result = web_app.RenderResult(
-        "Portfolio Summary",
-        summaries=[{"symbols": "002579", "position_value": 1200.0, "total_return": 0.2, "refresh": "yes"}],
-        tables=[
-            web_app.TableBlock(
-                "Positions",
-                pd.DataFrame([{"symbol": "600001.SH", "rank": 1.0, "action": "hold", "source": "portfolio_holding"}]),
-            )
-        ],
+def test_web_thermostat_page_shows_stock_pool_controls(tmp_path) -> None:
+    store = WatchlistStore(tmp_path / "account")
+    store.create("高关注")
+    store.add_symbols("高关注", ["600519"])
+    store.save_last_manual_input("600519,000001")
+
+    html = web_app.render_page(
+        page="thermostat",
+        form={"account_path": str(tmp_path / "account"), "stock_pool_source": "watchlist"},
     )
 
-    html = web_app.render_message(result, None)
+    assert "股票池来源" in html
+    assert 'name="stock_pool_source"' in html
+    assert "手动输入" in html
+    assert "自选股组合" in html
+    assert "市场范围" in html
+    assert "龙虎榜" in html
+    assert "同花顺龙虎榜" in html
+    assert "高关注" in html
+    assert "600519,000001" not in html
+    assert "剔除科创板" in html
+    assert "将在后续阶段接入" not in html
+    assert "海龟系统" not in html
+
+
+def test_web_thermostat_uses_conditional_stock_pool_controls(tmp_path) -> None:
+    store = WatchlistStore(tmp_path / "account")
+    store.create("高关注")
+    store.add_symbols("高关注", ["600519"])
+
+    manual_html = web_app.render_page(
+        page="thermostat",
+        form={"account_path": str(tmp_path / "account"), "stock_pool_source": "manual", "symbols": "600519 000001"},
+    )
+    watchlist_html = web_app.render_page(
+        page="thermostat",
+        form={"account_path": str(tmp_path / "account"), "stock_pool_source": "watchlist"},
+    )
+    empty_watchlist_html = web_app.render_page(
+        page="thermostat",
+        form={"account_path": str(tmp_path / "empty"), "stock_pool_source": "watchlist"},
+    )
+    market_html = web_app.render_page(page="thermostat", form={"stock_pool_source": "market_range"})
+    lhb_html = web_app.render_page(page="thermostat", form={"stock_pool_source": "lhb", "lhb_range": "1w"})
+    custom_lhb_html = web_app.render_page(page="thermostat", form={"stock_pool_source": "lhb", "lhb_range": "custom"})
+
+    assert "编辑手动股票池" in manual_html
+    assert "仅本次使用" in manual_html
+    assert "已识别股票数量" in manual_html
+    assert "保存手动股票池" not in manual_html
+    assert "自选股组合名称" not in manual_html
+    assert "高关注" in watchlist_html
+    assert "暂无自选组合，请到账户页创建" in empty_watchlist_html
+    assert "沪深 A 股" in market_html
+    assert "创业板" in market_html
+    assert "北交所" in market_html
+    assert 'type="checkbox" name="market_range"' in market_html
+    assert "龙虎榜开始日期" not in lhb_html
+    assert "龙虎榜结束日期" not in lhb_html
+    assert "龙虎榜开始日期" in custom_lhb_html
+    assert "龙虎榜结束日期" in custom_lhb_html
+
+
+def test_web_thermostat_uses_date_range_account_cash_and_advanced_settings(tmp_path) -> None:
+    account_path = tmp_path / "account"
+    ManualPortfolioStore(account_path).initialize(principal=100000, cash=87654)
+
+    initialized_html = web_app.render_page(page="thermostat", form={"account_path": str(account_path)})
+    missing_html = web_app.render_page(page="thermostat", form={"account_path": str(tmp_path / "missing")})
+    simulated_html = web_app.render_page(page="thermostat", form={"use_simulated_cash": "on"})
+    custom_range_html = web_app.render_page(page="thermostat", form={"strategy_date_range": "custom"})
+
+    assert "策略日期范围" in initialized_html
+    assert "最近 1 个月" in initialized_html
+    assert "最近 3 个月" in initialized_html
+    assert "最近半年" in initialized_html
+    assert "最近 1 年" in initialized_html
+    assert "策略开始日期" not in initialized_html
+    assert "策略结束日期" not in initialized_html
+    assert "策略开始日期" in custom_range_html
+    assert "策略结束日期" in custom_range_html
+    assert "账户现金" in initialized_html
+    assert "87654" in initialized_html
+    assert 'name="cash"' not in initialized_html
+    assert "账户未初始化，请先到账户页初始化账户" in missing_html
+    assert "使用模拟资金" in initialized_html
+    assert 'name="cash"' not in initialized_html
+    assert "临时策略测算" in simulated_html
+    assert 'name="cash"' in simulated_html
+    assert "高级设置" in initialized_html
+    assert "数据与执行设置" in initialized_html
+
+
+def test_web_can_save_manual_input_as_watchlist(tmp_path) -> None:
+    result = web_app.handle_watchlist_save_manual(
+        {
+            "path": str(tmp_path / "account"),
+            "symbols": "600519,000001",
+            "watchlist_name": "高关注",
+        }
+    )
+
+    saved = WatchlistStore(tmp_path / "account").get("高关注")
+
+    assert saved is not None
+    assert saved.symbols == ["600519.SH", "000001.SZ"]
+    assert result.title == "自选股已保存"
+
+
+def test_web_portfolio_page_uses_overview_and_function_tabs(tmp_path) -> None:
+    account_path = tmp_path / "account"
+    store = ManualPortfolioStore(account_path)
+    store.initialize(principal=100000, cash=90000)
+    store.buy("600001", name="A", price=10.0, shares=100, fees=0.0)
+    for idx in range(6):
+        store.adjust_cost("600001", avg_cost=10.0 + idx * 0.1, note=f"note-{idx}")
+
+    html = web_app.render_page(page="portfolio", form={"path": str(account_path)})
 
     assert "账户概览" in html
-    assert "股票池" in html
-    assert "持仓市值" in html
-    assert "总收益率" in html
+    assert 'class="overview-card"' in html
+    for label in ["本金", "现金", "持仓市值", "总资产", "总收益", "总收益率", "已实现盈亏", "浮动盈亏", "持仓数量", "胜率", "盈亏比", "最大回撤", "佣金率", "印花税率"]:
+        assert label in html
     assert "当前持仓" in html
-    assert "持有" in html
-    assert "账户持仓" in html
-    assert "1.000000" not in html
+    assert "查看全部持仓" in html
+    assert "交易流水" in html
+    assert "查看全部交易流水" in html
+    assert html.count("adjust_cost") <= 5
+    assert "功能操作区" in html
+    for tab in ["自选组合", "账户设置", "持仓与估值", "买入 / 卖出", "成本调整", "交易记录"]:
+        assert tab in html
+    assert "高级信息" in html
+    assert "会修改持仓成本记录" in html
 
 
-def test_web_app_preserves_submitted_form_values() -> None:
-    html = web_app.render_page(form={"symbols": "600172", "start": "20260501", "refresh": "on"})
+def test_web_portfolio_empty_states(tmp_path) -> None:
+    uninitialized = web_app.render_page(page="portfolio", form={"path": str(tmp_path / "missing")})
+    initialized_path = tmp_path / "account"
+    ManualPortfolioStore(initialized_path).initialize(principal=100000)
+    initialized = web_app.render_page(page="portfolio", form={"path": str(initialized_path)})
 
-    assert 'value="600172"' in html
-    assert 'value="20260501"' in html
-    assert 'name="refresh" checked' in html
+    assert "账户未初始化" in uninitialized
+    assert "初始化账户" in uninitialized
+    assert "暂无持仓" in initialized
+    assert "暂无交易流水" in initialized
+    assert "暂无自选组合" in initialized
 
 
-def test_web_app_can_render_last_form_on_refresh() -> None:
-    web_app.LAST_FORM.clear()
-    web_app.LAST_FORM.update({"symbols": "600172"})
+def test_web_portfolio_page_exposes_watchlist_management_without_hiding_account_forms(tmp_path) -> None:
+    WatchlistStore(tmp_path / "account").create("高关注")
 
-    html = web_app.render_page(form=web_app.LAST_FORM)
+    html = web_app.render_page(page="portfolio", form={"path": str(tmp_path / "account")})
 
-    assert 'value="600172"' in html
+    assert "自选股组合" in html
+    assert "自选股不是持仓" in html
+    assert 'action="/watchlist-create"' in html
+    assert 'action="/watchlist-add-symbol"' in html
+    assert 'action="/watchlist-remove-symbol"' in html
+    assert 'action="/watchlist-rename"' in html
+    assert 'action="/watchlist-delete"' in html
+    assert "高关注" in html
+    assert 'action="/portfolio-buy"' in html
+    assert 'action="/portfolio-sell"' in html
+
+
+def test_web_normal_pages_do_not_show_old_strategy_entries() -> None:
+    for page in ["thermostat", "backtest", "portfolio"]:
+        html = web_app.render_page(page=page)
+        assert 'action="/turtle"' not in html
+        assert 'action="/turtle-backtest"' not in html
+        assert 'href="/turtle"' not in html
+        assert "海龟系统" not in html
+        assert "旧策略列表" not in html
+
+
+def test_web_thermostat_result_contains_market_holdings_and_candidates(tmp_path, monkeypatch) -> None:
+    store = ManualPortfolioStore(tmp_path / "account")
+    store.initialize(principal=100000, cash=80000)
+    store.buy("600001", name="Held", price=18.0, shares=100, fees=0.0, strategy="thermostat", system="risk_control")
+    fake = FakeWebService(
+        {
+            "600001.SH": _history("600001.SH", [20 - i * 0.25 for i in range(40)]),
+            "600002.SH": _history("600002.SH", [10 + i * 0.25 for i in range(40)]),
+        },
+        quotes=pd.DataFrame(
+            [
+                {"symbol": "600002.SH", "name": "Candidate", "price": 19.8, "high": 20.0, "prev_close": 19.0, "volume": 100000}
+            ]
+        ),
+    )
+    monkeypatch.setattr(web_app, "_service", lambda form: fake)
+
+    result = web_app.handle_thermostat(
+        {
+            "symbols": "600002",
+            "account_path": str(tmp_path / "account"),
+            "start": "20260401",
+            "end": "20260510",
+            "execution_plan": "on",
+        }
+    )
+
+    titles = [table.title for table in result.tables]
+    assert titles[:4] == ["Stock Pool Summary", "Market Overview", "Holding Advice", "New Buy Candidates"]
+    pool_summary = next(table.frame for table in result.tables if table.title == "Stock Pool Summary")
+    assert int(pool_summary.loc[0, "filtered_count"]) == 1
+    holding = next(table.frame for table in result.tables if table.title == "Holding Advice")
+    candidates = next(table.frame for table in result.tables if table.title == "New Buy Candidates")
+    assert holding.loc[0, "symbol"] == "600001.SH"
+    assert candidates.loc[0, "symbol"] == "600002.SH"
+
+
+def test_web_thermostat_rejects_invalid_and_empty_stock_pool(tmp_path) -> None:
+    account_path = str(tmp_path / "missing-account")
+    empty = web_app.handle_thermostat({"symbols": " ", "account_path": account_path})
+    invalid = web_app.handle_thermostat({"symbols": "abc", "account_path": account_path})
+
+    assert empty.title == "股票池错误"
+    assert "手动输入为空" in empty.summaries[0]["errors"]
+    assert invalid.title == "股票池错误"
+    assert "abc" in invalid.summaries[0]["warnings"]
+
+
+def test_web_thermostat_backtest_outputs_diagnostics(monkeypatch) -> None:
+    fake = FakeWebService({"600001.SH": _history("600001.SH", [10 + i * 0.1 for i in range(80)])})
+    monkeypatch.setattr(web_app, "_service", lambda form: fake)
+
+    result = web_app.handle_thermostat_backtest(
+        {"symbols": "600001", "start": "20260101", "end": "20260320", "cash": "100000"}
+    )
+
+    titles = [table.title for table in result.tables]
+    assert titles == ["Summary", "Regime Performance", "Diagnostics"]
 
 
 def test_portfolio_trade_form_is_cleared_after_record() -> None:
@@ -166,8 +324,8 @@ def test_portfolio_trade_form_is_cleared_after_record() -> None:
             "symbol": "600487",
             "price": "96.66",
             "shares": "100",
-            "strategy_meta": "turtle_system",
-            "system": "S1",
+            "strategy_meta": "thermostat",
+            "system": "trend_following",
             "realtime_source": "sina",
         }
     )
@@ -178,227 +336,15 @@ def test_portfolio_trade_form_is_cleared_after_record() -> None:
     assert 'value="600487"' not in html
     assert 'value="96.66"' not in html
     assert 'value="100"' not in html
-    assert 'value="turtle_system"' in html
-    assert 'value="S1"' in html
-
-
-def test_turtle_universe_can_exclude_chinext_symbols() -> None:
-    universe = {
-        "symbols": ["300001.SZ", "301001.SZ", "600001.SH"],
-        "pool": pd.DataFrame(
-            [
-                {"symbol": "300001.SZ", "code": "300001", "source": "manual"},
-                {"symbol": "301001.SZ", "code": "301001", "source": "manual"},
-                {"symbol": "600001.SH", "code": "600001", "source": "manual"},
-            ]
-        ),
-        "lhb": pd.DataFrame(
-            [
-                {"code": "300001", "name": "A", "net_buy": 1.0, "rank": 1},
-                {"code": "600001", "name": "B", "net_buy": 2.0, "rank": 2},
-            ]
-        ),
-        "portfolio": None,
-        "cash": 5000.0,
-    }
-
-    filtered = web_app._exclude_chinext_from_universe(universe)
-
-    assert filtered["symbols"] == ["600001.SH"]
-    assert filtered["pool"]["code"].tolist() == ["600001"]
-    assert filtered["lhb"]["code"].tolist() == ["600001"]
-
-
-def test_lhb_pool_forces_portfolio_holdings_into_turtle_universe(tmp_path, monkeypatch) -> None:
-    store = ManualPortfolioStore(tmp_path / "account")
-    store.initialize(principal=100000)
-    store.buy("600002", name="Held", price=10.0, shares=100, fees=0.0, system="S1")
-    monkeypatch.setattr(
-        web_app,
-        "build_lhb_candidates",
-        lambda start, end, top: (
-            pd.DataFrame([{"code": "600001", "name": "LHB", "net_buy": 100.0, "rank": 1}]),
-            pd.DataFrame(),
-        ),
-    )
-    fake = FakeWebService(
-        {
-            "600001.SH": _history("600001.SH", [10.0] * 30),
-            "600002.SH": _history("600002.SH", [10.0] * 30),
-        }
-    )
-    monkeypatch.setattr(web_app, "_service", lambda form: fake)
-
-    result = web_app.handle_turtle(
-        {
-            "pool_mode": "lhb_top30",
-            "lhb_start": "20260501",
-            "lhb_end": "20260527",
-            "account_path": str(tmp_path / "account"),
-            "end": "20260527",
-        }
-    )
-
-    pool = result.tables[0].frame
-    assert pool["symbol"].tolist() == ["600001.SH", "600002.SH"]
-    assert pool["source"].tolist() == ["lhb_top30", "portfolio_holding"]
-
-
-def test_turtle_manual_pool_enriches_missing_stock_name(tmp_path, monkeypatch) -> None:
-    store = ManualPortfolioStore(tmp_path / "account")
-    store.initialize(principal=100000, cash=8000)
-    fake = FakeWebService(
-        {
-            "002579.SZ": _history("002579.SZ", [10.0] * 30),
-        },
-        quotes=pd.DataFrame([{"symbol": "002579.SZ", "name": "中京电子", "price": 10.0}]),
-    )
-    monkeypatch.setattr(web_app, "_service", lambda form: fake)
-
-    result = web_app.handle_turtle(
-        {
-            "pool_mode": "manual",
-            "symbols": "002579",
-            "account_path": str(tmp_path / "account"),
-            "sync_holdings": "on",
-            "end": "20260604",
-            "cash": "5000",
-        }
-    )
-
-    pool = result.tables[0].frame
-    assert pool.loc[0, "name"] == "中京电子"
-    assert result.summaries[0]["account_cash"] == 8000
-    assert "cash" not in result.summaries[0]
-
-
-def test_turtle_candidate_without_breakout_gets_evaluation_row(tmp_path, monkeypatch) -> None:
-    store = ManualPortfolioStore(tmp_path / "account")
-    store.initialize(principal=100000, cash=8000)
-    fake = FakeWebService(
-        {
-            "002579.SZ": _history("002579.SZ", [10.0] * 40),
-        },
-        quotes=pd.DataFrame([{"symbol": "002579.SZ", "name": "中京电子", "price": 10.0}]),
-    )
-    monkeypatch.setattr(web_app, "_service", lambda form: fake)
-
-    result = web_app.handle_turtle(
-        {
-            "pool_mode": "manual",
-            "symbols": "002579",
-            "account_path": str(tmp_path / "account"),
-            "sync_holdings": "on",
-            "start": "20260518",
-            "end": "20260604",
-        }
-    )
-
-    evaluation = next(table.frame for table in result.tables if table.title == "Candidate Evaluation")
-    assert evaluation.loc[0, "symbol"] == "002579.SZ"
-    assert evaluation.loc[0, "name"] == "中京电子"
-    assert evaluation.loc[0, "evaluation_action"] == "no_signal"
-    assert "未触发买入" in evaluation.loc[0, "reason"]
-    new_signals = next(table.frame for table in result.tables if table.title == "New Buy Signals")
-    assert new_signals.empty
-
-
-def test_turtle_backtest_adds_benchmark_and_diagnostic_tables(monkeypatch) -> None:
-    fake = FakeWebService(
-        {
-            "600001.SH": _history("600001.SH", [10.0] * 80),
-        },
-        quotes=pd.DataFrame([{"symbol": "600001.SH", "name": "A", "price": 10.0}]),
-    )
-    monkeypatch.setattr(web_app, "_service", lambda form: fake)
-
-    result = web_app.handle_turtle_backtest(
-        {
-            "pool_mode": "manual",
-            "symbols": "600001",
-            "start": "20260415",
-            "end": "20260604",
-            "cash": "100000",
-        }
-    )
-
-    summary = next(table.frame for table in result.tables if table.title == "Summary")
-    pool = next(table.frame for table in result.tables if table.title == "Backtest Pool")
-    candidate_diff = next(table.frame for table in result.tables if table.title == "Backtest Candidate Difference")
-    trade_quality = next(table.frame for table in result.tables if table.title == "Trade Quality")
-    monthly = next(table.frame for table in result.tables if table.title == "Monthly Returns")
-
-    assert summary.loc[0, "benchmark_symbol"] == "000001.SH"
-    assert summary.loc[0, "benchmark_return"] == pytest.approx(0.05)
-    assert "excess_return" in summary.columns
-    assert summary.loc[0, "trade_note"] == "未触发交易"
-    assert pool["symbol"].tolist() == ["600001.SH"]
-    assert candidate_diff.loc[0, "traded"] == "no"
-    assert trade_quality.loc[0, "trade_count"] == 0
-    assert not monthly.empty
-
-
-def test_turtle_backtest_lhb_pool_can_exclude_chinext(monkeypatch) -> None:
-    monkeypatch.setattr(
-        web_app,
-        "build_lhb_candidates",
-        lambda start, end, top: (
-            pd.DataFrame(
-                [
-                    {"code": "300001", "name": "创业", "net_buy": 100.0, "rank": 1},
-                    {"code": "600001", "name": "主板", "net_buy": 90.0, "rank": 2},
-                ]
-            ),
-            pd.DataFrame(),
-        ),
-    )
-    fake = FakeWebService({"600001.SH": _history("600001.SH", [10.0] * 80)})
-    monkeypatch.setattr(web_app, "_service", lambda form: fake)
-
-    result = web_app.handle_turtle_backtest(
-        {
-            "pool_mode": "lhb_top30",
-            "lhb_start": "20260601",
-            "lhb_end": "20260604",
-            "start": "20260415",
-            "end": "20260604",
-            "exclude_chinext": "on",
-        }
-    )
-
-    pool = next(table.frame for table in result.tables if table.title == "Backtest Pool")
-    assert pool["code"].tolist() == ["600001"]
-
-
-def test_holding_advice_outputs_sell_hold_and_add(tmp_path) -> None:
-    store = ManualPortfolioStore(tmp_path / "account")
-    portfolio = store.initialize(principal=100000)
-    portfolio = store.buy("600001", price=10.0, shares=100, fees=0.0, system="S1")
-    portfolio = store.buy("600002", price=10.0, shares=100, fees=0.0, system="S1")
-    portfolio = store.buy("600003", price=10.0, shares=100, fees=0.0, system="S1")
-    service = FakeWebService(
-        {
-            "600001.SH": _history("600001.SH", [10.0] * 20 + [7.0]),
-            "600002.SH": _history("600002.SH", [10.0] * 21),
-            "600003.SH": _history("600003.SH", [10.0] * 20 + [10.6]),
-        }
-    )
-
-    advice = web_app._holding_advice(service, portfolio, "20260501", "20260527", web_app.TurtleConfig(), False)
-
-    actions = dict(zip(advice["symbol"], advice["action"]))
-    assert actions["600001.SH"] == "sell"
-    assert actions["600002.SH"] == "hold"
-    assert actions["600003.SH"] == "add"
+    assert 'value="thermostat"' in html
+    assert 'value="trend_following"' in html
 
 
 def test_portfolio_summary_refreshes_valuation_without_adding_trades(tmp_path, monkeypatch) -> None:
     store = ManualPortfolioStore(tmp_path / "account")
     store.initialize(principal=100000)
     store.buy("600001", name="A", price=10.0, shares=100, fees=0.0)
-    fake = FakeWebService(
-        quotes=pd.DataFrame([{"symbol": "600001.SH", "name": "A", "price": 12.0}])
-    )
+    fake = FakeWebService(quotes=pd.DataFrame([{"symbol": "600001.SH", "name": "A", "price": 12.0}]))
     monkeypatch.setattr(web_app, "_service", lambda form: fake)
 
     result = web_app.handle_portfolio_summary({"path": str(tmp_path / "account"), "refresh_valuation": "1"})
@@ -412,7 +358,7 @@ def test_portfolio_summary_refreshes_valuation_without_adding_trades(tmp_path, m
 def test_web_app_adjusts_portfolio_cost(tmp_path) -> None:
     store = ManualPortfolioStore(tmp_path / "account")
     store.initialize(principal=100000)
-    store.buy("002579", name="中京电子", price=16.922, shares=100, fees=5.0)
+    store.buy("002579", name="A", price=16.922, shares=100, fees=5.0)
 
     result = web_app.handle_portfolio_adjust_cost(
         {"path": str(tmp_path / "account"), "symbol": "002579", "avg_cost": "19.922"}
@@ -420,7 +366,7 @@ def test_web_app_adjusts_portfolio_cost(tmp_path) -> None:
 
     positions = result.tables[0].frame
     trades = result.tables[1].frame
-    assert positions.loc[0, "avg_cost"] == pytest.approx(19.922)
+    assert positions.loc[0, "avg_cost"] == 19.922
     assert trades.iloc[-1]["side"] == "adjust_cost"
 
 

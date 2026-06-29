@@ -2,7 +2,49 @@
 
 This project is an early MVP for an A-share stock selection tool.
 
-The first version focuses only on market data:
+The normal workflow now uses the 恒温器策略: evaluate the current market
+regime first, then route each stock to trend following, grid/range trading,
+risk control, or observation. Account management, market-data fetching,
+fallback sources, local cache, realtime quotes, execution assistance, and the
+local web app remain part of the supported workflow.
+
+## 正常使用路径
+
+Start the local web app:
+
+```powershell
+.\.venv\Scripts\python.exe examples\web_app.py --host 127.0.0.1 --port 8765
+```
+
+Open:
+
+```text
+http://127.0.0.1:8765
+```
+
+Use the 恒温器策略 page to choose a 股票池 and strategy date range. 可用现金从账户读取
+and is displayed as read-only on the strategy page. If the account is not
+initialized, go to the 账户 page first. 模拟资金只影响临时策略测算 and never changes
+account cash, positions, or trades. The page shows market regime overview,
+holding advice, new candidates, grid advice, trend advice, execution checks,
+and the account page. The program does not place orders automatically; manual
+portfolio records are still confirmed by the user.
+
+股票池 can come from manual input, a saved 自选股组合, a market range, or a
+Longhu Bang source. Manual input can be saved as a named 自选股组合 from the web
+page and reused later. 账户页统一管理自选组合. 自选股组合不是持仓: adding, deleting, renaming, or removing
+symbols from a watchlist does not change account cash, positions, trades, or
+P&L. Holding advice still comes from the account positions; watchlists only
+control the new-candidate input range.
+
+The run form keeps the 剔除科创板 option. 剔除科创板只影响本次运行 and never deletes
+saved watchlist members. Results show the stock-pool source, original count,
+deduped count, filtered count, removed count, warnings, and errors before the
+恒温器策略 consumes the final symbol list. If 同花顺龙虎榜不可用, the result explains
+the unavailable reason and shows the real data source actually used instead of
+pretending another source is 同花顺.
+
+The maintained base capabilities are:
 
 - Fetch A-share historical daily price data
 - Fetch A-share realtime quote snapshots
@@ -115,6 +157,12 @@ Test a small batch before running the full market:
 Failed stocks are appended to `data/history_errors.csv` by default. Use
 `--error-log <path>` to choose another CSV, or `--stop-on-error` to stop at the
 first failure.
+
+## 历史兼容
+
+The old CLI strategy examples, old screening engine, and old Turtle source code
+are kept for compatibility and reference. They are no longer the recommended
+normal workflow and are not exposed by the web app's normal user path.
 
 ## Screen Stocks
 

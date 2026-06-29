@@ -116,3 +116,61 @@ def test_execution_plan_skips_when_turtle_unit_exceeds_cash() -> None:
 
     assert plan.loc[0, "recommended_action"] == "skip_insufficient_cash"
     assert plan.loc[0, "system"] == "S1"
+
+
+def test_execution_plan_accepts_thermostat_buy_and_add_actions() -> None:
+    signals = pd.DataFrame(
+        [
+            {
+                "strategy": "thermostat",
+                "strategy_family": "trend_following",
+                "symbol": "600001.SH",
+                "name": "A",
+                "action": "add",
+                "score": 0.8,
+                "rank": 1,
+                "suggested_shares": 200,
+                "stop_price": 9.2,
+                "risk_note": "趋势恶化则退出",
+            }
+        ]
+    )
+    quotes = pd.DataFrame(
+        [{"symbol": "600001.SH", "name": "A", "price": 10.0, "high": 10.1, "prev_close": 9.8, "volume": 100000}]
+    )
+
+    plan = build_execution_plan(signals, quotes, cash=5000.0)
+
+    assert plan.loc[0, "strategy"] == "thermostat"
+    assert plan.loc[0, "signal_action"] == "add"
+    assert plan.loc[0, "recommended_action"] == "buy_now"
+    assert plan.loc[0, "shares"] == 200
+    assert plan.loc[0, "stop_price"] == 9.2
+
+
+def test_execution_plan_preserves_non_buy_thermostat_reasons() -> None:
+    signals = pd.DataFrame(
+        [
+            {
+                "strategy": "thermostat",
+                "symbol": "600001.SH",
+                "name": "A",
+                "action": "stop_grid",
+                "score": 0.2,
+                "rank": 1,
+                "reference_price": 9.5,
+                "reason": "跌破震荡区间下沿",
+                "risk_note": "停止网格扩仓",
+            }
+        ]
+    )
+    quotes = pd.DataFrame(
+        [{"symbol": "600001.SH", "name": "A", "price": 9.4, "high": 9.6, "prev_close": 9.8, "volume": 100000}]
+    )
+
+    plan = build_execution_plan(signals, quotes, cash=5000.0)
+
+    assert plan.loc[0, "signal_action"] == "stop_grid"
+    assert plan.loc[0, "recommended_action"] == "manual_stop_grid_review"
+    assert plan.loc[0, "executable"] == False  # noqa: E712
+    assert "跌破震荡区间下沿" in plan.loc[0, "reason"]

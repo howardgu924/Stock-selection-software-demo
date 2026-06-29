@@ -15,9 +15,18 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stock_picker.data import DataSourceConfig, MarketDataService
-from stock_picker.data.models import normalize_symbol, symbol_code
+from stock_picker.data.models import StockInfo, normalize_symbol, symbol_code
 from stock_picker.execution import build_execution_plan
+from stock_picker.pools import (
+    lhb_range_dates,
+    parse_manual_pool,
+    resolve_lhb_pool,
+    resolve_market_range_pool,
+    resolve_watchlist_pool,
+)
 from stock_picker.strategies import (
+    backtest_thermostat_strategy,
+    run_thermostat_strategy,
     TurtleConfig,
     TurtleSystemResult,
     backtest_turtle_system,
@@ -30,14 +39,14 @@ from stock_picker.strategies.turtle_system import (
     TURTLE_SUMMARY_COLUMNS,
     TURTLE_TRADE_COLUMNS,
 )
-from stock_picker.user import ManualPortfolioStore
+from stock_picker.user import ManualPortfolioStore, WatchlistStore
 from examples.list_lhb_candidates import build_lhb_candidates
 
 
 DEFAULT_PORT = 8765
 DEFAULT_USER_PATH = "data/user/default"
 LAST_FORM: dict[str, str] = {}
-PAGES = {"turtle", "backtest", "portfolio"}
+PAGES = {"thermostat", "backtest", "portfolio"}
 APP_NAME = "选股工作台"
 
 TITLE_LABELS = {
@@ -71,6 +80,8 @@ TITLE_LABELS = {
     "Sell Recorded": "卖出已记录",
     "Portfolio Summary": "账户概览",
     "Positions": "当前持仓",
+    "Stock Pool Summary": "股票池摘要",
+    "Watchlists": "自选股组合",
 }
 
 COLUMN_LABELS = {
@@ -124,6 +135,13 @@ COLUMN_LABELS = {
     "limit_up_price": "涨停价",
     "lhb_end": "龙虎榜结束日期",
     "lhb_start": "龙虎榜开始日期",
+    "stock_pool_source": "股票池来源",
+    "original_count": "原始数量",
+    "deduped_count": "去重后数量",
+    "filtered_count": "过滤后数量",
+    "removed_count": "被剔除数量",
+    "warnings": "警告",
+    "errors": "错误",
     "loss_count": "亏损次数",
     "mark_price": "最新价",
     "market_value": "市值",
@@ -235,6 +253,36 @@ OPTION_LABELS = {
         "lhb_top50": "龙虎榜前50",
         "portfolio_holding": "账户持仓",
     },
+    "stock_pool_source": {
+        "manual": "手动输入",
+        "watchlist": "自选股组合",
+        "market_range": "市场范围",
+        "lhb": "龙虎榜",
+        "ths_lhb": "同花顺龙虎榜",
+    },
+    "market_range": {
+        "all_a": "沪深 A 股",
+        "star": "科创板",
+        "sh": "沪市",
+        "sz": "深市",
+        "chinext": "创业板",
+        "bj": "北交所",
+    },
+    "lhb_range": {
+        "1w": "最近 1 周",
+        "1m": "最近 1 个月",
+        "3m": "最近 3 个月",
+        "half_year": "最近半年",
+        "1y": "最近 1 年",
+        "custom": "自定义",
+    },
+    "strategy_date_range": {
+        "1m": "最近 1 个月",
+        "3m": "最近 3 个月",
+        "half_year": "最近半年",
+        "1y": "最近 1 年",
+        "custom": "自定义",
+    },
     "source": {"": "自动", "baostock": "BaoStock", "akshare": "AkShare", "joinquant": "JoinQuant"},
     "stock_source": {"": "自动", "baostock": "BaoStock", "akshare": "AkShare", "joinquant": "JoinQuant"},
     "realtime_source": {"sina": "新浪", "akshare": "AkShare"},
@@ -281,7 +329,7 @@ class WebAppHandler(BaseHTTPRequestHandler):
             self._send_text("ok")
             return
         if path == "/":
-            self._send_page(render_page(page="turtle", form=LAST_FORM))
+            self._send_page(render_page(page="thermostat", form=LAST_FORM))
             return
         page = path.strip("/")
         if page not in PAGES:
@@ -301,12 +349,12 @@ class WebAppHandler(BaseHTTPRequestHandler):
         try:
             form = self._read_form()
             display_form = form
-            if path == "/turtle":
-                page = "turtle"
-                result = handle_turtle(form)
-            elif path == "/turtle-backtest":
+            if path == "/thermostat":
+                page = "thermostat"
+                result = handle_thermostat(form)
+            elif path == "/thermostat-backtest":
                 page = "backtest"
-                result = handle_turtle_backtest(form)
+                result = handle_thermostat_backtest(form)
             elif path == "/portfolio-init":
                 page = "portfolio"
                 result = handle_portfolio_init(form)
@@ -325,6 +373,12 @@ class WebAppHandler(BaseHTTPRequestHandler):
             elif path == "/portfolio-summary":
                 page = "portfolio"
                 result = handle_portfolio_summary(form)
+            elif path == "/watchlist-save-manual":
+                page = "thermostat"
+                result = handle_watchlist_save_manual(form)
+            elif path in {"/watchlist-create", "/watchlist-add-symbol", "/watchlist-remove-symbol", "/watchlist-rename", "/watchlist-delete"}:
+                page = "portfolio"
+                result = handle_watchlist_action(path, form)
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
@@ -341,7 +395,7 @@ class WebAppHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length).decode("utf-8")
         values = parse_qs(raw, keep_blank_values=True)
-        return {key: value[-1] for key, value in values.items()}
+        return {key: ",".join(value) if key == "market_range" else value[-1] for key, value in values.items()}
 
     def _send_page(self, body: str) -> None:
         encoded = body.encode("utf-8")
@@ -434,6 +488,122 @@ def handle_turtle(form: dict[str, str]) -> RenderResult:
         title="完整海龟系统",
         summaries=[_turtle_summary(form, start, end, cash, portfolio)],
         tables=tables,
+    )
+
+
+def handle_thermostat(form: dict[str, str]) -> RenderResult:
+    service = _service(form)
+    start, end = _strategy_range_dates(form)
+    account_path = _value(form, "account_path", DEFAULT_USER_PATH)
+    portfolio = _load_portfolio(account_path)
+    cash = _float(form, "cash", 5000.0) if _checked(form, "use_simulated_cash") else (portfolio.cash if portfolio is not None else _float(form, "cash", 5000.0))
+    pool = _resolve_thermostat_stock_pool(form, service)
+    if _value(form, "stock_pool_source", "manual") == "manual" and _optional(form, "symbols") is not None:
+        WatchlistStore(account_path).save_last_manual_input(_optional(form, "symbols") or "")
+    if pool.should_stop or not pool.symbols:
+        return _stock_pool_error_result(pool)
+    symbols = list(pool.symbols)
+    result = run_thermostat_strategy(
+        service=service,
+        symbols=symbols,
+        start_date=start,
+        end_date=end,
+        cash=cash,
+        portfolio=portfolio,
+        refresh=_checked(form, "refresh"),
+    )
+    tables = [
+        TableBlock("Stock Pool Summary", _pool_summary_frame(pool)),
+        TableBlock("Market Overview", result.market_overview),
+        TableBlock("Holding Advice", result.holding_advice),
+        TableBlock("New Buy Candidates", result.new_candidates),
+        TableBlock("Grid Advice", result.grid_advice),
+        TableBlock("Trend Advice", result.trend_advice),
+        TableBlock("Errors", result.errors),
+    ]
+    if _checked(form, "execution_plan") and not result.new_candidates.empty:
+        executable = result.new_candidates[result.new_candidates["action"].isin(["buy", "add"])].copy()
+        if not executable.empty:
+            quotes = service.get_realtime_quotes(executable["symbol"].dropna().astype(str).tolist())
+            plan = build_execution_plan(
+                executable,
+                quotes,
+                cash=cash,
+                next_day_premium=_float(form, "next_day_premium", 0.02),
+                volume_limit_pct=_float(form, "volume_limit_pct", 0.10),
+            )
+            tables.insert(5, TableBlock("Execution Plan", plan))
+    return RenderResult(
+        title="恒温器策略",
+        summaries=[
+            _request_summary(
+                {**form, "start": start, "end": end, "account_path": account_path},
+                ["stock_pool_source", "symbols", "watchlist_name", "market_range", "lhb_range", "start", "end", "account_path", "refresh"],
+            )
+        ],
+        tables=tables,
+    )
+
+
+def handle_watchlist_save_manual(form: dict[str, str]) -> RenderResult:
+    path = _value(form, "path", _value(form, "account_path", DEFAULT_USER_PATH))
+    name = _value(form, "watchlist_name")
+    if not name:
+        raise ValueError("保存自选股需要组合名称。")
+    pool = parse_manual_pool(_value(form, "symbols"))
+    if pool.should_stop or not pool.symbols:
+        return _stock_pool_error_result(pool)
+    store = WatchlistStore(path)
+    created = store.create(name)
+    if created.status == "name_conflict":
+        store.add_symbols(name, pool.symbols)
+    else:
+        store.add_symbols(name, pool.symbols)
+    store.save_last_manual_input(_value(form, "symbols"))
+    saved = store.get(name)
+    return RenderResult(
+        "自选股已保存",
+        summaries=[{"watchlist_name": name, "filtered_count": len(saved.symbols) if saved else 0}],
+        tables=[TableBlock("Watchlists", _watchlists_frame(store))],
+    )
+
+
+def handle_watchlist_action(path: str, form: dict[str, str]) -> RenderResult:
+    store = WatchlistStore(_value(form, "path", DEFAULT_USER_PATH))
+    if path == "/watchlist-create":
+        store.create(_value(form, "watchlist_name"))
+    elif path == "/watchlist-add-symbol":
+        store.add_symbols(_value(form, "watchlist_name"), [_value(form, "symbol")])
+    elif path == "/watchlist-remove-symbol":
+        store.remove_symbol(_value(form, "watchlist_name"), _value(form, "symbol"))
+    elif path == "/watchlist-rename":
+        store.rename(_value(form, "watchlist_name"), _value(form, "new_watchlist_name"))
+    elif path == "/watchlist-delete":
+        store.delete(_value(form, "watchlist_name"))
+    return RenderResult("自选股组合", tables=[TableBlock("Watchlists", _watchlists_frame(store))])
+
+
+def handle_thermostat_backtest(form: dict[str, str]) -> RenderResult:
+    symbols = [normalize_symbol(symbol) for symbol in _require_symbols(form)]
+    start = _value(form, "start")
+    end = _value(form, "end", _today_yyyymmdd())
+    if not start or not end:
+        raise ValueError("恒温器回测需要开始日期和结束日期。")
+    result = backtest_thermostat_strategy(
+        service=_service(form),
+        symbols=symbols,
+        start_date=start,
+        end_date=end,
+        initial_cash=_float(form, "cash", 100000.0),
+    )
+    return RenderResult(
+        title="恒温器回测诊断",
+        summaries=[_request_summary({**form, "end": end}, ["symbols", "start", "end", "cash", "source", "refresh"])],
+        tables=[
+            TableBlock("Summary", result.summary),
+            TableBlock("Regime Performance", result.regime_performance),
+            TableBlock("Diagnostics", result.diagnostics),
+        ],
     )
 
 
@@ -598,18 +768,47 @@ def handle_portfolio_summary(form: dict[str, str]) -> RenderResult:
 
 
 def render_page(
-    page: str = "turtle",
+    page: str = "thermostat",
     result: RenderResult | None = None,
     error: str | None = None,
     form: dict[str, str] | None = None,
 ) -> str:
     form = form or {}
-    page = page if page in PAGES else "turtle"
+    page = page if page in PAGES else "thermostat"
     page_body = {
-        "turtle": render_turtle_section(form),
-        "backtest": render_backtest_section(form),
+        "thermostat": render_thermostat_section(form),
+        "backtest": render_thermostat_backtest_section(form),
         "portfolio": render_portfolio_section(form),
     }[page]
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{APP_NAME}</title>
+  <style>{CSS}</style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>{APP_NAME}</h1>
+      <p>恒温器策略、回测诊断和手动账户工作台</p>
+    </div>
+    <div class="status">本地运行 · {html.escape(datetime.now().strftime("%Y-%m-%d %H:%M"))}</div>
+  </header>
+  <nav>
+    {nav_link("thermostat", "恒温器策略", page)}
+    {nav_link("backtest", "回测诊断", page)}
+    {nav_link("portfolio", "账户", page)}
+  </nav>
+  <main>
+    {render_message(result, error)}
+    <div class="workbench-page">
+      {page_body}
+    </div>
+  </main>
+</body>
+</html>"""
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -642,6 +841,110 @@ def render_page(
 def nav_link(target: str, label: str, current: str) -> str:
     active = ' class="active"' if target == current else ""
     return f'<a href="/{target}"{active}>{html.escape(label)}</a>'
+
+
+def render_thermostat_section(form: dict[str, str]) -> str:
+    display_form = _thermostat_display_form(form)
+    stock_source = _value(display_form, "stock_pool_source", "manual")
+    return f"""
+    <section id="thermostat" class="workspace-section">
+      <div class="page-head">
+        <h2>恒温器策略</h2>
+        <p class="status">页面状态：选择股票池、策略日期和账户资金后运行。工作区按当前选择动态显示字段。</p>
+      </div>
+      <form method="post" action="/thermostat">
+        <div class="panel-block">
+          <h3>工作区：股票池来源</h3>
+          {stock_pool_fields(display_form)}
+        </div>
+        <div class="panel-block">
+          <h3>工作区：策略日期和资金</h3>
+          <div class="grid">
+            {strategy_date_fields(display_form)}
+            {input_text("account_path", "账户路径", DEFAULT_USER_PATH, display_form)}
+          </div>
+          {account_cash_status(display_form)}
+          {simulated_cash_fields(display_form)}
+        </div>
+        <details class="advanced-settings">
+          <summary>高级设置</summary>
+          <p class="muted">数据与执行设置默认收起，展开后可调整数据源、刷新和执行计划。</p>
+          <div class="grid">
+            {source_fields(display_form)}
+            {execution_fields(display_form)}
+          </div>
+          {checkbox("execution_plan", "生成手工执行计划", display_form, checked=True)}
+        </details>
+        {checkbox("exclude_star", "剔除科创板", display_form)}
+        <button type="submit">运行恒温器策略</button>
+      </form>
+      <p class="muted">股票池来源支持手动输入、自选股组合、市场范围、龙虎榜和同花顺龙虎榜来源说明。当前来源：{html.escape(OPTION_LABELS["stock_pool_source"].get(stock_source, stock_source))}</p>
+    </section>"""
+
+
+def strategy_date_fields(form: dict[str, str]) -> str:
+    current = _value(form, "strategy_date_range", "3m")
+    actual_start, actual_end = _strategy_range_dates(form)
+    fields = select("strategy_date_range", ("1m", "3m", "half_year", "1y", "custom"), "3m", "策略日期范围", form)
+    fields += f'<p class="muted">实际使用日期范围：{html.escape(actual_start)} 至 {html.escape(actual_end)}</p>'
+    if current == "custom":
+        fields += input_text("start", "策略开始日期", "", form)
+        fields += input_text("end", "策略结束日期", _today_yyyymmdd(), form)
+    return fields
+
+
+def account_cash_status(form: dict[str, str]) -> str:
+    if _checked(form, "use_simulated_cash"):
+        return '<p class="muted">使用模拟资金进行临时策略测算，不会改变账户现金、持仓或交易流水。</p>'
+    path = _value(form, "account_path", DEFAULT_USER_PATH)
+    portfolio = _load_portfolio(path)
+    if portfolio is None:
+        return '<p class="message-inline error">账户未初始化，请先到账户页初始化账户。</p>'
+    return f'<p class="message-inline">账户现金（只读）：<strong>{portfolio.cash:.2f}</strong></p>'
+
+
+def simulated_cash_fields(form: dict[str, str]) -> str:
+    checked = _checked(form, "use_simulated_cash")
+    fields = checkbox("use_simulated_cash", "使用模拟资金", form)
+    if checked:
+        fields += '<p class="muted">模拟资金仅用于临时策略测算，不会改变账户。</p>'
+        fields += input_number("cash", "模拟资金", "5000", form)
+    return fields
+
+
+def _strategy_range_dates(form: dict[str, str]) -> tuple[str, str]:
+    range_key = _value(form, "strategy_date_range", "3m")
+    if range_key == "custom":
+        end = _value(form, "end", _today_yyyymmdd())
+        start = _optional(form, "start") or (pd.to_datetime(end) - pd.Timedelta(days=90)).strftime("%Y%m%d")
+        return start, end
+    end = _value(form, "end", _today_yyyymmdd())
+    offsets = {"1m": 30, "3m": 90, "half_year": 182, "1y": 365}
+    start = (pd.to_datetime(end) - pd.Timedelta(days=offsets.get(range_key, 90))).strftime("%Y%m%d")
+    return start, end
+
+
+def render_thermostat_backtest_section(form: dict[str, str]) -> str:
+    today = _today_yyyymmdd()
+    return f"""
+    <section id="backtest" class="workspace-section">
+      <div class="page-head">
+        <h2>恒温器回测诊断</h2>
+        <p class="status">页面状态：工作区用于输入回测股票池和日期，计算语义保持不变。</p>
+      </div>
+      <form method="post" action="/thermostat-backtest">
+        <h3>工作区：回测输入</h3>
+        <div class="grid">
+          {input_text("symbols", "股票池", "", form)}
+          {input_text("start", "开始日期", "", form)}
+          {input_text("end", "结束日期", today, form)}
+          {input_number("cash", "初始资金", "100000", form)}
+          {source_fields(form)}
+        </div>
+        {checkbox("refresh", "强制刷新历史数据", form)}
+        <button type="submit">运行恒温器回测</button>
+      </form>
+    </section>"""
 
 
 def render_turtle_section(form: dict[str, str]) -> str:
@@ -694,53 +997,67 @@ def render_backtest_section(form: dict[str, str]) -> str:
 
 
 def render_portfolio_section(form: dict[str, str]) -> str:
+    portfolio = _load_portfolio(_value(form, "path", DEFAULT_USER_PATH))
     return f"""
-    <section id="portfolio">
-      <h2>手动账户</h2>
-      <div class="columns">
-        <form method="post" action="/portfolio-init">
-          <h3>初始化</h3>
-          {portfolio_path(form)}
-          {input_number("principal", "本金", "5000", form)}
-          {input_number("cash", "现金", "", form)}
-          {input_number("commission_rate", "佣金率", "0.0003", form)}
-          {input_number("min_commission", "最低佣金", "5", form)}
-          {input_number("stamp_tax_rate", "印花税率", "0.001", form)}
-          <button type="submit">初始化账户</button>
-        </form>
-        <form method="post" action="/portfolio-summary">
-          <input type="hidden" name="refresh_valuation" value="1">
-          <h3>刷新行情/更新估值</h3>
-          {portfolio_path(form)}
-          {input_text("marks", "标记价格", "", form)}
-          {source_fields(form)}
-          <button type="submit">刷新估值</button>
-        </form>
+    <section id="portfolio" class="workspace-section">
+      <div class="page-head">
+        <h2>账户</h2>
+        <p class="status">页面状态：账户概览默认展示，低频操作放入功能操作区。工作区按任务分组。</p>
       </div>
-      <div class="columns">
-        <form method="post" action="/portfolio-buy">
-          <h3>买入记录</h3>
-          {portfolio_path(form)}
-          {trade_fields(side="buy", form=form)}
-          <button type="submit">记录买入</button>
-        </form>
-        <form method="post" action="/portfolio-sell">
-          <h3>卖出记录</h3>
-          {portfolio_path(form)}
-          {trade_fields(side="sell", form=form)}
-          <button type="submit">记录卖出</button>
-        </form>
-      </div>
-      <div class="columns">
-        <form method="post" action="/portfolio-adjust-cost">
-          <h3>调整成本</h3>
-          {portfolio_path(form)}
-          {input_text("symbol", "股票代码", "", form)}
-          {input_number("avg_cost", "正确平均成本", "", form)}
-          {input_text("note", "备注", "", form)}
-          <button type="submit">调整成本</button>
-        </form>
-      </div>
+      {render_account_overview(form, portfolio)}
+      {render_holdings_and_trades_summary(portfolio)}
+      <section class="function-tabs">
+        <h2>功能操作区</h2>
+        <div class="tab-labels">
+          <span>自选组合</span><span>账户设置</span><span>持仓与估值</span><span>买入 / 卖出</span><span>成本调整</span><span>交易记录</span>
+        </div>
+        <details open>
+          <summary>自选组合</summary>
+          {render_watchlist_management(form)}
+        </details>
+        <details>
+          <summary>账户设置</summary>
+          {render_account_initializer(form)}
+        </details>
+        <details>
+          <summary>持仓与估值</summary>
+          {render_valuation_refresher(form)}
+        </details>
+        <details>
+          <summary>买入 / 卖出</summary>
+          <div class="columns">
+            <form method="post" action="/portfolio-buy">
+              <h3>买入记录</h3>
+              {portfolio_path(form)}
+              {trade_fields(side="buy", form=form)}
+              <button type="submit">记录买入</button>
+            </form>
+            <form method="post" action="/portfolio-sell">
+              <h3>卖出记录</h3>
+              {portfolio_path(form)}
+              {trade_fields(side="sell", form=form)}
+              <button type="submit">记录卖出</button>
+            </form>
+          </div>
+        </details>
+        <details>
+          <summary>成本调整</summary>
+          <p class="muted">这是低频操作，会修改持仓成本记录。</p>
+          <form method="post" action="/portfolio-adjust-cost">
+            {portfolio_path(form)}
+            <div class="grid">
+              {input_text("symbol", "股票代码", "", form)}
+              {input_number("avg_cost", "正确平均成本", "", form)}
+              {input_text("note", "备注", "", form)}
+            </div>
+            <button type="submit">调整成本</button>
+          </form>
+        </details>
+        <details>
+          <summary>交易记录</summary>
+          {render_table("Trades", _trades_view(portfolio.trades if portfolio is not None else pd.DataFrame()))}
+        </details>
+      </section>
     </section>
     """
 
@@ -780,6 +1097,99 @@ def render_table(title: str, frame: pd.DataFrame) -> str:
         f"<h3>{html.escape(_display_title(title))} <span>{len(frame)} 行</span></h3>"
         f'<div class="table-wrap">{table}</div>'
     )
+
+
+def render_account_overview(form: dict[str, str], portfolio) -> str:
+    if portfolio is None:
+        return """
+        <section class="account-overview">
+          <h2>账户概览</h2>
+          <p class="message-inline error">账户未初始化，请先在账户设置中初始化账户。</p>
+          <a class="secondary-action" href="#account-settings">初始化账户</a>
+        </section>
+        """
+    summary = portfolio.summary(_marks(form))
+    cards = [
+        ("本金", summary.get("principal", 0.0)),
+        ("现金", summary.get("cash", 0.0)),
+        ("持仓市值", summary.get("position_value", 0.0)),
+        ("总资产", summary.get("total_asset", 0.0)),
+        ("总收益", summary.get("total_pnl", 0.0)),
+        ("总收益率", summary.get("total_return", 0.0)),
+        ("已实现盈亏", summary.get("realized_pnl", 0.0)),
+        ("浮动盈亏", summary.get("unrealized_pnl", 0.0)),
+        ("持仓数量", len(portfolio.positions)),
+        ("胜率", summary.get("win_rate", 0.0)),
+        ("盈亏比", summary.get("profit_loss_ratio", 0.0)),
+        ("最大回撤", 0.0),
+        ("佣金率", summary.get("commission_rate", 0.0)),
+        ("印花税率", summary.get("stamp_tax_rate", 0.0)),
+    ]
+    content = "".join(
+        f'<div class="overview-card"><span>{html.escape(label)}</span><strong>{html.escape(_format_metric(value))}</strong></div>'
+        for label, value in cards
+    )
+    return f'<section class="account-overview"><h2>账户概览</h2><div class="overview-grid">{content}</div></section>'
+
+
+def render_holdings_and_trades_summary(portfolio) -> str:
+    if portfolio is None:
+        return """
+        <section class="account-summaries">
+          <h2>当前持仓</h2><p class="muted">暂无持仓。</p>
+          <h2>交易流水</h2><p class="muted">暂无交易流水。</p>
+        </section>
+        """
+    positions = _positions_view(portfolio.positions)
+    recent_trades = _trades_view(portfolio.trades.tail(5))
+    positions_html = render_table("Positions", positions) if positions is not None and not positions.empty else '<h3>当前持仓</h3><p class="muted">暂无持仓。</p>'
+    trades_html = render_table("Trades", recent_trades) if recent_trades is not None and not recent_trades.empty else '<h3>交易流水</h3><p class="muted">暂无交易流水。</p>'
+    return f"""
+    <section class="account-summaries">
+      {positions_html}
+      <a class="secondary-action" href="#all-holdings">查看全部持仓</a>
+      {trades_html}
+      <a class="secondary-action" href="#all-trades">查看全部交易流水</a>
+    </section>
+    """
+
+
+def render_account_initializer(form: dict[str, str]) -> str:
+    return f"""
+    <form id="account-settings" method="post" action="/portfolio-init">
+      <h3>初始化账户</h3>
+      <div class="grid">
+        {portfolio_path(form)}
+        {input_number("principal", "本金", "5000", form)}
+        {input_number("commission_rate", "佣金率", "0.0003", form)}
+        {input_number("min_commission", "最低佣金", "5", form)}
+        {input_number("stamp_tax_rate", "印花税率", "0.001", form)}
+      </div>
+      <p class="muted">初始化后会更新账户概览。</p>
+      <button type="submit">初始化账户</button>
+    </form>
+    """
+
+
+def render_valuation_refresher(form: dict[str, str]) -> str:
+    return f"""
+    <form method="post" action="/portfolio-summary">
+      <input type="hidden" name="refresh_valuation" value="1">
+      <h3>刷新行情 / 更新估值</h3>
+      <div class="grid">
+        {portfolio_path(form)}
+        {input_text("marks", "标记价格", "", form)}
+        {source_fields(form)}
+      </div>
+      <button type="submit">刷新估值</button>
+    </form>
+    """
+
+
+def _format_metric(value: object) -> str:
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
 
 
 def _display_title(title: str) -> str:
@@ -904,6 +1314,127 @@ def checkbox(
     return f'<label class="check"><input type="checkbox" name="{name}"{marker}> {html.escape(label)}</label>'
 
 
+def stock_pool_fields(form: dict[str, str] | None = None) -> str:
+    form = form or {}
+    source = _value(form, "stock_pool_source", "manual")
+    fields = select("stock_pool_source", ("manual", "watchlist", "market_range", "lhb", "ths_lhb"), "manual", "股票池来源", form)
+    if source == "watchlist":
+        fields += _watchlist_select(form)
+    elif source == "market_range":
+        fields += market_range_fields(form)
+    elif source in {"lhb", "ths_lhb"}:
+        fields += lhb_source_fields(form)
+    else:
+        fields += manual_stock_pool_editor(form)
+    return fields
+
+
+def manual_stock_pool_editor(form: dict[str, str]) -> str:
+    raw = _field_value(form, "symbols", "")
+    pool = parse_manual_pool(raw) if raw.strip() else None
+    recognized = pool.summary.filtered_count if pool is not None else 0
+    warnings: list[str] = []
+    if pool is not None:
+        warnings.extend(pool.warnings)
+        if pool.duplicates:
+            warnings.append(f"重复代码：{', '.join(pool.duplicates)}")
+    return f"""
+    <details class="drawer manual-stock-pool-editor">
+      <summary>编辑手动股票池</summary>
+      <label>手动股票池<textarea name="symbols">{html.escape(raw)}</textarea></label>
+      <p class="muted">支持逗号、空格、换行分隔。已识别股票数量：{recognized}</p>
+      <p class="muted">{html.escape("；".join(warnings))}</p>
+      <label class="check"><input type="radio" name="manual_pool_mode" value="once" checked> 仅本次使用</label>
+      <p class="muted">保存为自选组合请到账户页的自选组合管理，或使用账户里的统一保存逻辑。</p>
+    </details>
+    """
+
+
+def market_range_fields(form: dict[str, str]) -> str:
+    selected = set(_value(form, "market_range", "all_a").split(","))
+    options = ("all_a", "sh", "sz", "chinext", "star", "bj")
+    checks = []
+    for value in options:
+        checked = " checked" if value in selected else ""
+        label = OPTION_LABELS["market_range"][value]
+        checks.append(f'<label class="check"><input type="checkbox" name="market_range" value="{value}"{checked}> {html.escape(label)}</label>')
+    summary = "、".join(OPTION_LABELS["market_range"].get(value, value) for value in options if value in selected)
+    return f'<div class="checkbox-group"><p class="muted">市场范围：{html.escape(summary or "未选择市场范围")}</p>{"".join(checks)}<p class="muted">大范围股票池可能耗时较长。</p></div>'
+
+
+def lhb_source_fields(form: dict[str, str]) -> str:
+    fields = select("lhb_range", ("1w", "1m", "3m", "half_year", "1y", "custom"), "1w", "龙虎榜时间范围", form)
+    if _value(form, "lhb_range", "1w") == "custom":
+        fields += input_text("lhb_start", "龙虎榜开始日期", "", form)
+        fields += input_text("lhb_end", "龙虎榜结束日期", "", form)
+    fields += '<p class="muted">结果会显示真实数据来源、时间范围、股票数量、错误或警告。同花顺龙虎榜不可用时会说明原因。</p>'
+    return fields
+
+
+def _watchlist_select(form: dict[str, str] | None = None) -> str:
+    form = form or {}
+    store = WatchlistStore(_value(form, "account_path", _value(form, "path", DEFAULT_USER_PATH)))
+    values = tuple(item.name for item in store.list())
+    if not values:
+        return '<p class="muted">暂无自选组合，请到账户页创建</p>'
+    current = _field_value(form, "watchlist_name", values[0])
+    options = []
+    for value in values:
+        selected = " selected" if value == current else ""
+        item = store.get(value)
+        count = item.count if item is not None else 0
+        options.append(f'<option value="{html.escape(value)}"{selected}>{html.escape(value)}（{count}只）</option>')
+    return f'<label>自选股组合<select name="watchlist_name">{"".join(options)}</select></label>'
+
+
+def render_watchlist_management(form: dict[str, str]) -> str:
+    path = _value(form, "path", DEFAULT_USER_PATH)
+    store = WatchlistStore(path)
+    watchlists = _watchlists_frame(store)
+    return f"""
+      <section id="watchlists">
+        <h2>自选股组合</h2>
+        <p class="muted">自选股不是持仓；删除自选股不会影响账户现金、持仓或交易流水。</p>
+        {render_table("Watchlists", watchlists) if not watchlists.empty else '<p class="muted">暂无自选组合</p>'}
+        <div class="columns">
+          <form method="post" action="/watchlist-create">
+            <h3>创建组合</h3>
+            {portfolio_path(form)}
+            {input_text("watchlist_name", "组合名称", "", form)}
+            <button type="submit">创建组合</button>
+          </form>
+          <form method="post" action="/watchlist-add-symbol">
+            <h3>添加股票</h3>
+            {portfolio_path(form)}
+            {_watchlist_select(form)}
+            {input_text("symbol", "股票代码", "", form)}
+            <button type="submit">添加股票</button>
+          </form>
+          <form method="post" action="/watchlist-remove-symbol">
+            <h3>删除股票</h3>
+            {portfolio_path(form)}
+            {_watchlist_select(form)}
+            {input_text("symbol", "股票代码", "", form)}
+            <button type="submit">删除股票</button>
+          </form>
+          <form method="post" action="/watchlist-rename">
+            <h3>重命名组合</h3>
+            {portfolio_path(form)}
+            {_watchlist_select(form)}
+            {input_text("new_watchlist_name", "新组合名称", "", form)}
+            <button type="submit">重命名组合</button>
+          </form>
+          <form method="post" action="/watchlist-delete">
+            <h3>删除组合</h3>
+            {portfolio_path(form)}
+            {_watchlist_select(form)}
+            <button type="submit">删除组合</button>
+          </form>
+        </div>
+      </section>
+    """
+
+
 def source_fields(form: dict[str, str] | None = None) -> str:
     return (
         select("source", ("", "baostock", "akshare", "joinquant"), "", "历史源", form)
@@ -938,6 +1469,9 @@ def portfolio_path(form: dict[str, str] | None = None) -> str:
 
 def trade_fields(side: str, form: dict[str, str] | None = None) -> str:
     reason = "entry_reason" if side == "buy" else "exit_reason"
+    form = dict(form or {})
+    form.setdefault("strategy_meta", "thermostat")
+    form.setdefault("system", "trend_following")
     return (
         input_text("symbol", "股票代码", "", form)
         + input_number("price", "成交价", "", form)
@@ -947,12 +1481,14 @@ def trade_fields(side: str, form: dict[str, str] | None = None) -> str:
             if side == "buy"
             else ""
         )
+        + '<details><summary>高级信息</summary><div class="grid">'
         + input_text("strategy_meta", "策略", "turtle_system", form)
         + input_text("system", "系统", "S1", form)
         + input_text(reason, "原因", "", form)
         + input_text("signal_date", "信号日", "", form)
         + input_text("execution_date", "执行日", "", form)
         + input_text("note", "备注", "", form)
+        + "</div></details>"
     )
 
 
@@ -1744,11 +2280,23 @@ def _checked(form: dict[str, str], key: str) -> bool:
 
 
 def _page_for_path(path: str) -> str:
-    if path in {"/turtle", "/portfolio-buy", "/portfolio-sell", "/portfolio-adjust-cost", "/portfolio-init", "/portfolio-summary"}:
-        return "portfolio" if path.startswith("/portfolio") else "turtle"
-    if path == "/turtle-backtest":
+    if path in {
+        "/thermostat",
+        "/portfolio-buy",
+        "/portfolio-sell",
+        "/portfolio-adjust-cost",
+        "/portfolio-init",
+        "/portfolio-summary",
+        "/watchlist-create",
+        "/watchlist-add-symbol",
+        "/watchlist-remove-symbol",
+        "/watchlist-rename",
+        "/watchlist-delete",
+    }:
+        return "portfolio" if path.startswith("/portfolio") else "thermostat"
+    if path == "/thermostat-backtest":
         return "backtest"
-    return "turtle"
+    return "thermostat"
 
 
 def _field_value(form: dict[str, str] | None, key: str, default: str) -> str:
@@ -1767,6 +2315,102 @@ def _request_summary(form: dict[str, str], keys: list[str]) -> dict[str, object]
         if value is not None:
             values[key] = value
     return values
+
+
+def _resolve_thermostat_stock_pool(form: dict[str, str], service: MarketDataService):
+    source = _value(form, "stock_pool_source", "manual")
+    account_path = _value(form, "account_path", _value(form, "path", DEFAULT_USER_PATH))
+    exclude_star = _checked(form, "exclude_star")
+    if source == "watchlist":
+        return resolve_watchlist_pool(WatchlistStore(account_path), _value(form, "watchlist_name"), exclude_star=exclude_star)
+    if source == "market_range":
+        try:
+            stocks = service.get_stock_symbols(refresh=_checked(form, "refresh"))
+        except Exception as exc:
+            return _stock_pool_error("market_range", "市场范围", f"市场范围股票列表获取失败：{exc}")
+        source_detail = _stock_source_detail(service)
+        return resolve_market_range_pool(stocks, _value(form, "market_range", "all_a"), source_detail=source_detail, updated_at=_today_yyyymmdd(), exclude_star=exclude_star)
+    if source in {"lhb", "ths_lhb"}:
+        range_key = _value(form, "lhb_range", "1w")
+        try:
+            start, end = lhb_range_dates(range_key, as_of=_value(form, "end", _today_yyyymmdd()), start_date=_value(form, "lhb_start"), end_date=_value(form, "lhb_end"))
+        except Exception as exc:
+            return _stock_pool_error("lhb", "龙虎榜", str(exc))
+        requested_source = "ths" if source == "ths_lhb" else "eastmoney"
+        return resolve_lhb_pool(
+            lambda start_date, end_date: build_lhb_candidates(start_date, end_date, 500)[1],
+            start_date=start,
+            end_date=end,
+            requested_source=requested_source,
+            actual_source="东方财富龙虎榜",
+            exclude_star=exclude_star,
+        )
+    return parse_manual_pool(_value(form, "symbols"), exclude_star=exclude_star)
+
+
+def _stock_pool_error(source: str, name: str, message: str):
+    from stock_picker.pools import StockPoolResult, StockPoolSummary
+
+    summary = StockPoolSummary(source=source, name=name, original_count=0, deduped_count=0, filtered_count=0, removed_count=0)
+    return StockPoolResult([], summary, errors=[message])
+
+
+def _stock_source_detail(service: MarketDataService) -> str:
+    result = getattr(service, "last_source_results", {}).get("stock")
+    if result is None:
+        return "现有股票列表"
+    return result.source
+
+
+def _stock_pool_error_result(pool) -> RenderResult:
+    return RenderResult(
+        "股票池错误",
+        summaries=[_pool_summary_dict(pool)],
+        tables=[TableBlock("Stock Pool Summary", _pool_summary_frame(pool))],
+    )
+
+
+def _pool_summary_frame(pool) -> pd.DataFrame:
+    return pd.DataFrame([_pool_summary_dict(pool)])
+
+
+def _pool_summary_dict(pool) -> dict[str, object]:
+    summary = pool.summary
+    return {
+        "stock_pool_source": summary.source,
+        "name": summary.name,
+        "time_range": summary.time_range,
+        "source_detail": summary.source_detail,
+        "original_count": summary.original_count,
+        "deduped_count": summary.deduped_count,
+        "filtered_count": summary.filtered_count,
+        "removed_count": summary.removed_count,
+        "warnings": "；".join(pool.warnings),
+        "errors": "；".join(pool.errors),
+    }
+
+
+def _watchlists_frame(store: WatchlistStore) -> pd.DataFrame:
+    rows = [
+        {
+            "name": item.name,
+            "symbols": ",".join(item.symbols),
+            "filtered_count": item.count,
+            "updated_at": item.updated_at,
+        }
+        for item in store.list()
+    ]
+    return pd.DataFrame(rows, columns=["name", "symbols", "filtered_count", "updated_at"])
+
+
+def _thermostat_display_form(form: dict[str, str]) -> dict[str, str]:
+    display = dict(form)
+    path = _value(display, "account_path", DEFAULT_USER_PATH)
+    if not _optional(display, "symbols"):
+        last = WatchlistStore(path).load_last_manual_input()
+        if last:
+            display["symbols"] = last
+    return display
 
 
 def _today_yyyymmdd() -> str:
@@ -1864,7 +2508,11 @@ nav a.active {
   text-decoration: underline;
   text-underline-offset: 6px;
 }
-main { padding: 18px 28px 40px; }
+main {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 18px 28px 40px;
+}
 section, .message {
   max-width: 100%;
   margin-bottom: 18px;
@@ -1872,6 +2520,98 @@ section, .message {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
+}
+.workbench-page {
+  display: grid;
+  gap: 18px;
+}
+.workspace-section,
+.account-overview,
+.account-summaries,
+.function-tabs {
+  width: 100%;
+}
+.page-head {
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.panel-block {
+  margin-bottom: 16px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+.overview-card {
+  min-height: 74px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+.overview-card span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+.overview-card strong {
+  display: block;
+  margin-top: 8px;
+  font-size: 16px;
+}
+.tab-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.tab-labels span,
+.secondary-action {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f2f5f8;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 13px;
+}
+.message-inline {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border-left: 4px solid var(--accent);
+  background: #f2f8f7;
+}
+.message-inline.error {
+  border-left-color: var(--danger);
+  background: #fff4f2;
+}
+details {
+  margin: 10px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+textarea {
+  width: 100%;
+  min-height: 120px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
 }
 .message { border-left: 4px solid var(--accent); }
 .message.error { border-left-color: var(--danger); }
@@ -1899,7 +2639,7 @@ label.check {
   align-items: center;
   margin: 12px 16px 0 0;
 }
-input, select {
+input, select, textarea {
   width: 100%;
   min-height: 36px;
   padding: 7px 9px;
@@ -1951,6 +2691,11 @@ button {
   background: #f2f5f8;
 }
 h3 span { color: var(--muted); font-weight: 400; }
+@media (max-width: 720px) {
+  header, nav { padding-left: 16px; padding-right: 16px; }
+  main { padding: 14px 16px 32px; }
+  .columns { grid-template-columns: 1fr; }
+}
 """
 
 
