@@ -29,6 +29,35 @@ def test_watchlist_store_adds_deduplicates_and_removes_symbols(tmp_path) -> None
     assert "不存在" in missing.message
 
 
+def test_watchlist_store_splits_batch_input_and_rejects_unsupported_codes(tmp_path) -> None:
+    store = WatchlistStore(tmp_path / "user")
+    store.create("短线观察")
+
+    result = store.add_symbols("短线观察", ["600519, 000001 300750", "516650"])
+    saved = store.get("短线观察")
+
+    assert saved is not None
+    assert saved.symbols == ["600519.SH", "000001.SZ", "300750.SZ"]
+    assert result.symbols == ["600519.SH", "000001.SZ", "300750.SZ"]
+    assert result.invalid_symbols == ["516650"]
+    assert "516650" in result.message
+
+
+def test_watchlist_store_rejects_batch_remove_without_mutating(tmp_path) -> None:
+    store = WatchlistStore(tmp_path / "user")
+    store.create("短线观察")
+    store.add_symbols("短线观察", ["600519", "000001"])
+
+    result = store.remove_symbol("短线观察", "600519,000001")
+    saved = store.get("短线观察")
+
+    assert saved is not None
+    assert saved.symbols == ["600519.SH", "000001.SZ"]
+    assert result.symbols == ["600519.SH", "000001.SZ"]
+    assert result.status == "invalid_symbol"
+    assert "一次只能删除一只股票" in result.message
+
+
 def test_watchlist_store_renames_deletes_and_rejects_duplicate_names(tmp_path) -> None:
     store = WatchlistStore(tmp_path / "user")
     store.create("短线观察")

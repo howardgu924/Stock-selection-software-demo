@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from stock_picker.pools import (
     LARGE_POOL_WARNING,
     parse_manual_pool,
@@ -22,6 +24,27 @@ def test_parse_manual_pool_deduplicates_and_reports_invalid_symbols() -> None:
     assert any("abc" in warning for warning in result.warnings)
 
 
+def test_parse_manual_pool_splits_common_batch_separators() -> None:
+    result = parse_manual_pool("600519，000001;300750 603309\n688001")
+
+    assert result.symbols == [
+        "600519.SH",
+        "000001.SZ",
+        "300750.SZ",
+        "603309.SH",
+        "688001.SH",
+    ]
+    assert result.invalid_symbols == []
+
+
+def test_parse_manual_pool_rejects_unsupported_six_digit_codes_without_suffix() -> None:
+    result = parse_manual_pool("516650,515880,515070,159801")
+
+    assert result.symbols == []
+    assert result.invalid_symbols == ["516650", "515880", "515070", "159801"]
+    assert any("516650" in warning for warning in result.warnings)
+
+
 def test_parse_manual_pool_returns_error_for_empty_input() -> None:
     result = parse_manual_pool("  ")
 
@@ -40,6 +63,30 @@ def test_parse_manual_pool_excludes_star_market_and_stops_when_empty() -> None:
     assert empty.symbols == []
     assert empty.should_stop
     assert "剔除科创板后股票池为空" in empty.errors[0]
+
+
+def test_resolve_watchlist_pool_excludes_historical_invalid_symbols(tmp_path) -> None:
+    user_path = tmp_path / "user"
+    user_path.mkdir()
+    (user_path / "watchlists.json").write_text(
+        json.dumps(
+            {
+                "观察": {
+                    "symbols": ["600519.SH", "516650,515880", "515070"],
+                    "updated_at": "2026-06-30T00:00:00",
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    store = WatchlistStore(user_path)
+
+    result = resolve_watchlist_pool(store, "观察")
+
+    assert result.symbols == ["600519.SH"]
+    assert result.invalid_symbols == ["516650,515880", "515070"]
+    assert any("516650" in warning for warning in result.warnings)
 
 
 def test_large_pool_warning_starts_above_500_symbols() -> None:

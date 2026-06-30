@@ -6,7 +6,7 @@ from typing import Callable
 
 import pandas as pd
 
-from stock_picker.data.models import StockInfo, normalize_symbol, symbol_code
+from stock_picker.data.models import StockInfo, is_supported_stock_symbol, normalize_symbol, split_symbol_tokens, symbol_code
 from stock_picker.user.watchlist import WatchlistStore
 
 
@@ -40,7 +40,7 @@ class StockPoolResult:
 
 
 def parse_manual_pool(raw: str, *, name: str = "手动输入", exclude_star: bool = False) -> StockPoolResult:
-    tokens = [item.strip() for item in raw.replace("\n", ",").split(",") if item.strip()]
+    tokens = split_symbol_tokens(raw)
     if not tokens:
         summary = StockPoolSummary("manual", name, 0, 0, 0, 0)
         return StockPoolResult([], summary, errors=["手动输入为空，请输入股票代码或选择其他股票池。"])
@@ -212,8 +212,7 @@ def _build_result(
 
 
 def _is_valid_stock_code(value: str) -> bool:
-    code = symbol_code(str(value).strip())
-    return len(code) == 6 and code.isdigit()
+    return is_supported_stock_symbol(value)
 
 
 def _is_star_market(symbol: str) -> bool:

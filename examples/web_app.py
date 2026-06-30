@@ -18,7 +18,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stock_picker.data import DataSourceConfig, MarketDataService
-from stock_picker.data.models import StockInfo, normalize_symbol, symbol_code
+from stock_picker.data.models import StockInfo, is_supported_stock_symbol, normalize_symbol, symbol_code
 from stock_picker.execution import build_execution_plan
 from stock_picker.pools import (
     lhb_range_dates,
@@ -181,6 +181,10 @@ COLUMN_LABELS = {
     "original_count": "原始数量",
     "deduped_count": "去重后数量",
     "filtered_count": "过滤后数量",
+    "added_count": "新增数量",
+    "duplicate_count": "重复数量",
+    "invalid_count": "无效数量",
+    "invalid_symbols": "无效代码",
     "removed_count": "被剔除数量",
     "warnings": "警告",
     "errors": "错误",
@@ -293,6 +297,7 @@ COLUMN_LABELS.update(
         "regime_switch_count": "市场状态切换次数",
         "risk_note": "风险提示",
         "stage": "阶段",
+        "status": "状态",
         "strength": "强度",
         "suggested_position_pct": "建议仓位比例",
         "switch_count": "切换次数",
@@ -428,7 +433,7 @@ OPTION_LABELS = {
 
 
 class WebAppHandler(BaseHTTPRequestHandler):
-    server_version = "StockPickerWeb/0.1.2"
+    server_version = "StockPickerWeb/1.1.3"
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -988,17 +993,44 @@ def handle_watchlist_save_manual(form: dict[str, str]) -> RenderResult:
 
 def handle_watchlist_action(path: str, form: dict[str, str]) -> RenderResult:
     store = WatchlistStore(_value(form, "path", DEFAULT_USER_PATH))
+    result = None
     if path == "/watchlist-create":
-        store.create(_value(form, "watchlist_name"))
+        result = store.create(_value(form, "watchlist_name"))
     elif path == "/watchlist-add-symbol":
-        store.add_symbols(_value(form, "watchlist_name"), [_value(form, "symbol")])
+        result = store.add_symbols(_value(form, "watchlist_name"), [_value(form, "symbol")])
     elif path == "/watchlist-remove-symbol":
-        store.remove_symbol(_value(form, "watchlist_name"), _value(form, "symbol"))
+        result = store.remove_symbol(_value(form, "watchlist_name"), _value(form, "symbol"))
     elif path == "/watchlist-rename":
-        store.rename(_value(form, "watchlist_name"), _value(form, "new_watchlist_name"))
+        result = store.rename(_value(form, "watchlist_name"), _value(form, "new_watchlist_name"))
     elif path == "/watchlist-delete":
-        store.delete(_value(form, "watchlist_name"))
-    return RenderResult("自选股组合", tables=[TableBlock("Watchlists", _watchlists_frame(store))])
+        result = store.delete(_value(form, "watchlist_name"))
+    summaries = [_watchlist_operation_summary(result)] if result is not None else []
+    return RenderResult(
+        "自选股组合",
+        summaries=summaries,
+        tables=[TableBlock("Watchlists", _watchlists_frame(store))],
+        extra_html=_watchlist_operation_feedback(result),
+    )
+
+
+def _watchlist_operation_summary(result) -> dict[str, object]:
+    duplicates = result.duplicates or []
+    invalid = result.invalid_symbols or []
+    return {
+        "watchlist_name": result.name,
+        "status": result.status,
+        "filtered_count": len(result.symbols),
+        "duplicate_count": len(duplicates),
+        "invalid_count": len(invalid),
+        "invalid_symbols": ", ".join(invalid),
+    }
+
+
+def _watchlist_operation_feedback(result) -> str:
+    if result is None or not result.message:
+        return ""
+    class_name = "warning" if result.invalid_symbols else "info"
+    return f'<p class="muted {class_name}">{html.escape(result.message)}</p>'
 
 
 def handle_thermostat_backtest(form: dict[str, str]) -> RenderResult:
@@ -2866,12 +2898,25 @@ def _watchlists_frame(store: WatchlistStore) -> pd.DataFrame:
         {
             "name": item.name,
             "symbols": ",".join(item.symbols),
-            "filtered_count": item.count,
+            "filtered_count": len([symbol for symbol in item.symbols if is_supported_stock_symbol(symbol)]),
+            "invalid_symbols": ", ".join(_watchlist_invalid_symbols(item.symbols)),
+            "warnings": _watchlist_warning(item.symbols),
             "updated_at": item.updated_at,
         }
         for item in store.list()
     ]
-    return pd.DataFrame(rows, columns=["name", "symbols", "filtered_count", "updated_at"])
+    return pd.DataFrame(rows, columns=["name", "symbols", "filtered_count", "invalid_symbols", "warnings", "updated_at"])
+
+
+def _watchlist_invalid_symbols(symbols: list[str]) -> list[str]:
+    return [symbol for symbol in symbols if not is_supported_stock_symbol(symbol)]
+
+
+def _watchlist_warning(symbols: list[str]) -> str:
+    invalid = _watchlist_invalid_symbols(symbols)
+    if not invalid:
+        return ""
+    return f"存在异常代码，请删除后重新添加：{', '.join(invalid)}"
 
 
 def _thermostat_display_form(form: dict[str, str]) -> dict[str, str]:

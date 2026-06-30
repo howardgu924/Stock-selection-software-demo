@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 
 from examples import web_app
@@ -271,6 +273,47 @@ def test_web_portfolio_page_exposes_watchlist_management_without_hiding_account_
     assert "高关注" in html
     assert 'action="/portfolio-buy"' in html
     assert 'action="/portfolio-sell"' in html
+
+
+def test_web_watchlist_add_symbol_splits_batch_input_and_reports_invalid(tmp_path) -> None:
+    account_path = tmp_path / "account"
+    store = WatchlistStore(account_path)
+    store.create("短线观察")
+
+    result = web_app.handle_watchlist_action(
+        "/watchlist-add-symbol",
+        {"path": str(account_path), "watchlist_name": "短线观察", "symbol": "600519, 000001 300750\n516650"},
+    )
+    saved = WatchlistStore(account_path).get("短线观察")
+    html = web_app.render_message(result, None)
+
+    assert saved is not None
+    assert saved.symbols == ["600519.SH", "000001.SZ", "300750.SZ"]
+    assert "516650" in html
+    assert "无法识别或暂不支持" in html
+
+
+def test_web_watchlist_table_flags_historical_invalid_symbols(tmp_path) -> None:
+    account_path = tmp_path / "account"
+    account_path.mkdir()
+    (account_path / "watchlists.json").write_text(
+        json.dumps(
+            {
+                "持仓": {
+                    "symbols": ["516650,515880", "515070", "600519.SH"],
+                    "updated_at": "2026-06-30T00:00:00",
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    html = web_app.render_page(page="portfolio", form={"path": str(account_path)})
+
+    assert "存在异常代码" in html
+    assert "516650" in html
+    assert "515070" in html
 
 
 def test_web_normal_pages_do_not_show_old_strategy_entries() -> None:

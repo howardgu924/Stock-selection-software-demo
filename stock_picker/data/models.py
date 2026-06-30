@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -32,6 +33,16 @@ def normalize_symbol(symbol: str) -> str:
 
 def symbol_code(symbol: str) -> str:
     return StockSymbol(symbol).code
+
+
+def split_symbol_tokens(raw: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[\s,，;；、]+", str(raw).strip()) if item.strip()]
+
+
+def is_supported_stock_symbol(symbol: str) -> bool:
+    code = symbol_code(str(symbol).strip())
+    normalized = normalize_symbol(str(symbol).strip())
+    return len(code) == 6 and code.isdigit() and normalized.endswith((".SH", ".SZ", ".BJ"))
 
 
 def baostock_symbol(symbol: str) -> str:
