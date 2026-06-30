@@ -99,12 +99,32 @@ def test_web_thermostat_page_shows_stock_pool_controls(tmp_path) -> None:
     assert "自选股组合" in html
     assert "市场范围" in html
     assert "龙虎榜" in html
-    assert "同花顺龙虎榜" in html
+    assert "同花顺龙虎榜" not in html
     assert "高关注" in html
     assert "600519,000001" not in html
     assert "剔除科创板" in html
     assert "将在后续阶段接入" not in html
     assert "海龟系统" not in html
+
+
+def test_web_thermostat_get_query_rerenders_selected_lhb_fields() -> None:
+    html = web_app.render_page(page="thermostat", form={"stock_pool_source": "lhb", "lhb_range": "1w"})
+
+    assert 'action="/thermostat-job"' in html
+    assert "龙虎榜时间范围" in html
+    assert "运行候选数量" in html
+    assert "前 20 名" in html
+    assert "前 30 名" in html
+    assert "前 50 名" in html
+    assert "编辑手动股票池" not in html
+
+
+def test_web_stock_pool_source_selector_refreshes_without_running() -> None:
+    html = web_app.render_page(page="thermostat", form={"stock_pool_source": "manual"})
+
+    assert 'name="stock_pool_source"' in html
+    assert 'data-source-selector="stock_pool_source"' in html
+    assert "refreshSourceFields" in html
 
 
 def test_web_thermostat_uses_conditional_stock_pool_controls(tmp_path) -> None:
@@ -141,6 +161,12 @@ def test_web_thermostat_uses_conditional_stock_pool_controls(tmp_path) -> None:
     assert 'type="checkbox" name="market_range"' in market_html
     assert "龙虎榜开始日期" not in lhb_html
     assert "龙虎榜结束日期" not in lhb_html
+    assert 'action="/thermostat-job"' in lhb_html
+    assert 'action="/thermostat-lhb-preview"' not in lhb_html
+    assert 'name="lhb_confirmed_top"' in lhb_html
+    assert "前 20 名" in lhb_html
+    assert "前 30 名" in lhb_html
+    assert "前 50 名" in lhb_html
     assert "龙虎榜开始日期" in custom_lhb_html
     assert "龙虎榜结束日期" in custom_lhb_html
 
@@ -292,6 +318,110 @@ def test_web_thermostat_result_contains_market_holdings_and_candidates(tmp_path,
     candidates = next(table.frame for table in result.tables if table.title == "New Buy Candidates")
     assert holding.loc[0, "symbol"] == "600001.SH"
     assert candidates.loc[0, "symbol"] == "600002.SH"
+
+
+def test_web_lhb_preview_builds_candidates_before_running_thermostat(monkeypatch) -> None:
+    ranked = pd.DataFrame(
+        [
+            {"code": f"600{i:03d}", "name": f"Stock{i}", "net_buy": 1000 - i, "rank": i}
+            for i in range(1, 61)
+        ]
+    )
+    monkeypatch.setattr(web_app, "build_lhb_candidates", lambda start, end, top: (ranked.head(top), ranked))
+
+    result = web_app.handle_thermostat_lhb_preview(
+        {
+            "stock_pool_source": "lhb",
+            "lhb_range": "1w",
+            "end": "20260629",
+            "exclude_star": "on",
+        }
+    )
+
+    assert result.title == "LHB Candidate Preview"
+    summary = result.summaries[0]
+    assert summary["actual_lhb_range"] == "20260623 至 20260629"
+    assert summary["candidate_count"] == 60
+    assert summary["top_options"] == "20 / 30 / 50"
+    assert [table.title for table in result.tables] == ["LHB Top 20", "LHB Top 30", "LHB Top 50"]
+    assert len(result.tables[0].frame) == 20
+    assert len(result.tables[1].frame) == 30
+    assert len(result.tables[2].frame) == 50
+
+
+def test_web_lhb_source_runs_directly_after_range_and_top_selection(monkeypatch) -> None:
+    ranked = pd.DataFrame(
+        [
+            {"code": f"600{i:03d}", "name": f"A{i}", "net_buy": 1000 - i, "rank": i}
+            for i in range(1, 61)
+        ]
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(web_app, "build_lhb_candidates", lambda start, end, top: (ranked.head(top), ranked))
+
+    def fake_run_thermostat_strategy(**kwargs):
+        captured.update(kwargs)
+        return type(
+            "FakeThermostatResult",
+            (),
+            {
+                "market_overview": pd.DataFrame([{"market_regime": "uptrend"}]),
+                "holding_advice": pd.DataFrame(),
+                "new_candidates": pd.DataFrame(),
+                "grid_advice": pd.DataFrame(),
+                "trend_advice": pd.DataFrame(),
+                "errors": pd.DataFrame(),
+            },
+        )()
+
+    monkeypatch.setattr(web_app, "run_thermostat_strategy", fake_run_thermostat_strategy)
+
+    result = web_app.handle_thermostat(
+        {
+            "stock_pool_source": "lhb",
+            "lhb_range": "1w",
+            "lhb_confirmed_top": "20",
+            "end": "20260629",
+        }
+    )
+
+    assert result.title == "恒温器策略"
+    assert len(captured["symbols"]) == 20
+    assert captured["symbols"][:3] == ["600001.SH", "600002.SH", "600003.SH"]
+
+
+def test_web_thermostat_progress_tracks_nodes_and_stock_counts() -> None:
+    fake = FakeWebService(
+        {
+            "600001.SH": _history("600001.SH", [10 + i * 0.2 for i in range(40)]),
+            "600002.SH": _history("600002.SH", [20 + i * 0.1 for i in range(40)]),
+        }
+    )
+    events: list[dict[str, object]] = []
+
+    web_app.run_thermostat_strategy(
+        service=fake,
+        symbols=["600001", "600002"],
+        start_date="20260401",
+        end_date="20260510",
+        cash=100000,
+        progress_callback=events.append,
+    )
+
+    assert {
+        "stage": "load_candidate_history",
+        "completed": 1,
+        "total": 2,
+        "current_symbol": "600001.SH",
+        "node": "加载候选股历史",
+    } in events
+    assert {
+        "stage": "evaluate_candidates",
+        "completed": 2,
+        "total": 2,
+        "current_symbol": "600002.SH",
+        "node": "评估候选股",
+    } in events
 
 
 def test_web_thermostat_rejects_invalid_and_empty_stock_pool(tmp_path) -> None:

@@ -39,7 +39,7 @@ def main() -> None:
         detail.parent.mkdir(parents=True, exist_ok=True)
         top.to_csv(detail, index=False)
 
-    print(f"rows={len(frame)} unique={ranked['code'].nunique()} top={len(top)}")
+    print(f"rows={len(ranked)} unique={ranked['code'].nunique()} top={len(top)}")
     print(f"symbols_txt={output}")
     if args.detail_output:
         print(f"ranked_csv={args.detail_output}")

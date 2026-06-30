@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import sqrt
-from typing import Iterable
+from typing import Callable, Iterable
 
 import pandas as pd
 
@@ -142,10 +142,15 @@ def evaluate_thermostat(
     holdings: pd.DataFrame | None = None,
     cash: float = 0.0,
     as_of: str | None = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> ThermostatResult:
+    if progress_callback:
+        progress_callback({"stage": "classify_market", "completed": 0, "total": 1, "current_symbol": "", "node": "判断市场状态"})
     market = classify_regime(market_history if market_history is not None else _aggregate_market_history(histories))
     market_regime = str(market["regime"])
     date = as_of or str(market.get("regime_date") or "")
+    if progress_callback:
+        progress_callback({"stage": "classify_market", "completed": 1, "total": 1, "current_symbol": "", "node": "判断市场状态"})
     overview = pd.DataFrame(
         [
             {
@@ -160,7 +165,8 @@ def evaluate_thermostat(
     )
 
     holding_rows: list[dict[str, object]] = []
-    for item in _records(holdings):
+    holding_items = _records(holdings)
+    for index, item in enumerate(holding_items, start=1):
         symbol = normalize_symbol(str(item.get("symbol", "")))
         if not symbol:
             continue
@@ -178,10 +184,13 @@ def evaluate_thermostat(
                 data_sufficient=bool(stock["data_sufficient"]),
             )
         )
+        if progress_callback:
+            progress_callback({"stage": "evaluate_holdings", "completed": index, "total": len(holding_items), "current_symbol": symbol, "node": "评估当前持仓"})
 
     candidate_rows: list[dict[str, object]] = []
     holding_symbols = {str(row["symbol"]) for row in holding_rows}
-    for item in candidates or []:
+    candidate_items = list(candidates or [])
+    for index, item in enumerate(candidate_items, start=1):
         symbol = normalize_symbol(str(item.get("symbol", "")))
         if not symbol or symbol in holding_symbols:
             continue
@@ -199,6 +208,8 @@ def evaluate_thermostat(
         )
         if row["action"] != "blocked":
             candidate_rows.append(row)
+        if progress_callback:
+            progress_callback({"stage": "evaluate_candidates", "completed": index, "total": len(candidate_items), "current_symbol": symbol, "node": "评估候选股"})
 
     holding_advice = _advice_frame(holding_rows)
     new_candidates = _advice_frame([row for row in candidate_rows if row["action"] in {"buy", "observe", "wait_confirm"}])
@@ -223,17 +234,26 @@ def run_thermostat_strategy(
     portfolio=None,
     refresh: bool = False,
     market_index: str = "000001.SH",
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> ThermostatResult:
     normalized = [normalize_symbol(symbol) for symbol in symbols]
     histories: dict[str, pd.DataFrame] = {}
     errors: list[dict[str, object]] = []
-    for symbol in normalized:
+    if progress_callback:
+        progress_callback({"stage": "initialize_task", "completed": 0, "total": len(normalized), "current_symbol": "", "node": "初始化任务"})
+    for index, symbol in enumerate(normalized, start=1):
         try:
             histories[symbol] = service.get_history(symbol, start_date=start_date, end_date=end_date, refresh=refresh)
         except Exception as exc:  # pragma: no cover - defensive path for live providers
             histories[symbol] = pd.DataFrame()
             errors.append({"symbol": symbol, "error": str(exc)})
+        if progress_callback:
+            progress_callback({"stage": "load_candidate_history", "completed": index, "total": len(normalized), "current_symbol": symbol, "node": "加载候选股历史"})
+    if progress_callback:
+        progress_callback({"stage": "load_market_history", "completed": 0, "total": 1, "current_symbol": market_index, "node": "加载市场基准"})
     market_history = _load_market_history(service, market_index, start_date, end_date)
+    if progress_callback:
+        progress_callback({"stage": "load_market_history", "completed": 1, "total": 1, "current_symbol": market_index, "node": "加载市场基准"})
     holdings = getattr(portfolio, "positions", None)
     result = evaluate_thermostat(
         histories=histories,
@@ -242,6 +262,7 @@ def run_thermostat_strategy(
         holdings=holdings,
         cash=cash,
         as_of=end_date,
+        progress_callback=progress_callback,
     )
     if errors:
         result.errors = pd.DataFrame(errors)

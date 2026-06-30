@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import math
 import sys
+import threading
+import uuid
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,6 +49,8 @@ from examples.list_lhb_candidates import build_lhb_candidates
 DEFAULT_PORT = 8765
 DEFAULT_USER_PATH = "data/user/default"
 LAST_FORM: dict[str, str] = {}
+JOBS: dict[str, "ThermostatJob"] = {}
+JOBS_LOCK = threading.Lock()
 PAGES = {"thermostat", "backtest", "portfolio"}
 APP_NAME = "选股工作台"
 
@@ -276,6 +281,7 @@ OPTION_LABELS = {
         "1y": "最近 1 年",
         "custom": "自定义",
     },
+    "lhb_confirmed_top": {"20": "前 20 名", "30": "前 30 名", "50": "前 50 名"},
     "strategy_date_range": {
         "1m": "最近 1 个月",
         "3m": "最近 3 个月",
@@ -324,9 +330,14 @@ class WebAppHandler(BaseHTTPRequestHandler):
     server_version = "StockPickerWeb/0.1"
 
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/health":
             self._send_text("ok")
+            return
+        if path == "/job":
+            job_id = parse_qs(parsed.query).get("id", [""])[-1]
+            self._send_json(job_status_payload(job_id))
             return
         if path == "/":
             self._send_page(render_page(page="thermostat", form=LAST_FORM))
@@ -335,13 +346,15 @@ class WebAppHandler(BaseHTTPRequestHandler):
         if page not in PAGES:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
+        query_form = _query_form(parsed.query)
+        display_form = {**LAST_FORM, **query_form} if query_form else LAST_FORM
         result = None
         if page == "portfolio":
             try:
-                result = handle_portfolio_summary({"path": LAST_FORM.get("path", DEFAULT_USER_PATH)})
+                result = handle_portfolio_summary({"path": display_form.get("path", DEFAULT_USER_PATH)})
             except Exception:
                 result = None
-        self._send_page(render_page(page=page, result=result, form=LAST_FORM))
+        self._send_page(render_page(page=page, result=result, form=display_form))
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -352,6 +365,12 @@ class WebAppHandler(BaseHTTPRequestHandler):
             if path == "/thermostat":
                 page = "thermostat"
                 result = handle_thermostat(form)
+            elif path == "/thermostat-lhb-preview":
+                page = "thermostat"
+                result = handle_thermostat_lhb_preview(form)
+            elif path == "/thermostat-job":
+                page = "thermostat"
+                result = handle_thermostat_job(form)
             elif path == "/thermostat-backtest":
                 page = "backtest"
                 result = handle_thermostat_backtest(form)
@@ -409,6 +428,14 @@ class WebAppHandler(BaseHTTPRequestHandler):
         encoded = body.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_json(self, payload: dict[str, object]) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
@@ -491,7 +518,7 @@ def handle_turtle(form: dict[str, str]) -> RenderResult:
     )
 
 
-def handle_thermostat(form: dict[str, str]) -> RenderResult:
+def handle_thermostat(form: dict[str, str], progress_callback=None) -> RenderResult:
     service = _service(form)
     start, end = _strategy_range_dates(form)
     account_path = _value(form, "account_path", DEFAULT_USER_PATH)
@@ -511,6 +538,7 @@ def handle_thermostat(form: dict[str, str]) -> RenderResult:
         cash=cash,
         portfolio=portfolio,
         refresh=_checked(form, "refresh"),
+        progress_callback=progress_callback,
     )
     tables = [
         TableBlock("Stock Pool Summary", _pool_summary_frame(pool)),
@@ -524,6 +552,8 @@ def handle_thermostat(form: dict[str, str]) -> RenderResult:
     if _checked(form, "execution_plan") and not result.new_candidates.empty:
         executable = result.new_candidates[result.new_candidates["action"].isin(["buy", "add"])].copy()
         if not executable.empty:
+            if progress_callback:
+                progress_callback({"stage": "build_execution_plan", "completed": 0, "total": len(executable), "current_symbol": "", "node": "生成执行计划"})
             quotes = service.get_realtime_quotes(executable["symbol"].dropna().astype(str).tolist())
             plan = build_execution_plan(
                 executable,
@@ -532,6 +562,8 @@ def handle_thermostat(form: dict[str, str]) -> RenderResult:
                 next_day_premium=_float(form, "next_day_premium", 0.02),
                 volume_limit_pct=_float(form, "volume_limit_pct", 0.10),
             )
+            if progress_callback:
+                progress_callback({"stage": "build_execution_plan", "completed": len(executable), "total": len(executable), "current_symbol": "", "node": "生成执行计划"})
             tables.insert(5, TableBlock("Execution Plan", plan))
     return RenderResult(
         title="恒温器策略",
@@ -543,6 +575,287 @@ def handle_thermostat(form: dict[str, str]) -> RenderResult:
         ],
         tables=tables,
     )
+
+
+def handle_thermostat_lhb_preview(form: dict[str, str]) -> RenderResult:
+    start, end = _lhb_dates_from_form(form)
+    _top, ranked = build_lhb_candidates(start, end, 50)
+    ranked = _prepare_lhb_preview_frame(ranked, exclude_star=_checked(form, "exclude_star"))
+    if ranked.empty:
+        return RenderResult(
+            "LHB Candidate Preview",
+            summaries=[{"actual_lhb_range": f"{start} 至 {end}", "candidate_count": 0, "errors": "龙虎榜候选池为空，请调整时间范围。"}],
+        )
+    tables = [
+        TableBlock("LHB Top 20", ranked.head(20)),
+        TableBlock("LHB Top 30", ranked.head(30)),
+        TableBlock("LHB Top 50", ranked.head(50)),
+    ]
+    return RenderResult(
+        "LHB Candidate Preview",
+        summaries=[
+            {
+                "actual_lhb_range": f"{start} 至 {end}",
+                "candidate_count": len(ranked),
+                "top_options": "20 / 30 / 50",
+                "source_detail": "东方财富龙虎榜",
+            }
+        ],
+        tables=tables,
+        extra_html=render_lhb_confirmation_form(form, ranked, start, end),
+    )
+
+
+def handle_thermostat_job(form: dict[str, str]) -> RenderResult:
+    job = start_thermostat_job(form)
+    return RenderResult(
+        "Thermostat Job Started",
+        summaries=[{"job_id": job.job_id, "stage": job.stage, "node": job.node, "message": job.message}],
+        extra_html=render_job_progress(job.job_id),
+    )
+
+
+def _lhb_dates_from_form(form: dict[str, str]) -> tuple[str, str]:
+    range_key = _value(form, "lhb_range", "1w")
+    return lhb_range_dates(
+        range_key,
+        as_of=_value(form, "end", _today_yyyymmdd()),
+        start_date=_value(form, "lhb_start"),
+        end_date=_value(form, "lhb_end"),
+    )
+
+
+def _prepare_lhb_preview_frame(frame: pd.DataFrame, *, exclude_star: bool = False) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["code", "name", "net_buy", "rank"])
+    data = frame.copy()
+    data["code"] = data["code"].astype(str).str.zfill(6)
+    if exclude_star:
+        data = data[~data["code"].str.startswith("688")]
+    if "rank" not in data.columns:
+        data = data.reset_index(drop=True)
+        data["rank"] = range(1, len(data) + 1)
+    return data.reset_index(drop=True)
+
+
+def render_lhb_confirmation_form(form: dict[str, str], ranked: pd.DataFrame, start: str, end: str) -> str:
+    hidden = _hidden_inputs(
+        form,
+        [
+            "account_path",
+            "strategy_date_range",
+            "start",
+            "end",
+            "cash",
+            "use_simulated_cash",
+            "refresh",
+            "execution_plan",
+            "next_day_premium",
+            "volume_limit_pct",
+            "exclude_star",
+            "data_source",
+            "history_source",
+            "realtime_source",
+            "stock_source",
+        ],
+    )
+    symbols = ",".join(_symbols_from_lhb_frame(ranked.head(50)))
+    selected_top = _value(form, "lhb_confirmed_top", "30")
+    top_options = []
+    for value, label in (("20", "前 20 名"), ("30", "前 30 名"), ("50", "前 50 名")):
+        selected = " selected" if selected_top == value else ""
+        top_options.append(f'<option value="{value}"{selected}>{label}</option>')
+    return f"""
+    <section class="candidate-confirm">
+      <h3>确认龙虎榜候选池</h3>
+      <p class="muted">实际日期范围：{html.escape(start)} 至 {html.escape(end)}。默认使用 Top 30，可改为 Top 20/30/50 后再运行。</p>
+      <form method="post" action="/thermostat-job">
+        {hidden}
+        <input type="hidden" name="stock_pool_source" value="lhb">
+        <input type="hidden" name="lhb_range" value="{html.escape(_value(form, "lhb_range", "1w"))}">
+        <input type="hidden" name="lhb_start" value="{html.escape(start)}">
+        <input type="hidden" name="lhb_end" value="{html.escape(end)}">
+        <input type="hidden" name="confirmed_lhb_symbols" value="{html.escape(symbols)}">
+        <label>候选池数量
+          <select name="lhb_confirmed_top" data-lhb-top-selector>
+            {"".join(top_options)}
+          </select>
+        </label>
+        <button type="submit">确认候选池并运行恒温器</button>
+      </form>
+    </section>
+    """
+
+
+def _symbols_from_lhb_frame(frame: pd.DataFrame) -> list[str]:
+    if frame is None or frame.empty or "code" not in frame:
+        return []
+    return frame["code"].astype(str).str.zfill(6).tolist()
+
+
+def _hidden_inputs(form: dict[str, str], keys: list[str]) -> str:
+    fields = []
+    for key in keys:
+        if key in form:
+            fields.append(f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(str(form[key]))}">')
+    return "\n".join(fields)
+
+
+class ThermostatJob:
+    def __init__(self, job_id: str, form: dict[str, str]) -> None:
+        self.job_id = job_id
+        self.form = dict(form)
+        self.status = "queued"
+        self.stage = "queued"
+        self.node = "排队"
+        self.message = "任务已创建，等待开始。"
+        self.completed = 0
+        self.total = 0
+        self.current_symbol = ""
+        self.percent = 0
+        self.error = ""
+        self.result_html = ""
+
+    def update(self, event: dict[str, object]) -> None:
+        with JOBS_LOCK:
+            self.status = "running"
+            self.stage = str(event.get("stage") or self.stage)
+            self.node = str(event.get("node") or self.node)
+            self.completed = int(event.get("completed") or 0)
+            self.total = int(event.get("total") or 0)
+            self.current_symbol = str(event.get("current_symbol") or "")
+            self.percent = _progress_percent(self.stage, self.completed, self.total)
+            self.message = _progress_message(self.node, self.stage, self.completed, self.total, self.current_symbol)
+
+    def complete(self, result: RenderResult) -> None:
+        with JOBS_LOCK:
+            self.status = "done"
+            self.stage = "done"
+            self.node = "完成"
+            self.percent = 100
+            self.message = "恒温器评估完成。"
+            self.result_html = render_message(result, None)
+
+    def fail(self, exc: Exception) -> None:
+        with JOBS_LOCK:
+            self.status = "failed"
+            self.stage = "failed"
+            self.node = "失败"
+            self.message = str(exc)
+            self.error = str(exc)
+
+
+def start_thermostat_job(form: dict[str, str]) -> ThermostatJob:
+    job_id = uuid.uuid4().hex
+    job = ThermostatJob(job_id, form)
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    thread = threading.Thread(target=_run_thermostat_job, args=(job_id,), daemon=True)
+    thread.start()
+    return job
+
+
+def _run_thermostat_job(job_id: str) -> None:
+    job = JOBS[job_id]
+    try:
+        result = handle_thermostat(job.form, progress_callback=job.update)
+        job.complete(result)
+    except Exception as exc:  # pragma: no cover - defensive live-web path
+        job.fail(exc)
+
+
+def job_status_payload(job_id: str) -> dict[str, object]:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return {"status": "missing", "error": "任务不存在或已过期。"}
+        return {
+            "job_id": job.job_id,
+            "status": job.status,
+            "stage": job.stage,
+            "node": job.node,
+            "message": job.message,
+            "completed": job.completed,
+            "total": job.total,
+            "current_symbol": job.current_symbol,
+            "percent": job.percent,
+            "error": job.error,
+            "result_html": job.result_html,
+        }
+
+
+def render_job_progress(job_id: str) -> str:
+    escaped = html.escape(job_id)
+    return f"""
+    <section class="job-progress" data-job-id="{escaped}">
+      <h3>运行进度</h3>
+      <progress max="100" value="0"></progress>
+      <p class="job-stage">排队</p>
+      <p class="job-detail">任务已创建，等待开始。</p>
+      <div class="job-result"></div>
+    </section>
+    <script>
+    (function() {{
+      const box = document.querySelector('[data-job-id="{escaped}"]');
+      if (!box) return;
+      const progress = box.querySelector('progress');
+      const stage = box.querySelector('.job-stage');
+      const detail = box.querySelector('.job-detail');
+      const result = box.querySelector('.job-result');
+      async function poll() {{
+        const response = await fetch('/job?id={escaped}');
+        const data = await response.json();
+        progress.value = data.percent || 0;
+        stage.textContent = data.node || data.stage || '';
+        detail.textContent = data.message || '';
+        if (data.status === 'done') {{
+          result.innerHTML = data.result_html || '';
+          return;
+        }}
+        if (data.status === 'failed') {{
+          detail.textContent = data.error || data.message || '任务失败';
+          return;
+        }}
+        setTimeout(poll, 1000);
+      }}
+      poll();
+    }})();
+    </script>
+    """
+
+
+def _progress_percent(stage: str, completed: int, total: int) -> int:
+    ranges = {
+        "queued": (0, 2),
+        "initialize_task": (2, 5),
+        "load_market_history": (5, 10),
+        "load_candidate_history": (10, 55),
+        "classify_market": (55, 60),
+        "evaluate_candidates": (60, 85),
+        "evaluate_holdings": (85, 92),
+        "build_execution_plan": (92, 98),
+        "done": (100, 100),
+    }
+    start, end = ranges.get(stage, (5, 95))
+    if total <= 0:
+        return start
+    ratio = min(max(completed / total, 0), 1)
+    return int(start + (end - start) * ratio)
+
+
+def _progress_message(node: str, stage: str, completed: int, total: int, current_symbol: str) -> str:
+    suffix = ""
+    if stage == "evaluate_candidates":
+        suffix = "，生成网格/趋势建议"
+    elif stage == "evaluate_holdings":
+        suffix = "，生成持仓处理建议"
+    elif stage == "build_execution_plan":
+        suffix = "，筛选可执行买入/加仓信号"
+    if total > 0 and current_symbol:
+        return f"正在{node}：{completed} / {total}，当前 {current_symbol}{suffix}"
+    if total > 0:
+        return f"正在{node}：{completed} / {total}{suffix}"
+    return f"正在{node}{suffix}"
 
 
 def handle_watchlist_save_manual(form: dict[str, str]) -> RenderResult:
@@ -807,6 +1120,7 @@ def render_page(
       {page_body}
     </div>
   </main>
+  {render_source_refresh_script(page)}
 </body>
 </html>"""
     return f"""<!doctype html>
@@ -843,16 +1157,32 @@ def nav_link(target: str, label: str, current: str) -> str:
     return f'<a href="/{target}"{active}>{html.escape(label)}</a>'
 
 
+def render_source_refresh_script(page: str) -> str:
+    if page != "thermostat":
+        return ""
+    return """
+  <script>
+  function refreshSourceFields(select) {
+    const form = select.form;
+    const params = new URLSearchParams(new FormData(form));
+    window.location.href = "/thermostat?" + params.toString();
+  }
+  </script>
+  """
+
+
 def render_thermostat_section(form: dict[str, str]) -> str:
     display_form = _thermostat_display_form(form)
     stock_source = _value(display_form, "stock_pool_source", "manual")
+    form_action = "/thermostat-job" if stock_source in {"lhb", "ths_lhb"} else "/thermostat"
+    submit_label = "运行恒温器策略"
     return f"""
     <section id="thermostat" class="workspace-section">
       <div class="page-head">
         <h2>恒温器策略</h2>
         <p class="status">页面状态：选择股票池、策略日期和账户资金后运行。工作区按当前选择动态显示字段。</p>
       </div>
-      <form method="post" action="/thermostat">
+      <form method="post" action="{form_action}">
         <div class="panel-block">
           <h3>工作区：股票池来源</h3>
           {stock_pool_fields(display_form)}
@@ -876,9 +1206,9 @@ def render_thermostat_section(form: dict[str, str]) -> str:
           {checkbox("execution_plan", "生成手工执行计划", display_form, checked=True)}
         </details>
         {checkbox("exclude_star", "剔除科创板", display_form)}
-        <button type="submit">运行恒温器策略</button>
+        <button type="submit">{html.escape(submit_label)}</button>
       </form>
-      <p class="muted">股票池来源支持手动输入、自选股组合、市场范围、龙虎榜和同花顺龙虎榜来源说明。当前来源：{html.escape(OPTION_LABELS["stock_pool_source"].get(stock_source, stock_source))}</p>
+      <p class="muted">股票池来源支持手动输入、自选股组合、市场范围和龙虎榜。当前来源：{html.escape(OPTION_LABELS["stock_pool_source"].get(stock_source, stock_source))}</p>
     </section>"""
 
 
@@ -1072,6 +1402,8 @@ def render_message(result: RenderResult | None, error: str | None) -> str:
         parts.append(render_summary(summary))
     for table in result.tables:
         parts.append(render_table(table.title, table.frame))
+    if result.extra_html:
+        parts.append(result.extra_html)
     parts.append("</section>")
     return "\n".join(parts)
 
@@ -1293,6 +1625,7 @@ def select(
     default: str,
     label: str,
     form: dict[str, str] | None = None,
+    attrs: str = "",
 ) -> str:
     current = _field_value(form, name, default)
     options = []
@@ -1300,7 +1633,8 @@ def select(
         selected = " selected" if value == current else ""
         display = OPTION_LABELS.get(name, {}).get(value, value)
         options.append(f'<option value="{value}"{selected}>{html.escape(display)}</option>')
-    return f'<label>{html.escape(label)}<select name="{name}">{"".join(options)}</select></label>'
+    attr_text = f" {attrs.strip()}" if attrs.strip() else ""
+    return f'<label>{html.escape(label)}<select name="{name}"{attr_text}>{"".join(options)}</select></label>'
 
 
 def checkbox(
@@ -1317,7 +1651,15 @@ def checkbox(
 def stock_pool_fields(form: dict[str, str] | None = None) -> str:
     form = form or {}
     source = _value(form, "stock_pool_source", "manual")
-    fields = select("stock_pool_source", ("manual", "watchlist", "market_range", "lhb", "ths_lhb"), "manual", "股票池来源", form)
+    fields = select("stock_pool_source", ("manual", "watchlist", "market_range", "lhb"), "manual", "股票池来源", form)
+    fields = select(
+        "stock_pool_source",
+        ("manual", "watchlist", "market_range", "lhb"),
+        "manual",
+        "股票池来源",
+        form,
+        attrs='data-source-selector="stock_pool_source" onchange="refreshSourceFields(this)"',
+    )
     if source == "watchlist":
         fields += _watchlist_select(form)
     elif source == "market_range":
@@ -1364,10 +1706,11 @@ def market_range_fields(form: dict[str, str]) -> str:
 
 def lhb_source_fields(form: dict[str, str]) -> str:
     fields = select("lhb_range", ("1w", "1m", "3m", "half_year", "1y", "custom"), "1w", "龙虎榜时间范围", form)
+    fields += select("lhb_confirmed_top", ("20", "30", "50"), "30", "运行候选数量", form)
     if _value(form, "lhb_range", "1w") == "custom":
         fields += input_text("lhb_start", "龙虎榜开始日期", "", form)
         fields += input_text("lhb_end", "龙虎榜结束日期", "", form)
-    fields += '<p class="muted">结果会显示真实数据来源、时间范围、股票数量、错误或警告。同花顺龙虎榜不可用时会说明原因。</p>'
+    fields += '<p class="muted">结果会显示真实数据来源、时间范围、股票数量、错误或警告。</p>'
     return fields
 
 
@@ -2299,6 +2642,11 @@ def _page_for_path(path: str) -> str:
     return "thermostat"
 
 
+def _query_form(query: str) -> dict[str, str]:
+    values = parse_qs(query, keep_blank_values=True)
+    return {key: ",".join(value) if key == "market_range" else value[-1] for key, value in values.items()}
+
+
 def _field_value(form: dict[str, str] | None, key: str, default: str) -> str:
     if form is None:
         return default
@@ -2331,6 +2679,12 @@ def _resolve_thermostat_stock_pool(form: dict[str, str], service: MarketDataServ
         source_detail = _stock_source_detail(service)
         return resolve_market_range_pool(stocks, _value(form, "market_range", "all_a"), source_detail=source_detail, updated_at=_today_yyyymmdd(), exclude_star=exclude_star)
     if source in {"lhb", "ths_lhb"}:
+        confirmed = _optional(form, "confirmed_lhb_symbols")
+        if confirmed:
+            top = _int(form, "lhb_confirmed_top", 30)
+            symbols = ",".join([item.strip() for item in confirmed.split(",") if item.strip()][:top])
+            return parse_manual_pool(symbols, name="龙虎榜确认候选池", exclude_star=exclude_star)
+        top = _int(form, "lhb_confirmed_top", 30)
         range_key = _value(form, "lhb_range", "1w")
         try:
             start, end = lhb_range_dates(range_key, as_of=_value(form, "end", _today_yyyymmdd()), start_date=_value(form, "lhb_start"), end_date=_value(form, "lhb_end"))
@@ -2338,7 +2692,7 @@ def _resolve_thermostat_stock_pool(form: dict[str, str], service: MarketDataServ
             return _stock_pool_error("lhb", "龙虎榜", str(exc))
         requested_source = "ths" if source == "ths_lhb" else "eastmoney"
         return resolve_lhb_pool(
-            lambda start_date, end_date: build_lhb_candidates(start_date, end_date, 500)[1],
+            lambda start_date, end_date: build_lhb_candidates(start_date, end_date, top)[0],
             start_date=start,
             end_date=end,
             requested_source=requested_source,
@@ -2454,10 +2808,12 @@ class RenderResult:
         title: str,
         tables: list[TableBlock] | None = None,
         summaries: list[dict[str, object]] | None = None,
+        extra_html: str = "",
     ) -> None:
         self.title = title
         self.tables = tables or []
         self.summaries = summaries or []
+        self.extra_html = extra_html
 
 
 CSS = """
