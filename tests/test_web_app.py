@@ -424,6 +424,199 @@ def test_web_thermostat_progress_tracks_nodes_and_stock_counts() -> None:
     } in events
 
 
+def test_web_result_rendering_localizes_titles_columns_and_values() -> None:
+    result = web_app.RenderResult(
+        "恒温器策略",
+        summaries=[
+            {
+                "stock_pool_source": "watchlist",
+                "watchlist_name": "观察",
+                "time_range": "1w",
+                "data_sufficient": True,
+            }
+        ],
+        tables=[
+            web_app.TableBlock(
+                "Stock Pool Summary",
+                pd.DataFrame(
+                    [
+                        {
+                            "stock_pool_source": "watchlist",
+                            "watchlist_name": "观察",
+                            "time_range": "1w",
+                            "source_detail": "data/user/default",
+                            "raw_count": 2,
+                            "deduped_count": 2,
+                            "filtered_count": 2,
+                            "excluded_count": 0,
+                        }
+                    ]
+                ),
+            ),
+            web_app.TableBlock(
+                "Market Overview",
+                pd.DataFrame(
+                    [
+                        {
+                            "market_regime": "range",
+                            "confidence": "medium",
+                            "data_source": "index_history",
+                            "data_sufficient": True,
+                        }
+                    ]
+                ),
+            ),
+            web_app.TableBlock(
+                "Grid Advice",
+                pd.DataFrame([{"strategy_family": "grid", "action": "wait_confirm", "stock_regime": "downtrend"}]),
+            ),
+            web_app.TableBlock(
+                "Trend Advice",
+                pd.DataFrame([{"strategy_family": "trend_following", "action": "observe", "stock_regime": "uptrend"}]),
+            ),
+            web_app.TableBlock(
+                "Execution Plan",
+                pd.DataFrame(
+                    [
+                        {
+                            "recommended_action": "buy",
+                            "fallback_action": "switch_alternative",
+                            "limit_status": "normal",
+                            "volume_limit_pct": 0.05,
+                            "skip_insufficient_cash": False,
+                            "skip_volume_limit": True,
+                        }
+                    ]
+                ),
+            ),
+        ],
+    )
+
+    html = web_app.render_message(result, None)
+
+    for text in [
+        "股票池摘要",
+        "市场概览",
+        "网格建议",
+        "趋势建议",
+        "手工执行计划",
+        "自选组合名称",
+        "时间范围",
+        "来源说明",
+        "原始数量",
+        "被剔除数量",
+        "市场状态",
+        "置信度",
+        "数据来源",
+        "数据是否充足",
+        "推荐操作",
+        "备选操作",
+        "涨跌停状态",
+        "成交量限制比例",
+        "资金不足跳过",
+        "成交量限制跳过",
+        "震荡区间",
+        "上升趋势",
+        "下降趋势",
+        "趋势跟随",
+        "网格策略",
+        "观察",
+        "买入",
+        "等待确认",
+        "是",
+        "否",
+    ]:
+        assert text in html
+
+    for forbidden in [
+        "Stock Pool Summary",
+        "Market Overview",
+        "Grid Advice",
+        "Trend Advice",
+        "Execution Plan",
+        "watchlist_name",
+        "time_range",
+        "source_detail",
+        "raw_count",
+        "excluded_count",
+        "market_regime",
+        "confidence",
+        "data_source",
+        "data_sufficient",
+        "recommended_action",
+        "fallback_action",
+        "limit_status",
+        "volume_limit_pct",
+        "skip_insufficient_cash",
+        "skip_volume_limit",
+        ">range<",
+        ">uptrend<",
+        ">downtrend<",
+        ">trend_following<",
+        ">grid<",
+        ">observe<",
+        ">wait_confirm<",
+    ]:
+        assert forbidden not in html
+
+
+def test_web_rendering_marks_unknown_user_visible_fields() -> None:
+    html = web_app.render_table("Unknown Result", pd.DataFrame([{"unmapped_field": "abc"}]))
+
+    assert "未翻译字段：Unknown Result" in html
+    assert "未翻译字段：unmapped_field" in html
+    assert ">unmapped_field<" not in html
+
+
+def test_web_job_progress_uses_chinese_stage_fallback_and_failure_summary() -> None:
+    job = web_app.ThermostatJob("job-localization", {})
+
+    job.update({"stage": "evaluate_candidates", "completed": 12, "total": 50, "current_symbol": "600519.SH"})
+
+    assert job.node == "正在评估候选股"
+    assert "已完成 12 / 50" in job.message
+    assert "当前处理 600519.SH" in job.message
+    assert "生成市场状态、网格/趋势建议" in job.message
+    assert "evaluate_candidates" not in job.message
+
+    job.fail(RuntimeError("upstream timeout"))
+
+    assert job.error.startswith("任务失败：")
+    assert "upstream timeout" in job.error
+
+
+def test_web_normal_results_do_not_show_untranslated_field_marker(monkeypatch) -> None:
+    fake = FakeWebService({"600001.SH": _history("600001.SH", [10 + i * 0.1 for i in range(80)])})
+    monkeypatch.setattr(web_app, "_service", lambda form: fake)
+    monkeypatch.setattr(
+        web_app,
+        "build_lhb_candidates",
+        lambda start, end, top: (
+            pd.DataFrame([{"code": "600001", "name": "A", "net_buy": 1000, "rank": 1}]),
+            pd.DataFrame([{"code": "600001", "name": "A", "net_buy": 1000, "rank": 1}]),
+        ),
+    )
+
+    results = [
+        web_app.handle_thermostat(
+            {
+                "symbols": "600001",
+                "start": "20260401",
+                "end": "20260510",
+                "account_path": "data/user/default",
+            }
+        ),
+        web_app.handle_thermostat_lhb_preview({"stock_pool_source": "lhb", "lhb_range": "1w", "end": "20260629"}),
+        web_app.handle_thermostat_job({"symbols": "600001"}),
+        web_app.handle_thermostat_backtest({"symbols": "600001", "start": "20260401", "end": "20260510", "cash": "100000"}),
+    ]
+
+    for result in results:
+        html = web_app.render_message(result, None)
+        assert "未翻译字段" not in html
+        assert ">queued<" not in html
+
+
 def test_web_thermostat_rejects_invalid_and_empty_stock_pool(tmp_path) -> None:
     account_path = str(tmp_path / "missing-account")
     empty = web_app.handle_thermostat({"symbols": " ", "account_path": account_path})

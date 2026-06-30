@@ -67,7 +67,18 @@ TITLE_LABELS = {
     "Execution Plan": "手工执行计划",
     "Candidate Evaluation": "候选评估",
     "Turtle Backtest": "海龟回测",
-    "Summary": "汇总",
+    "Summary": "摘要",
+    "Market Overview": "市场概览",
+    "New Buy Candidates": "新买候选",
+    "Grid Advice": "网格建议",
+    "Trend Advice": "趋势建议",
+    "LHB Top 20": "龙虎榜前 20 名",
+    "LHB Top 30": "龙虎榜前 30 名",
+    "LHB Top 50": "龙虎榜前 50 名",
+    "Regime Performance": "市场状态表现",
+    "Diagnostics": "诊断明细",
+    "LHB Candidate Preview": "龙虎榜候选预览",
+    "Thermostat Job Started": "恒温器任务已开始",
     "Trades": "交易流水",
     "Equity": "每日权益",
     "Drawdowns": "回撤明细",
@@ -87,6 +98,19 @@ TITLE_LABELS = {
     "Positions": "当前持仓",
     "Stock Pool Summary": "股票池摘要",
     "Watchlists": "自选股组合",
+}
+
+PROGRESS_STAGE_LABELS = {
+    "queued": "排队",
+    "initialize_task": "正在初始化任务",
+    "load_market_history": "正在加载市场历史",
+    "load_candidate_history": "正在加载候选股历史",
+    "classify_market": "正在生成市场状态",
+    "evaluate_candidates": "正在评估候选股",
+    "evaluate_holdings": "正在评估持仓",
+    "build_execution_plan": "正在生成手工执行计划",
+    "done": "完成",
+    "failed": "失败",
 }
 
 COLUMN_LABELS = {
@@ -127,7 +151,7 @@ COLUMN_LABELS = {
     "exit_price": "通道退出价",
     "exit_reason": "退出原因",
     "expectancy": "单笔期望",
-    "fallback_action": "失败备选",
+    "fallback_action": "备选操作",
     "fees": "手续费",
     "final_value": "最终资产",
     "held_symbols": "持仓标的数",
@@ -136,10 +160,23 @@ COLUMN_LABELS = {
     "initial_cash": "初始资金",
     "last_entry_price": "最近入场价",
     "limit_pct": "涨跌停幅度",
-    "limit_status": "涨停状态",
+    "limit_status": "涨跌停状态",
     "limit_up_price": "涨停价",
     "lhb_end": "龙虎榜结束日期",
     "lhb_start": "龙虎榜开始日期",
+    "watchlist_name": "自选组合名称",
+    "time_range": "时间范围",
+    "source_detail": "来源说明",
+    "raw_count": "原始数量",
+    "excluded_count": "被剔除数量",
+    "market_regime": "市场状态",
+    "stock_regime": "个股状态",
+    "confidence": "置信度",
+    "data_source": "数据来源",
+    "data_sufficient": "数据是否充足",
+    "strategy_family": "策略类型",
+    "skip_insufficient_cash": "资金不足跳过",
+    "skip_volume_limit": "成交量限制跳过",
     "stock_pool_source": "股票池来源",
     "original_count": "原始数量",
     "deduped_count": "去重后数量",
@@ -173,7 +210,7 @@ COLUMN_LABELS = {
     "realized_pnl": "已实现盈亏",
     "realized_pnl_pct": "已实现收益率",
     "reason": "原因",
-    "recommended_action": "建议动作",
+    "recommended_action": "推荐操作",
     "evaluation_action": "分析结果",
     "refresh": "强制刷新",
     "risk_pct": "单元风险",
@@ -223,13 +260,47 @@ COLUMN_LABELS = {
     "units": "单元数",
     "units_after": "操作后单元数",
     "unrealized_pnl": "浮动盈亏",
-    "volume_limit_pct": "成交量限制",
+    "volume_limit_pct": "成交量限制比例",
     "weight": "权重",
     "win_count": "盈利次数",
     "win_rate": "胜率",
     "year": "年份",
     "zero_count": "持平次数",
 }
+
+COLUMN_LABELS.update(
+    {
+        "actual_lhb_range": "实际龙虎榜日期范围",
+        "average_after_switch_return": "切换后平均收益",
+        "cash_ratio": "现金比例",
+        "candidate_count": "候选数量",
+        "entry_price": "入场价",
+        "evidence": "判断依据",
+        "grid_invalid_count": "网格失效次数",
+        "grid_lower": "网格下沿",
+        "grid_max_layers": "最大网格层数",
+        "grid_mid": "网格中枢",
+        "grid_stop_condition": "网格停止条件",
+        "grid_unit_pct": "单格仓位比例",
+        "grid_upper": "网格上沿",
+        "job_id": "任务编号",
+        "message": "进度说明",
+        "node": "当前节点",
+        "period_count": "周期数",
+        "priority": "优先级",
+        "reference_price": "参考价",
+        "regime_date": "状态日期",
+        "regime_switch_count": "市场状态切换次数",
+        "risk_note": "风险提示",
+        "stage": "阶段",
+        "strength": "强度",
+        "suggested_position_pct": "建议仓位比例",
+        "switch_count": "切换次数",
+        "target_price": "目标价",
+        "top_options": "可选排名范围",
+        "trend_stop_count": "趋势止损次数",
+    }
+)
 
 INTEGER_DISPLAY_COLUMNS = {
     "rank",
@@ -292,7 +363,16 @@ OPTION_LABELS = {
     "source": {"": "自动", "baostock": "BaoStock", "akshare": "AkShare", "joinquant": "JoinQuant"},
     "stock_source": {"": "自动", "baostock": "BaoStock", "akshare": "AkShare", "joinquant": "JoinQuant"},
     "realtime_source": {"sina": "新浪", "akshare": "AkShare"},
-    "action": {"buy": "买入", "sell": "卖出", "hold": "持有", "add": "加仓"},
+    "action": {
+        "buy": "买入",
+        "sell": "卖出",
+        "hold": "持有",
+        "add": "加仓",
+        "observe": "观察",
+        "wait_confirm": "等待确认",
+        "blocked": "暂不参与",
+        "stop_grid": "停止网格",
+    },
     "evaluation_action": {"buy": "买入", "no_signal": "观望", "missing_history": "缺少历史数据"},
     "signal_action": {"buy": "买入", "sell": "卖出", "hold": "持有", "add": "加仓"},
     "recommended_action": {
@@ -310,6 +390,27 @@ OPTION_LABELS = {
         "switch_alternative": "切换备选",
     },
     "limit_status": {"normal": "正常", "limit_up": "涨停", "unknown": "未知"},
+    "market_regime": {
+        "uptrend": "上升趋势",
+        "downtrend": "下降趋势",
+        "range": "震荡区间",
+        "transition": "转换期",
+    },
+    "stock_regime": {
+        "uptrend": "上升趋势",
+        "downtrend": "下降趋势",
+        "range": "震荡区间",
+        "transition": "转换期",
+    },
+    "strategy_family": {
+        "trend_following": "趋势跟随",
+        "grid": "网格策略",
+        "risk_control": "风险控制",
+    },
+    "confidence": {"high": "高", "medium": "中", "low": "低"},
+    "data_source": {"index_history": "指数历史数据", "history": "历史数据", "realtime": "实时行情"},
+    "data_sufficient": {"yes": "是", "no": "否", "True": "是", "False": "否", "true": "是", "false": "否"},
+    "stage": PROGRESS_STAGE_LABELS,
     "side": {"buy": "买入", "sell": "卖出", "adjust_cost": "调整成本"},
     "strategy": {
         "ma_cross": "双均线",
@@ -327,7 +428,7 @@ OPTION_LABELS = {
 
 
 class WebAppHandler(BaseHTTPRequestHandler):
-    server_version = "StockPickerWeb/0.1"
+    server_version = "StockPickerWeb/0.1.2"
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -720,7 +821,7 @@ class ThermostatJob:
         with JOBS_LOCK:
             self.status = "running"
             self.stage = str(event.get("stage") or self.stage)
-            self.node = str(event.get("node") or self.node)
+            self.node = str(event.get("node") or _display_progress_stage(self.stage))
             self.completed = int(event.get("completed") or 0)
             self.total = int(event.get("total") or 0)
             self.current_symbol = str(event.get("current_symbol") or "")
@@ -741,8 +842,8 @@ class ThermostatJob:
             self.status = "failed"
             self.stage = "failed"
             self.node = "失败"
-            self.message = str(exc)
-            self.error = str(exc)
+            self.message = f"任务失败：{exc}"
+            self.error = self.message
 
 
 def start_thermostat_job(form: dict[str, str]) -> ThermostatJob:
@@ -843,19 +944,23 @@ def _progress_percent(stage: str, completed: int, total: int) -> int:
     return int(start + (end - start) * ratio)
 
 
+def _display_progress_stage(stage: str) -> str:
+    return PROGRESS_STAGE_LABELS.get(stage, f"正在处理未知阶段：{stage}")
+
+
 def _progress_message(node: str, stage: str, completed: int, total: int, current_symbol: str) -> str:
     suffix = ""
     if stage == "evaluate_candidates":
-        suffix = "，生成网格/趋势建议"
+        suffix = "，生成市场状态、网格/趋势建议"
     elif stage == "evaluate_holdings":
         suffix = "，生成持仓处理建议"
     elif stage == "build_execution_plan":
         suffix = "，筛选可执行买入/加仓信号"
     if total > 0 and current_symbol:
-        return f"正在{node}：{completed} / {total}，当前 {current_symbol}{suffix}"
+        return f"{node}：已完成 {completed} / {total}，当前处理 {current_symbol}{suffix}"
     if total > 0:
-        return f"正在{node}：{completed} / {total}{suffix}"
-    return f"正在{node}{suffix}"
+        return f"{node}：已完成 {completed} / {total}{suffix}"
+    return f"{node}{suffix}"
 
 
 def handle_watchlist_save_manual(form: dict[str, str]) -> RenderResult:
@@ -1530,11 +1635,23 @@ def _display_title(title: str) -> str:
     if title.startswith("Strategy:"):
         strategy = title.split(":", 1)[1].strip()
         return f"策略运行：{_display_value('strategy', strategy)}"
-    return title
+    if _contains_cjk(title):
+        return title
+    return f"未翻译字段：{title}"
 
 
 def _display_label(key: str) -> str:
-    return COLUMN_LABELS.get(key, key)
+    if key in COLUMN_LABELS:
+        return COLUMN_LABELS[key]
+    if key.isdigit():
+        return f"{int(key)}月"
+    if _contains_cjk(key):
+        return key
+    return f"未翻译字段：{key}"
+
+
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
 
 
 def _display_value(key: str, value: object) -> str:

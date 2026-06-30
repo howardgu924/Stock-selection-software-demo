@@ -1,20 +1,20 @@
-# 工作台 UI 重构任务清单
+# 优化汉化任务清单
 
 > 基于当前 `spec.md` 和 `plan.md`。本文件只列任务、验证点、涉及文件和执行顺序，不写代码，不开始实现。
 
 ## 执行原则
 
 - 每个任务先写测试或明确验证点，再做最小改动。
-- 每个任务必须能独立验证，阶段结束后运行对应回归。
-- 优先锁定现有行为不变，再调整页面结构。
-- 不重写恒温器策略、回测诊断、账户模型、行情 provider、执行辅助、海龟系统、旧 CLI 或旧筛选引擎。
-- Web 正常路径只暴露“恒温器策略 / 回测诊断 / 账户”。
-- 旧 CLI、旧筛选引擎、旧海龟源码可以保留，但不能在正常 Web 使用路径中重新出现。
-- 页面优化只改变展示、分组、字段可见性和交互路径，不改变计算结果。
+- 每个任务必须能独立验证。
+- 汉化只发生在 Web 用户可见展示层。
+- 不重命名内部字段名，不改 DataFrame 原始列名，不改持久化数据结构。
+- 不改信息渠道、策略逻辑、账户逻辑、回测逻辑、股票池逻辑、执行辅助逻辑和 CLI 兼容性。
+- 不做全局机械替换。
+- 测试不得写成“页面不能包含任何英文字符”，因为股票代码、数据源品牌名、路径、URL、命令行参数和外部异常原文允许保留英文。
 
-## 阶段 0：基线和范围锁定
+## 阶段 0：范围和基线
 
-### T001：确认规格、方案和任务范围一致
+### T001：核对规格、方案和任务范围
 
 涉及文件：
 - `spec.md`
@@ -22,788 +22,685 @@
 - `tasks.md`
 
 先做验证：
-- `spec.md` 的 27 条验收标准都能在本任务清单中找到对应任务。
-- `plan.md` 中的模块影响范围都能在本任务清单中找到对应任务。
-- 本任务清单不包含策略重写、provider 替换、账户模型重写、自动下单、删除旧源码等不做范围。
+- `spec.md` 的验收标准在本任务清单中都有对应任务。
+- `plan.md` 的推荐实施顺序在本任务清单中都有对应阶段。
+- 本任务清单不包含策略重写、字段重命名、provider 替换、账户模型重写、CLI 重写或全局机械替换。
 
 实施范围：
-- 只调整 `tasks.md` 的任务覆盖和顺序。
+- 只调整任务覆盖和顺序。
 
 验收：
-- 每个任务都足够小，且有独立验证方式。
-- 没有把多个页面的大改动塞进一个任务。
+- 每个任务足够小。
+- 每个任务有独立验证方式。
+- 任务顺序先验证、再改展示、最后回归。
 
-### T002：记录当前核心回归基线
+### T002：记录当前测试基线
 
 涉及文件：
 - `tests`
 - `examples/web_app.py`
 
 先做验证：
-- 运行当前 Web、策略、账户、执行、海龟相关测试，记录改动前是否已有失败。
+- 运行当前测试，确认进入实现前的基线状态。
 
 验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_thermostat_strategy.py tests\test_thermostat_backtest.py tests\test_turtle_system.py tests\test_portfolio_journal.py tests\test_execution.py -q`
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+- `.\.venv\Scripts\python.exe -m pytest tests\test_thermostat_strategy.py tests\test_thermostat_backtest.py tests\test_execution.py -q`
+- `.\.venv\Scripts\python.exe -m pytest tests\test_stock_pools.py tests\test_pool_market_ranges.py tests\test_pool_lhb.py tests\test_lhb_candidates.py -q`
+- `.\.venv\Scripts\python.exe -m pytest tests\test_portfolio_journal.py tests\test_watchlist_store.py -q`
 
 实施范围：
-- 不修改业务代码。
-- 只记录基线结果，作为后续回归对照。
+- 不修改代码。
+- 只记录当前通过或失败情况。
 
 验收：
-- 如果基线通过，后续不得引入回归。
-- 如果基线失败，记录失败测试名称、失败原因和是否与本次 UI 重构有关。
+- 如果基线通过，后续任务不得引入回归。
+- 如果基线失败，记录失败测试名、失败原因和是否与本次汉化有关。
 
-## 阶段 1：Web 壳层、导航和旧入口可见性
+### T003：盘点正常 Web 路径英文泄漏清单
 
-### T003：为顶部导航和旧入口隐藏写 Web 测试
+涉及文件：
+- `examples/web_app.py`
+- `tests/test_web_app.py`
+- 新建或更新：`docs/localization-leak-checklist.md`
+
+先做验证：
+- 从现有渲染路径盘点用户可见英文标题、列名、枚举值、进度阶段和错误文案。
+- 区分必须汉化和允许保留英文。
+
+检查范围：
+- 恒温器策略结果。
+- 龙虎榜候选和 Top N 结果。
+- 回测诊断结果。
+- 账户概览、持仓、交易流水、自选组合。
+- 进度条和失败提示。
+
+实施范围：
+- 只记录清单，不改页面代码。
+- 清单按“必须汉化”和“允许保留英文”分组。
+- 每个必须汉化项记录来源页面、当前英文、期望中文、对应后续任务编号。
+
+验收：
+- 明确列出必须覆盖的英文标题和字段来源。
+- 明确列出允许保留英文的内容，例如股票代码、数据源品牌名、路径、URL、外部异常原文。
+- `docs/localization-leak-checklist.md` 存在，且可直接用于后续测试和映射补齐。
+
+## 阶段 1：先写失败测试锁定英文泄漏
+
+### T004：为恒温器结果区标题汉化写 Web 测试
 
 涉及文件：
 - `tests/test_web_app.py`
-- `examples/web_app.py`
 
 先写测试：
-- 顶部导航只显示“恒温器策略 / 回测诊断 / 账户”三个正常入口。
-- Web 默认页不显示旧策略列表。
-- Web 默认页不显示旧默认技术筛选入口。
-- Web 默认页不显示旧海龟系统入口。
+- 恒温器结果页面不显示 `Stock Pool Summary`、`Market Overview`、`Holding Advice`、`New Buy Candidates`、`Grid Advice`、`Trend Advice`、`Execution Plan`、`Errors`。
+- 页面显示“股票池摘要”“市场概览”“持仓建议”“新买候选”“网格建议”“趋势建议”“手工执行计划”“错误”。
 
-实施范围：
-- 只调整 Web 正常路径的导航和入口可见性。
-- 不删除旧 CLI、旧筛选引擎或旧海龟源码。
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+预期：
+- 如果当前恒温器结果区仍有英文标题泄漏，测试应先失败。
+
+验收：
+- 测试能准确抓到恒温器结果区标题未汉化问题。
+- 测试不禁止股票代码、路径或数据源品牌名。
+
+### T005：为龙虎榜、回测和账户结果区标题汉化写 Web 测试
+
+涉及文件：
+- `tests/test_web_app.py`
+
+先写测试：
+- 龙虎榜结果标题显示“龙虎榜前 20 名”“龙虎榜前 30 名”“龙虎榜前 50 名”。
+- 回测诊断和账户结果不显示 `Summary`、`Diagnostics`、`Trades`、`Positions` 等规格列出的英文区块标题。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+预期：
+- 如果当前龙虎榜、回测或账户结果区仍有英文标题泄漏，测试应先失败。
+
+验收：
+- 测试能准确抓到龙虎榜、回测和账户结果区标题未汉化问题。
+- 测试不禁止股票代码、路径或数据源品牌名。
+
+### T006：为表格列名汉化写 Web 测试
+
+涉及文件：
+- `tests/test_web_app.py`
+
+先写测试：
+- 页面不直接显示 `watchlist_name`、`time_range`、`source_detail`、`market_regime`、`confidence`、`data_source`、`data_sufficient`。
+- 页面显示“自选组合名称”“时间范围”“来源说明”“市场状态”“置信度”“数据来源”“数据是否充足”。
+- 执行计划表格不直接显示 `recommended_action`、`fallback_action`、`limit_status`、`volume_limit_pct`、`skip_insufficient_cash`、`skip_volume_limit`。
+- 执行计划表格显示“推荐操作”“备选操作”“涨跌停状态”“成交量限制比例”“资金不足跳过”“成交量限制跳过”。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+预期：
+- 如果当前列名仍直接使用内部字段名，测试应先失败。
+
+验收：
+- 测试覆盖规格第 7 节的关键字段。
+- 测试只检查用户页面，不要求内部 DataFrame 改中文列名。
+
+### T007：为状态值和枚举值汉化写 Web 测试
+
+涉及文件：
+- `tests/test_web_app.py`
+
+先写测试：
+- 页面中的 `range` 显示为“震荡区间”。
+- 页面中的 `uptrend` 显示为“上升趋势”。
+- 页面中的 `downtrend` 显示为“下降趋势”。
+- 页面中的 `trend_following` 显示为“趋势跟随”。
+- 页面中的 `grid` 显示为“网格策略”。
+- 页面中的 `observe` 显示为“观察”。
+- 页面中的 `buy` 显示为“买入”。
+- 页面中的 `wait_confirm` 显示为“等待确认”。
+- 布尔值在用户页面显示为“是”或“否”。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+预期：
+- 如果用户页面仍直接显示内部枚举值，测试应先失败。
+
+验收：
+- 测试覆盖市场状态、策略类型、建议动作和布尔值。
+- 测试不要求内部策略结果枚举值改成中文。
+
+### T008：为未知字段中文兜底写渲染测试
+
+涉及文件：
+- `tests/test_web_app.py`
+
+先写测试：
+- 当用户可见表格出现未登记列名时，页面显示“未翻译字段：原字段名”或等价中文提示。
+- 未知字段不应静默以纯英文列名展示。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+预期：
+- 当前如果未知字段直接回落为英文列名，测试应先失败。
+
+验收：
+- 漏翻字段可见、可定位、可继续补映射。
+
+### T009：为进度提示汉化写 Web 测试
+
+涉及文件：
+- `tests/test_web_app.py`
+
+先写测试：
+- 进度展示不直接显示内部 `stage`。
+- 进度标题显示中文阶段名，例如“正在获取龙虎榜候选”“正在加载候选股历史”“正在评估恒温器”“正在生成手工执行计划”。
+- 有总数时显示“已完成 x / y”。
+- 有当前股票时显示当前处理股票。
+- 失败时显示中文失败摘要。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+预期：
+- 如果进度仍直接暴露内部 stage，测试应先失败。
+
+验收：
+- 进度条和小字都有中文用户可读信息。
+
+### T010：为错误、警告和空状态中文摘要写 Web 测试
+
+涉及文件：
+- `tests/test_web_app.py`
+
+先写测试：
+- 股票池为空显示中文摘要。
+- 自选组合不存在或为空显示中文摘要。
+- 龙虎榜候选为空或抓取失败显示中文摘要。
+- 账户未初始化显示中文摘要。
+- 当前无持仓显示“暂无持仓”。
+- 当前无交易流水显示“暂无交易流水”。
+- 外部异常原文如果显示，必须位于中文摘要之后。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+预期：
+- 如果页面只显示英文异常或空状态不清楚，测试应先失败。
+
+验收：
+- 错误、警告和空状态能告诉用户下一步可以做什么。
+
+### T011：运行汉化测试锁定阶段验证
+
+涉及文件：
+- `tests/test_web_app.py`
 
 验证命令：
 - `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
 
 验收：
-- 正常 Web 路径只有三个主入口。
-- 旧功能保留在源码中，但页面不可见。
+- 新增测试能覆盖标题、列名、枚举值、未知字段、进度、错误和空状态。
+- 当前失败点能对应到具体汉化缺口。
 
-### T004：为统一工作台页面壳层写 Web 测试
+## 阶段 2：标题和列名展示汉化
+
+### T012：补齐恒温器结果区标题映射
 
 涉及文件：
-- `tests/test_web_app.py`
 - `examples/web_app.py`
+- `tests/test_web_app.py`
 
-先写测试：
-- 恒温器策略页有页面标题、状态说明和主要内容区。
-- 回测诊断页有页面标题、状态说明和主要内容区。
-- 账户页有页面标题、状态说明和主要内容区。
-- 三个页面都使用统一的页面容器，不出现内容贴边的基础布局。
+先做验证：
+- 运行 T004 对应测试，确认恒温器标题汉化缺口。
 
 实施范围：
-- 只建立或整理三个主页面的外层结构。
-- 不调整具体表单字段。
+- 只补齐恒温器结果区标题映射。
+- 覆盖股票池摘要、市场概览、持仓建议、新买候选、网格建议、趋势建议、手工执行计划和错误区。
+- 不改 `TableBlock` 的业务含义。
 
 验证命令：
 - `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
 
 验收：
-- 三个主入口都有工作台式外层分区。
-- 页面外壳调整不影响各页面原有提交入口。
+- T004 中列出的恒温器英文标题不再直接显示。
+- 对应中文标题全部显示。
 
-### T005：为回测诊断页轻量分区写回归测试
+### T013：补齐龙虎榜、回测和账户结果区标题映射
 
 涉及文件：
-- `tests/test_web_app.py`
-- 可能涉及：`tests/test_backtest.py`
 - `examples/web_app.py`
+- `tests/test_web_app.py`
 
-先写测试：
-- 回测诊断页仍可访问。
-- 回测输入、运行入口、结果区域和错误提示仍可见。
-- 回测诊断页不重新暴露旧策略列表、旧默认技术筛选或旧海龟入口。
-- 已有回测计算测试继续通过。
+先做验证：
+- 运行 T005 对应测试，确认龙虎榜、回测和账户标题汉化缺口。
 
 实施范围：
-- 只整理回测诊断页外层布局和视觉层级。
-- 不改变回测参数语义、计算过程或输出含义。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_backtest.py -q`
-
-验收：
-- 回测诊断页被纳入工作台结构。
-- 回测结果语义保持不变。
-
-### T006：运行壳层阶段回归
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_backtest.py`
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_backtest.py -q`
-
-验收：
-- 顶部导航、旧入口隐藏、三页壳层、回测诊断分区全部通过。
-
-## 阶段 2：恒温器策略页股票池来源动态展示
-
-### T007：为股票池来源基础区写 Web 测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `examples/web_app.py`
-
-先写测试：
-- 恒温器策略页默认显示股票池来源选择。
-- 默认显示当前股票池摘要或空状态。
-- 不再一次性铺开所有股票池输入字段。
-
-实施范围：
-- 只调整股票池来源区域的基础容器和默认摘要。
-- 不改股票池解析规则。
+- 只补齐龙虎榜、回测诊断、账户、持仓、交易流水、自选组合等结果区标题映射。
+- 不改 `TableBlock` 的业务含义。
+- 不改回测、账户或龙虎榜计算逻辑。
 
 验证命令：
 - `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
 
 验收：
-- 股票池来源区域可见。
-- 非当前来源的字段默认不可见。
+- T005 中列出的英文标题不再直接显示。
+- 对应中文标题全部显示。
 
-### T008：为手动输入入口写 Web 测试
+### T014：统一结果区标题渲染出口
 
 涉及文件：
-- `tests/test_web_app.py`
 - `examples/web_app.py`
+- `tests/test_web_app.py`
 
-先写测试：
-- 选择“手动输入”时，主页面显示“编辑手动股票池”或等价入口。
-- 主页面不直接显示普通股票代码输入框。
-- 主页面不显示独立的“保存手动股票池”区域。
+先做验证：
+- 用测试确认新增或已有 `TableBlock` 标题都经过中文展示。
 
 实施范围：
-- 只调整恒温器主页面的手动输入入口。
-- 不在此任务内实现账户页自选组合管理。
+- 只调整 Web 渲染出口。
+- 不改路由、业务处理或数据结构。
 
 验证命令：
 - `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
 
 验收：
-- 手动输入从主页面长输入框改为二级编辑入口。
-- 保存职责不再重复出现在恒温器策略页。
+- 所有用户可见结果区标题都走统一汉化出口。
+- 未登记标题不静默裸露英文。
 
-### T009：为手动股票池编辑区写解析展示测试
+### T015：补齐关键表格列名映射
 
 涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_stock_pools.py`
 - `examples/web_app.py`
-- `stock_picker/pools.py`
+- `tests/test_web_app.py`
 
-先写测试：
-- 编辑区支持逗号、空格、换行分隔股票代码。
-- 编辑区显示已识别股票数量。
-- 编辑区显示重复代码提示。
-- 编辑区显示无效代码提示。
-- 编辑区支持“仅本次使用”状态。
+先做验证：
+- 运行 T006 对应测试，确认列名汉化缺口。
 
 实施范围：
-- 只接入或展示已有股票池解析结果。
-- 不改变股票池最终语义。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_stock_pools.py -q`
-
-验收：
-- 手动股票池编辑区可以独立验证解析、数量、重复和错误提示。
-
-### T010：为自选股组合来源写 Web 测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_watchlist_store.py`
-- `examples/web_app.py`
-- `stock_picker/user/watchlist.py`
-
-先写测试：
-- 选择“自选股组合”时，不显示手动填写组合名称的输入框。
-- 页面从账户已有自选组合读取列表。
-- 每个组合显示名称和股票数量。
-- 无自选组合时显示“暂无自选组合，请到账户页创建”或等价空状态。
-
-实施范围：
-- 只让恒温器页读取并选择账户已有组合。
-- 不在恒温器页实现创建、删除、重命名、添加、删除股票等完整管理功能。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_watchlist_store.py -q`
-
-验收：
-- 自选股组合选择和管理职责分离。
-
-### T011：为市场范围多选 UI 写 Web 测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_pool_market_ranges.py`
-- `examples/web_app.py`
-- `stock_picker/pools.py`
-
-先写测试：
-- 选择“市场范围”时，市场范围控件支持多选。
-- 至少显示沪深 A 股、沪市、深市、创业板、科创板、北交所。
-- 用户可以同时选择多个市场范围。
-- 页面显示所选范围摘要。
-- 未选择市场范围时显示明确空状态或错误提示。
-- 大范围选择显示耗时提示。
-
-实施范围：
-- 只调整市场范围来源的 UI 和摘要展示。
-- 不替换现有股票列表获取语义。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_pool_market_ranges.py -q`
-
-验收：
-- 市场范围来源从单选或散乱字段收敛为多选入口。
-
-### T012：为龙虎榜来源时间范围 UI 写 Web 测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_pool_lhb.py`
-- `examples/web_app.py`
-- `stock_picker/pools.py`
-
-先写测试：
-- 选择“龙虎榜”或“同花顺龙虎榜”时，显示时间范围选择。
-- 时间范围包含最近 1 周、最近 1 个月、最近 3 个月、最近半年、最近 1 年、自定义。
-- 默认不显示开始日期和结束日期。
-- 只有选择“自定义”时才显示开始日期和结束日期。
-- 摘要显示真实数据来源、时间范围、股票数量、错误或警告。
-- 同花顺不可用时显示真实原因和实际使用来源。
-
-实施范围：
-- 只调整龙虎榜来源 UI 和来源说明。
-- 不新增伪造的数据源，不把其他来源伪装成同花顺。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_pool_lhb.py -q`
-
-验收：
-- 龙虎榜时间字段按条件展示。
-- 数据来源说明诚实可追溯。
-
-### T013：运行股票池来源阶段回归
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_stock_pools.py`
-- `tests/test_watchlist_store.py`
-- `tests/test_pool_market_ranges.py`
-- `tests/test_pool_lhb.py`
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_stock_pools.py tests\test_watchlist_store.py tests\test_pool_market_ranges.py tests\test_pool_lhb.py -q`
-
-验收：
-- 四类股票池来源的动态展示、摘要和错误状态全部通过。
-
-## 阶段 3：恒温器策略页日期、现金和高级设置
-
-### T014：为策略日期范围写测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- 可能涉及：`tests/test_stock_pools.py`
-- `examples/web_app.py`
-
-先写测试：
-- 恒温器策略页显示“策略日期范围”选择。
-- 选项包含最近 1 个月、最近 3 个月、最近半年、最近 1 年、自定义。
-- 固定范围时不显示开始日期和结束日期输入框。
-- 自定义时才显示开始日期和结束日期输入框。
-- 固定范围时页面显示实际使用的日期范围。
-
-实施范围：
-- 只调整日期范围 UI 和实际日期展示。
-- 不改变策略计算语义。
+- 只补齐 `spec.md` 第 7 节列出的关键列名映射。
+- 优先覆盖恒温器、股票池摘要、市场概览、执行计划、回测、账户表格。
+- 不改内部 DataFrame 原始列名。
 
 验证命令：
 - `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
 
 验收：
-- 用户不需要在固定范围下手动填写日期。
+- 用户页面不再直接显示规格列出的英文字段名。
+- 内部测试仍可使用英文键名。
 
-### T015：为可用现金只读展示写测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_portfolio_journal.py`
-- `examples/web_app.py`
-- `stock_picker/user/portfolio.py`
-
-先写测试：
-- 账户已初始化时，恒温器策略页只读显示当前账户现金。
-- 可用现金不作为默认手动输入字段出现。
-- 账户未初始化时，显示“账户未初始化，请先到账户页初始化账户”或等价提示。
-
-实施范围：
-- 只调整恒温器策略页账户现金展示。
-- 不改变账户初始化、现金计算或交易流水逻辑。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_portfolio_journal.py -q`
-
-验收：
-- 可用现金从账户状态同步，不再要求用户重复填写。
-
-### T016：为模拟资金临时测算写测试
+### T016：统一表格列名渲染出口
 
 涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_portfolio_journal.py`
 - `examples/web_app.py`
+- `tests/test_web_app.py`
 
-先写测试：
-- 默认不显示模拟资金输入框。
-- 启用“使用模拟资金”后才显示模拟资金输入框。
-- 页面明确说明模拟资金只用于临时策略测算，不改变账户现金、持仓或交易流水。
-- 使用模拟资金后，账户现金、持仓和交易流水保持不变。
+先做验证：
+- 用渲染测试确认所有表格列名都经过中文展示。
 
 实施范围：
-- 只调整模拟资金 UI 和提示。
-- 不改变账户状态持久化逻辑。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_portfolio_journal.py -q`
-
-验收：
-- 模拟资金与真实账户状态边界清晰。
-
-### T017：为低频数据源和执行设置默认收起写测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `examples/web_app.py`
-
-先写测试：
-- 历史源、股票列表源、实时源、强制刷新默认不全部展开。
-- 生成手工执行计划、次日溢价上限、成交量限制默认不全部展开。
-- 页面显示“高级设置”“数据与执行设置”或等价入口。
-- 展开后这些字段仍可见且可提交。
-
-实施范围：
-- 只把低频字段移入折叠区或等价二级入口。
-- 不改变默认值和提交含义。
+- 只调整表格渲染出口。
+- 不改表格数据来源。
 
 验证命令：
 - `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
 
 验收：
-- 恒温器策略页默认可见字段明显减少。
-- 高级字段仍可通过入口访问。
+- 表格列名统一映射。
+- 未知字段使用中文兜底提示。
 
-### T018：为恒温器运行结果不变写回归测试
+### T017：统一摘要字段名渲染出口
+
+涉及文件：
+- `examples/web_app.py`
+- `tests/test_web_app.py`
+
+先做验证：
+- 用摘要渲染测试确认摘要字段名能转为中文。
+
+实施范围：
+- 只调整摘要展示。
+- 不改摘要数据结构。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+验收：
+- 结果摘要不直接显示内部字段名。
+- 摘要字段和值的展示与表格展示规则一致。
+
+### T018：运行标题和列名阶段回归
+
+涉及文件：
+- `tests/test_web_app.py`
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+验收：
+- 标题、表格列名、摘要字段名相关测试通过。
+- 未触及策略、账户和回测计算逻辑。
+
+## 阶段 3：状态值、动作值和执行计划值汉化
+
+### T019：补齐状态值和枚举值映射
+
+涉及文件：
+- `examples/web_app.py`
+- `tests/test_web_app.py`
+
+先做验证：
+- 运行 T007 对应测试，确认枚举值汉化缺口。
+
+实施范围：
+- 只补齐用户可见枚举值映射。
+- 覆盖市场状态、个股状态、策略类型、建议动作、置信度、布尔值、股票池来源、数据来源。
+- 不改内部枚举值。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+验收：
+- 页面显示“震荡区间”“趋势跟随”“观察”“买入”“等待确认”等中文值。
+- 策略层返回的原始枚举值保持不变。
+
+### T020：统一表格单元格值渲染出口
+
+涉及文件：
+- `examples/web_app.py`
+- `tests/test_web_app.py`
+
+先做验证：
+- 用 Web 测试确认同一个枚举值在不同表格中显示一致。
+
+实施范围：
+- 只调整用户页面单元格显示。
+- 不改 DataFrame 内容。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+验收：
+- 枚举值展示统一。
+- 股票代码、路径、URL、数据源品牌名保留原样。
+
+### T021：补齐执行计划动作值汉化
+
+涉及文件：
+- `examples/web_app.py`
+- `tests/test_web_app.py`
+- `tests/test_execution.py`
+
+先写或确认测试：
+- `recommended_action` 显示为中文推荐操作。
+- `fallback_action` 显示为中文备选操作。
+- `limit_status` 显示为中文涨跌停状态。
+- 资金不足、涨停、成交量限制、报价缺失等情况有中文摘要或中文动作说明。
+- 执行计划计算结果行数和原始动作值不变。
+
+实施范围：
+- 只调整执行计划展示。
+- 不改 `build_execution_plan` 的计算逻辑和输出结构。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_execution.py -q`
+
+验收：
+- 执行计划用户页面可读。
+- 执行辅助计算结果不变。
+
+### T022：运行状态值阶段回归
+
+涉及文件：
+- `tests/test_web_app.py`
+- `tests/test_execution.py`
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_execution.py -q`
+
+验收：
+- 枚举值、动作值和执行计划值汉化测试通过。
+- 执行辅助回归通过。
+
+## 阶段 4：进度、错误、警告和空状态
+
+### T023：汉化进度阶段标题
+
+涉及文件：
+- `examples/web_app.py`
+- `tests/test_web_app.py`
+
+先做验证：
+- 运行 T009 对应测试，确认内部 stage 泄漏点。
+
+实施范围：
+- 只调整进度展示映射。
+- 不改变后台任务状态结构和执行顺序。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+验收：
+- 进度标题显示中文阶段名。
+- 内部 stage 不直接作为用户可见文本。
+
+### T024：汉化进度小字和处理数量
+
+涉及文件：
+- `examples/web_app.py`
+- `tests/test_web_app.py`
+
+先写或确认测试：
+- 有 `completed` 和 `total` 时显示“已完成 x / y”。
+- 有 `current_symbol` 时显示当前处理股票。
+- 有中文 `node` 时优先显示节点说明。
+- 无中文 `node` 时使用中文阶段名兜底。
+
+实施范围：
+- 只调整进度小字渲染。
+- 不改变任务进度 payload 产生逻辑。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+验收：
+- 用户能看到当前阶段、当前股票和处理数量。
+
+### T025：汉化错误和警告摘要
+
+涉及文件：
+- `examples/web_app.py`
+- `tests/test_web_app.py`
+
+先做验证：
+- 运行 T010 对应测试，确认错误和警告英文泄漏点。
+
+实施范围：
+- 只调整用户可见错误摘要和警告摘要。
+- 原始异常详情保留在中文摘要之后。
+- 不改底层异常类型或数据源错误处理。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+验收：
+- 用户看到中文摘要。
+- 排查仍可看到原始异常详情。
+
+### T026：汉化空状态和下一步提示
+
+涉及文件：
+- `examples/web_app.py`
+- `tests/test_web_app.py`
+
+先写或确认测试：
+- 股票池为空、自选组合为空、龙虎榜为空、账户未初始化、无持仓、无交易流水、无可执行买入候选都有中文空状态。
+- 空状态提供下一步建议。
+
+实施范围：
+- 只调整页面文案。
+- 不改空状态判断逻辑。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+验收：
+- 空状态中文、明确、可操作。
+
+### T027：运行进度和错误阶段回归
+
+涉及文件：
+- `tests/test_web_app.py`
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+验收：
+- 进度、错误、警告、空状态相关测试通过。
+
+## 阶段 5：页面覆盖和计算结果不变验证
+
+### T028：验证恒温器页面汉化覆盖
 
 涉及文件：
 - `tests/test_web_app.py`
 - `tests/test_thermostat_strategy.py`
 - `tests/test_thermostat_backtest.py`
-- `examples/web_app.py`
 
-先写测试或确认现有测试：
-- UI 重构前后，同一最终股票池和同一策略日期范围下，恒温器策略结果语义不变。
-- 持仓建议、新买候选、网格建议和趋势建议来源不变。
-- UI 条件展示不改变策略内部判断。
-
-实施范围：
-- 只补回归验证或修正 Web 参数传递。
-- 不修改恒温器策略内部逻辑。
+先做验证：
+- 恒温器策略结果页标题、列名、状态值和动作值显示中文。
+- 股票代码、数据源品牌名和路径允许保留英文。
+- 同一输入下，恒温器候选数量、原始建议动作和计算结果不变。
 
 验证命令：
 - `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_thermostat_strategy.py tests\test_thermostat_backtest.py -q`
 
 验收：
-- 页面重排不改变恒温器策略计算结果。
+- 恒温器页面汉化覆盖通过。
+- 恒温器策略计算回归通过。
 
-### T019：运行恒温器页面阶段回归
+### T029：验证龙虎榜页面汉化覆盖
+
+涉及文件：
+- `tests/test_web_app.py`
+- `tests/test_pool_lhb.py`
+- `tests/test_lhb_candidates.py`
+
+先做验证：
+- 龙虎榜 Top N 标题中文。
+- 龙虎榜来源说明、时间范围、候选数量、错误或警告中文。
+- 龙虎榜候选池生成、Top N、去重、过滤和排序规则不变。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_pool_lhb.py tests\test_lhb_candidates.py -q`
+
+验收：
+- 龙虎榜用户页面中文可读。
+- 龙虎榜候选逻辑不变。
+
+### T030：验证回测诊断页面汉化覆盖
+
+涉及文件：
+- `tests/test_web_app.py`
+- `tests/test_backtest.py`
+- `tests/test_thermostat_backtest.py`
+
+先做验证：
+- 回测诊断结果区标题中文。
+- 回测表格列名中文。
+- 回测状态值中文。
+- 回测计算逻辑、统计口径和输出数据不变。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_backtest.py tests\test_thermostat_backtest.py -q`
+
+验收：
+- 回测诊断页面汉化覆盖通过。
+- 回测回归通过。
+
+### T031：验证账户页面汉化覆盖
+
+涉及文件：
+- `tests/test_web_app.py`
+- `tests/test_portfolio_journal.py`
+- `tests/test_watchlist_store.py`
+
+先做验证：
+- 账户概览、当前持仓、交易记录、自选组合标题中文。
+- 账户表格列名中文。
+- 空状态中文。
+- 账户初始化、买入、卖出、成本调整、估值刷新、持仓和交易流水逻辑不变。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_portfolio_journal.py tests\test_watchlist_store.py -q`
+
+验收：
+- 账户页面汉化覆盖通过。
+- 账户和自选组合回归通过。
+
+### T032：验证允许保留英文不会被误伤
+
+涉及文件：
+- `tests/test_web_app.py`
+
+先写或确认测试：
+- 页面可以显示 `600519.SH` 等股票代码。
+- 页面可以显示 `akshare`、`BaoStock`、`Sina`、`JoinQuant` 等数据源品牌名。
+- 页面可以显示 `data/user/default` 等路径。
+- 外部异常原文可以显示，但必须有中文摘要。
+
+验证命令：
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
+
+验收：
+- 测试没有过宽禁止英文。
+- 合法英文保留，业务标签中文。
+
+### T033：运行页面覆盖阶段回归
 
 涉及文件：
 - `tests/test_web_app.py`
 - `tests/test_thermostat_strategy.py`
 - `tests/test_thermostat_backtest.py`
+- `tests/test_pool_lhb.py`
+- `tests/test_lhb_candidates.py`
+- `tests/test_backtest.py`
 - `tests/test_portfolio_journal.py`
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_thermostat_strategy.py tests\test_thermostat_backtest.py tests\test_portfolio_journal.py -q`
-
-验收：
-- 股票池、日期、现金、模拟资金、高级设置和策略回归全部通过。
-
-## 阶段 4：账户页概览和摘要区
-
-### T020：为账户概览卡片写 Web 测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_portfolio_journal.py`
-- `examples/web_app.py`
-- `stock_picker/user/portfolio.py`
-
-先写测试：
-- 账户页顶部以卡片形式展示账户概览。
-- 概览至少包含本金、现金、持仓市值、总资产、总收益、总收益率、已实现盈亏、浮动盈亏、持仓数量、胜率、盈亏比、最大回撤、佣金率、印花税率。
-- 账户未初始化时显示明确空状态和初始化入口。
-- 未初始化状态下不显示误导性的零收益卡片。
-
-实施范围：
-- 只调整账户概览展示。
-- 不改变账户统计计算逻辑。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_portfolio_journal.py -q`
-
-验收：
-- 账户概览从分散文字变为整齐卡片。
-
-### T021：为当前持仓摘要写 Web 测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_portfolio_journal.py`
-- `examples/web_app.py`
-
-先写测试：
-- 有持仓时，账户页默认显示持仓摘要表或卡片。
-- 无持仓时，显示“暂无持仓”或等价空状态。
-- 提供“查看全部”入口。
-
-实施范围：
-- 只调整当前持仓默认展示。
-- 不改变持仓数据来源或估值逻辑。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_portfolio_journal.py -q`
-
-验收：
-- 持仓信息默认简洁可扫读。
-
-### T022：为交易流水最近 5 条写 Web 测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_portfolio_journal.py`
-- `examples/web_app.py`
-
-先写测试：
-- 账户页默认只展示最近 5 条交易流水。
-- 无交易流水时显示“暂无交易流水”或等价空状态。
-- 提供“查看全部”入口。
-- “查看全部”入口能进入完整表格、弹窗、展开区或二级页面。
-
-实施范围：
-- 只调整交易流水默认展示数量和入口。
-- 不改变交易流水数据结构或排序语义。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_portfolio_journal.py -q`
-
-验收：
-- 账户页不再默认显示完整长交易表。
-
-### T023：运行账户概览阶段回归
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_portfolio_journal.py`
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_portfolio_journal.py -q`
-
-验收：
-- 账户概览、持仓摘要和交易流水摘要全部通过。
-
-## 阶段 5：账户功能操作区
-
-### T024：为账户功能 tabs 或等价入口写 Web 测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `examples/web_app.py`
-
-先写测试：
-- 账户页功能操作区使用 tab、accordion、sidebar、弹窗、抽屉或二级页面组织。
-- 至少包含自选组合、账户设置、持仓与估值、买入 / 卖出、成本调整、交易记录这些入口或等价分组。
-- 不再把所有功能表单纵向展开在同一个长页面。
-
-实施范围：
-- 只建立账户功能操作区结构。
-- 不修改各功能内部业务逻辑。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
-
-验收：
-- 账户页从长表单变成概览加功能入口。
-
-### T025：为自选组合管理统一在账户页写测试
-
-涉及文件：
-- `tests/test_web_app.py`
 - `tests/test_watchlist_store.py`
-- `examples/web_app.py`
-- `stock_picker/user/watchlist.py`
-
-先写测试：
-- 账户页支持创建组合。
-- 账户页支持删除组合。
-- 账户页支持重命名组合。
-- 账户页支持添加股票。
-- 账户页支持删除股票。
-- 账户页支持查看组合内股票。
-- 添加股票支持逗号、空格、换行分隔。
-- 添加后显示解析结果，重复代码和错误代码有提示。
-- 删除自选组合或组合内股票不影响账户持仓、现金、交易流水或历史行情缓存。
-
-实施范围：
-- 只把自选组合完整管理放到账户页。
-- 恒温器策略页只提供跳转或调用统一保存逻辑，不重复完整管理功能。
 
 验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_watchlist_store.py tests\test_portfolio_journal.py -q`
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_thermostat_strategy.py tests\test_thermostat_backtest.py tests\test_pool_lhb.py tests\test_lhb_candidates.py tests\test_backtest.py tests\test_portfolio_journal.py tests\test_watchlist_store.py -q`
 
 验收：
-- 自选组合管理职责统一到账户页。
+- 四类页面汉化覆盖通过。
+- 计算结果相关回归通过。
 
-### T026：为账户初始化入口写 Web 测试
+## 阶段 6：最终回归和手动检查
 
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_portfolio_journal.py`
-- `examples/web_app.py`
-
-先写测试：
-- 初始化账户位于“账户设置”或等价入口中。
-- 初始化字段包含本金、佣金率、最低佣金、印花税率。
-- 初始化后账户概览更新。
-- 初始化操作有明确确认或结果提示。
-
-实施范围：
-- 只调整初始化账户的入口和展示位置。
-- 不改变账户初始化计算或存储逻辑。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_portfolio_journal.py -q`
-
-验收：
-- 初始化账户不再混在长页面中。
-
-### T027：为刷新行情 / 更新估值入口写 Web 测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_portfolio_journal.py`
-- `examples/web_app.py`
-
-先写测试：
-- 刷新行情 / 更新估值位于“持仓与估值”或等价入口中。
-- 字段包含账户路径、标记价格、历史源、股票列表源、实时源、是否强制刷新。
-- 刷新后账户概览、当前持仓、持仓市值和浮动盈亏同步更新。
-
-实施范围：
-- 只调整估值刷新入口和字段分组。
-- 不改变估值刷新、行情抓取或缓存逻辑。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_portfolio_journal.py tests\test_data_service.py -q`
-
-验收：
-- 估值刷新入口清晰，账户数据同步行为保持不变。
-
-### T028：为手动买入 / 卖出分组和高级信息折叠写测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_portfolio_journal.py`
-- `examples/web_app.py`
-
-先写测试：
-- 买入和卖出位于同一分组中，并通过子 tab、左右分栏或折叠面板区分。
-- 常用字段默认展示。
-- 策略、系统、原因、信号日、执行日、备注默认放入“高级信息”折叠区。
-- 买入和卖出提交后账户交易逻辑保持不变。
-
-实施范围：
-- 只调整买入 / 卖出表单布局和高级字段默认状态。
-- 不改变买入、卖出、成本和交易流水逻辑。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_portfolio_journal.py -q`
-
-验收：
-- 常用买卖操作更集中，高级字段不默认铺开。
-
-### T029：为调整成本低频入口写 Web 测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_portfolio_journal.py`
-- `examples/web_app.py`
-
-先写测试：
-- 调整成本位于单独入口、折叠面板或低频 tab 中。
-- 默认账户页不让调整成本表单占据大面积页面。
-- 进入该功能后，页面明确提示这是会修改持仓成本记录的操作。
-- 调整成本提交后账户成本逻辑保持不变。
-
-实施范围：
-- 只调整调整成本入口和默认展示状态。
-- 不改变成本调整业务逻辑。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_portfolio_journal.py -q`
-
-验收：
-- 调整成本作为低频操作被收纳。
-
-### T030：运行账户功能区阶段回归
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_watchlist_store.py`
-- `tests/test_portfolio_journal.py`
-- `tests/test_data_service.py`
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_watchlist_store.py tests\test_portfolio_journal.py tests\test_data_service.py -q`
-
-验收：
-- 账户功能入口、自选组合、初始化、估值、买卖、成本调整全部通过。
-
-## 阶段 6：视觉层级、响应式和文档
-
-### T031：为视觉层级和表单布局写 Web 结构测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `examples/web_app.py`
-
-先写测试或验证点：
-- 页面最大宽度合理，内容不贴边。
-- 表单使用统一 grid 布局或等价结构。
-- 同一组字段宽度一致。
-- checkbox 与文字水平对齐。
-- 主操作按钮和次要按钮有可识别区别。
-- 按钮位于表单底部或右下方，而不是散落在中间。
-
-实施范围：
-- 只调整页面 CSS 和结构类名。
-- 不改变表单字段含义。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
-
-验收：
-- 页面结构支持视觉层级检查。
-
-### T032：为错误和空状态写 Web 测试
-
-涉及文件：
-- `tests/test_web_app.py`
-- `examples/web_app.py`
-
-先写测试：
-- 账户未初始化有明确提示和下一步入口。
-- 无自选组合有明确空状态。
-- 自选组合为空有明确空状态。
-- 手动股票池为空有明确错误。
-- 市场范围未选择有明确错误。
-- 龙虎榜为空或失败有明确提示。
-- 无持仓和无交易流水有明确空状态。
-
-实施范围：
-- 只补空状态和错误提示文案。
-- 不改变底层错误类型或业务规则。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
-
-验收：
-- 错误和空状态告诉用户下一步可以做什么。
-
-### T033：为窄屏可用性做结构验证
-
-涉及文件：
-- `tests/test_web_app.py`
-- `examples/web_app.py`
-
-先写测试或手动验证点：
-- 卡片和表单字段在窄屏下可换行。
-- 按钮仍可见。
-- 关键文本不与输入框、按钮或下一段内容重叠。
-- 长表单通过折叠、tabs、弹窗、抽屉或二级入口收纳。
-
-实施范围：
-- 只调整响应式 CSS 和结构。
-- 不改变业务交互。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py -q`
-
-验收：
-- 窄屏下页面可用，没有明显重叠或按钮不可见。
-
-### T034：更新 README 的正常 Web 使用说明
-
-涉及文件：
-- `README.md`
-- 可能涉及：`tests/test_docs.py`
-
-先写验证：
-- README 说明 Web 正常入口仍是恒温器策略、回测诊断、账户。
-- README 说明自选组合管理统一在账户页。
-- README 说明恒温器策略页的手动股票池保存路径。
-- README 说明模拟资金只影响临时策略测算，不改变账户。
-- README 说明旧 CLI、旧筛选引擎、旧海龟源码保留但不在正常 Web 主流程展示。
-
-实施范围：
-- 只更新文档和文档测试。
-- 不改代码。
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_docs.py -q`
-
-验收：
-- 文档与 `spec.md`、`plan.md` 和实际 Web 行为一致。
-
-### T035：运行视觉和文档阶段回归
-
-涉及文件：
-- `tests/test_web_app.py`
-- `tests/test_docs.py`
-
-验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_docs.py -q`
-
-验收：
-- 视觉结构、空状态、窄屏结构和文档全部通过。
-
-## 阶段 7：最终回归和手动验证
-
-### T036：运行核心回归组合
+### T034：运行核心回归组合
 
 涉及文件：
 - `tests/test_web_app.py`
 - `tests/test_stock_pools.py`
 - `tests/test_pool_market_ranges.py`
 - `tests/test_pool_lhb.py`
+- `tests/test_lhb_candidates.py`
 - `tests/test_watchlist_store.py`
 - `tests/test_thermostat_strategy.py`
 - `tests/test_thermostat_backtest.py`
 - `tests/test_portfolio_journal.py`
 - `tests/test_execution.py`
-- `tests/test_turtle_system.py`
-- `tests/test_data_service.py`
+- `tests/test_backtest.py`
 
 验证命令：
-- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_stock_pools.py tests\test_pool_market_ranges.py tests\test_pool_lhb.py tests\test_watchlist_store.py tests\test_thermostat_strategy.py tests\test_thermostat_backtest.py tests\test_portfolio_journal.py tests\test_execution.py tests\test_turtle_system.py tests\test_data_service.py -q`
+- `.\.venv\Scripts\python.exe -m pytest tests\test_web_app.py tests\test_stock_pools.py tests\test_pool_market_ranges.py tests\test_pool_lhb.py tests\test_lhb_candidates.py tests\test_watchlist_store.py tests\test_thermostat_strategy.py tests\test_thermostat_backtest.py tests\test_portfolio_journal.py tests\test_execution.py tests\test_backtest.py -q`
 
 验收：
-- Web、股票池、自选组合、恒温器、账户、执行辅助、海龟系统和数据服务全部通过。
+- Web、股票池、龙虎榜、自选组合、恒温器、账户、执行辅助和回测全部通过。
 
-### T037：运行完整测试套件
+### T035：运行完整测试套件
 
 涉及文件：
 - `tests`
@@ -813,9 +710,9 @@
 
 验收：
 - 完整测试通过。
-- 如存在与本次无关的既有失败，必须记录失败名称、原因和与本次改动无关的证据。
+- 如存在与本次无关的既有失败，必须记录失败名称、原因和与本次汉化无关的证据。
 
-### T038：手动验证本地 Web 正常路径
+### T036：手动验证本地 Web 汉化效果
 
 涉及文件：
 - `examples/web_app.py`
@@ -824,35 +721,23 @@
 - 启动本地 Web：`.\.venv\Scripts\python.exe examples\web_app.py --host 127.0.0.1 --port 8765`
 - 验证 HTTP：`Invoke-WebRequest -Uri http://127.0.0.1:8765 -UseBasicParsing -TimeoutSec 10`
 - 打开 `http://127.0.0.1:8765`
-- 检查顶部只有“恒温器策略 / 回测诊断 / 账户”。
-- 检查恒温器策略页只显示当前股票池来源相关字段。
-- 检查手动股票池通过二级入口编辑。
-- 检查自选组合来源从账户已有组合读取。
-- 检查市场范围可多选。
-- 检查龙虎榜日期只在自定义时显示开始/结束日期。
-- 检查策略日期只在自定义时显示开始/结束日期。
-- 检查账户现金只读展示，模拟资金只在启用后显示。
-- 检查高级数据源和执行设置默认收起。
-- 检查账户页顶部为概览卡片。
-- 检查账户页功能操作区不是长表单堆叠。
-- 检查交易流水默认最近 5 条并有查看全部入口。
-- 检查手动买入 / 卖出高级字段默认收起。
-- 检查调整成本不默认占据大面积页面。
-- 检查页面没有旧策略列表、旧默认技术筛选或旧海龟系统入口。
+- 运行恒温器策略，检查结果区标题、表格列名、状态值、动作值是否中文。
+- 切换龙虎榜来源，检查 Top N 标题、候选数量、时间范围、进度和错误提示是否中文。
+- 打开回测诊断页，检查结果区标题和表格列名是否中文。
+- 打开账户页，检查账户概览、当前持仓、交易流水、自选组合是否中文。
+- 检查股票代码、数据源品牌名、路径、URL 等允许英文内容仍可正常显示。
+- 检查外部异常如果出现，是否有中文摘要。
 
 验收：
 - HTTP 返回 200。
-- 正常路径符合 `spec.md` 的 27 条验收标准。
-- 没有发现明显重叠、按钮不可见或长表单无限堆叠。
+- 正常 Web 路径没有规格禁止的英文标题、英文字段名和内部枚举值。
+- 允许保留英文的内容没有被误翻译。
 
 ## 最终完成定义
 
-- `spec.md` 的 27 条验收标准都有对应自动测试或手动验证点。
-- 顶部导航只保留三个正常入口。
-- 恒温器策略页实现股票池来源、日期、现金、模拟资金和高级设置的条件展示。
-- 账户页实现账户概览、摘要区和功能入口分区。
-- 自选组合管理统一在账户页完成。
-- 回测诊断页纳入工作台壳层且计算语义不变。
-- 旧 CLI、旧筛选引擎、旧海龟源码保留但不在 Web 正常路径展示。
-- 恒温器策略、回测诊断、账户交易、执行辅助、海龟系统计算结果不变。
+- `spec.md` 的验收标准都有对应自动测试或手动验证点。
+- 正常 Web 使用路径的标题、列名、状态值、动作值、进度提示、错误提示和空状态完成中文展示。
+- 股票代码、数据源品牌名、路径、URL、外部异常原文等允许英文内容保留合理。
+- 内部字段名、数据结构、接口语义、持久化结构和 CLI 兼容性保持不变。
+- 恒温器策略、龙虎榜候选、手工执行计划、回测诊断和账户计算结果保持不变。
 - 核心回归、完整测试和本地 Web 手动验证完成。
