@@ -58,7 +58,7 @@ def test_web_default_path_is_thermostat_and_hides_old_entries() -> None:
     html = web_app.render_page(page="unknown")
 
     assert "恒温器策略" in html
-    assert 'action="/thermostat"' in html
+    assert 'action="/thermostat-job"' in html
     assert 'href="/thermostat"' in html
     assert 'href="/portfolio"' in html
     assert 'action="/turtle"' not in html
@@ -119,6 +119,25 @@ def test_web_thermostat_get_query_rerenders_selected_lhb_fields() -> None:
     assert "前 30 名" in html
     assert "前 50 名" in html
     assert "编辑手动股票池" not in html
+
+
+def test_web_thermostat_all_sources_submit_to_same_job_entry(tmp_path) -> None:
+    store = WatchlistStore(tmp_path / "account")
+    store.create("观察")
+    store.add_symbols("观察", ["600519"])
+
+    forms = [
+        {"stock_pool_source": "manual", "symbols": "600519"},
+        {"stock_pool_source": "watchlist", "account_path": str(tmp_path / "account"), "watchlist_name": "观察"},
+        {"stock_pool_source": "market_range", "market_range": "all_a"},
+        {"stock_pool_source": "lhb", "lhb_range": "1w", "lhb_confirmed_top": "30"},
+    ]
+
+    for form in forms:
+        html = web_app.render_page(page="thermostat", form=form)
+        assert '<form method="post" action="/thermostat-job">' in html
+        assert '<form method="post" action="/thermostat">' not in html
+        assert "运行恒温器策略" in html
 
 
 def test_web_stock_pool_source_selector_refreshes_without_running() -> None:
@@ -611,6 +630,25 @@ def test_web_rendering_marks_unknown_user_visible_fields() -> None:
     assert ">unmapped_field<" not in html
 
 
+def test_web_cash_shortfall_wording_distinguishes_suggested_position_from_account_cash() -> None:
+    html = web_app.render_table(
+        "New Buy Candidates",
+        pd.DataFrame(
+            [
+                {
+                    "symbol": "688135.SH",
+                    "action": "observe",
+                    "reason": "市场过渡期，仅试探仓；现金不足以买入一手",
+                    "risk_note": "现金不足以买入一手",
+                }
+            ]
+        ),
+    )
+
+    assert "建议仓位金额不足以买入一手" in html
+    assert "账户现金不足" not in html
+
+
 def test_web_job_progress_uses_chinese_stage_fallback_and_failure_summary() -> None:
     job = web_app.ThermostatJob("job-localization", {})
 
@@ -704,6 +742,92 @@ def test_portfolio_trade_form_is_cleared_after_record() -> None:
     assert 'value="100"' not in html
     assert 'value="thermostat"' in html
     assert 'value="trend_following"' in html
+
+
+def test_web_display_form_after_success_clears_watchlist_inputs() -> None:
+    base = {
+        "path": "data/user/default",
+        "account_path": "data/user/other",
+        "watchlist_name": "观察",
+        "symbol": "600519,000001",
+        "new_watchlist_name": "新观察",
+        "realtime_source": "sina",
+    }
+
+    created = web_app._display_form_after_success("/watchlist-create", base)
+    added = web_app._display_form_after_success("/watchlist-add-symbol", base)
+    removed = web_app._display_form_after_success("/watchlist-remove-symbol", base)
+    renamed = web_app._display_form_after_success("/watchlist-rename", base)
+    deleted = web_app._display_form_after_success("/watchlist-delete", base)
+
+    assert created == {"path": "data/user/default", "account_path": "data/user/other"}
+    assert added == {"path": "data/user/default", "account_path": "data/user/other", "watchlist_name": "观察"}
+    assert removed == {"path": "data/user/default", "account_path": "data/user/other", "watchlist_name": "观察"}
+    assert renamed == {"path": "data/user/default", "account_path": "data/user/other", "watchlist_name": "观察"}
+    assert deleted == {"path": "data/user/default", "account_path": "data/user/other"}
+
+
+def test_web_display_form_after_success_clears_portfolio_inputs() -> None:
+    form = {
+        "path": "data/user/default",
+        "principal": "100000",
+        "cash": "90000",
+        "commission_rate": "0.0003",
+        "min_commission": "5",
+        "stamp_tax_rate": "0.001",
+        "marks": "600519=1600",
+        "source": "baostock",
+        "stock_source": "akshare",
+        "realtime_source": "sina",
+        "refresh": "on",
+    }
+
+    initialized = web_app._display_form_after_success("/portfolio-init", form)
+    refreshed = web_app._display_form_after_success("/portfolio-summary", {**form, "refresh_valuation": "1"})
+
+    assert initialized == {"path": "data/user/default"}
+    assert refreshed == {
+        "path": "data/user/default",
+        "source": "baostock",
+        "stock_source": "akshare",
+        "realtime_source": "sina",
+        "refresh": "on",
+    }
+
+
+def test_web_page_form_state_is_isolated_by_page() -> None:
+    mixed = {
+        "path": "data/user/default",
+        "account_path": "data/user/strategy",
+        "symbol": "600519",
+        "symbols": "000001",
+        "watchlist_name": "观察",
+        "stock_pool_source": "watchlist",
+        "strategy_date_range": "3m",
+        "cash": "100000",
+        "start": "20260101",
+        "end": "20260201",
+    }
+
+    thermostat = web_app._display_form_for_page("thermostat", mixed)
+    portfolio = web_app._display_form_for_page("portfolio", mixed)
+    backtest = web_app._display_form_for_page("backtest", mixed)
+
+    assert "symbol" not in thermostat
+    assert thermostat["symbols"] == "000001"
+    assert thermostat["watchlist_name"] == "观察"
+    assert "symbols" not in portfolio
+    assert portfolio["path"] == "data/user/default"
+    assert "stock_pool_source" not in portfolio
+    assert backtest["symbols"] == "000001"
+    assert "watchlist_name" not in backtest
+
+
+def test_web_account_path_normalization_prefers_account_path_for_thermostat() -> None:
+    form = {"path": "data/user/account-page", "account_path": "data/user/strategy-page"}
+
+    assert web_app._account_path_for_form(form, page="thermostat") == "data/user/strategy-page"
+    assert web_app._account_path_for_form(form, page="portfolio") == "data/user/account-page"
 
 
 def test_portfolio_summary_refreshes_valuation_without_adding_trades(tmp_path, monkeypatch) -> None:

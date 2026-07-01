@@ -509,7 +509,7 @@ OPTION_LABELS.update(
 
 
 class WebAppHandler(BaseHTTPRequestHandler):
-    server_version = "StockPickerWeb/1.1.4"
+    server_version = "StockPickerWeb/1.1.5"
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -522,14 +522,14 @@ class WebAppHandler(BaseHTTPRequestHandler):
             self._send_json(job_status_payload(job_id))
             return
         if path == "/":
-            self._send_page(render_page(page="thermostat", form=LAST_FORM))
+            self._send_page(render_page(page="thermostat", form=_display_form_for_page("thermostat", LAST_FORM)))
             return
         page = path.strip("/")
         if page not in PAGES:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
         query_form = _query_form(parsed.query)
-        display_form = {**LAST_FORM, **query_form} if query_form else LAST_FORM
+        display_form = _display_form_for_page(page, {**LAST_FORM, **query_form} if query_form else LAST_FORM)
         result = None
         if page == "portfolio":
             try:
@@ -562,15 +562,12 @@ class WebAppHandler(BaseHTTPRequestHandler):
             elif path == "/portfolio-buy":
                 page = "portfolio"
                 result = handle_portfolio_buy(form)
-                display_form = _clear_trade_form(form)
             elif path == "/portfolio-sell":
                 page = "portfolio"
                 result = handle_portfolio_sell(form)
-                display_form = _clear_trade_form(form)
             elif path == "/portfolio-adjust-cost":
                 page = "portfolio"
                 result = handle_portfolio_adjust_cost(form)
-                display_form = _clear_trade_form(form)
             elif path == "/portfolio-summary":
                 page = "portfolio"
                 result = handle_portfolio_summary(form)
@@ -583,6 +580,7 @@ class WebAppHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
+            display_form = _display_form_after_success(path, form)
             LAST_FORM.clear()
             LAST_FORM.update(display_form)
             self._send_page(render_page(page=page, result=result, form=display_form))
@@ -1387,7 +1385,7 @@ def render_source_refresh_script(page: str) -> str:
 def render_thermostat_section(form: dict[str, str]) -> str:
     display_form = _thermostat_display_form(form)
     stock_source = _value(display_form, "stock_pool_source", "manual")
-    form_action = "/thermostat-job" if stock_source in {"lhb", "ths_lhb"} else "/thermostat"
+    form_action = "/thermostat-job"
     submit_label = "运行恒温器策略"
     return f"""
     <section id="thermostat" class="workspace-section">
@@ -1779,7 +1777,7 @@ def _display_value(key: str, value: object) -> str:
         return OPTION_LABELS[key][text]
     if key == "source" and text in OPTION_LABELS["pool_mode"]:
         return OPTION_LABELS["pool_mode"][text]
-    if key == "reason":
+    if key in {"reason", "risk_note"}:
         return _translate_text(text)
     return text
 
@@ -1810,7 +1808,9 @@ def _translate_text(text: str) -> str:
         ("no historical rows returned", "没有返回历史数据"),
         ("missing price", "缺少最新价"),
         ("missing previous close", "缺少昨收价"),
-        ("buy signal but cash is insufficient for one lot or requested turtle unit", "出现买入信号，但现金不足以买入一手或策略建议单元"),
+        ("insufficient cash:", "账户现金不足："),
+        ("buy signal but cash is insufficient for one lot or requested turtle unit", "出现买入信号，但建议仓位金额不足以买入一手或策略建议单元"),
+        ("现金不足以买入一手", "建议仓位金额不足以买入一手"),
         ("buy signal but price is at limit-up", "出现买入信号，但当前价格已涨停"),
         ("wait for order book fill, otherwise buy next day only below", "可排队等待成交；否则次日只在不高于该价格时买入："),
         ("or switch to alternative", "或切换到备选标的"),
@@ -2067,6 +2067,90 @@ def _clear_trade_form(form: dict[str, str]) -> dict[str, str]:
         if value is not None:
             display[key] = value
     return display
+
+
+def _account_path_for_form(form: dict[str, str], *, page: str) -> str:
+    if page == "thermostat":
+        return _value(form, "account_path", _value(form, "path", DEFAULT_USER_PATH))
+    return _value(form, "path", _value(form, "account_path", DEFAULT_USER_PATH))
+
+
+def _copy_existing(form: dict[str, str], keys: list[str]) -> dict[str, str]:
+    return {key: form[key] for key in keys if _optional(form, key) is not None}
+
+
+def _display_form_for_page(page: str, form: dict[str, str]) -> dict[str, str]:
+    if page == "thermostat":
+        display = _copy_existing(
+            form,
+            [
+                "stock_pool_source",
+                "symbols",
+                "watchlist_name",
+                "market_range",
+                "lhb_range",
+                "lhb_confirmed_top",
+                "lhb_start",
+                "lhb_end",
+                "strategy_date_range",
+                "start",
+                "end",
+                "cash",
+                "source",
+                "stock_source",
+                "realtime_source",
+                "refresh",
+                "execution_plan",
+                "next_day_premium",
+                "volume_limit_pct",
+                "exclude_star",
+                "use_simulated_cash",
+            ],
+        )
+        display["account_path"] = _account_path_for_form(form, page="thermostat")
+        return display
+    if page == "portfolio":
+        display = _copy_existing(form, ["source", "stock_source", "realtime_source", "refresh", "watchlist_name"])
+        display["path"] = _account_path_for_form(form, page="portfolio")
+        if _optional(form, "account_path") is not None:
+            display["account_path"] = _value(form, "account_path")
+        return display
+    if page == "backtest":
+        return _copy_existing(form, ["symbols", "start", "end", "cash", "source", "stock_source", "realtime_source", "refresh"])
+    return {}
+
+
+def _display_form_after_success(path: str, form: dict[str, str]) -> dict[str, str]:
+    if path == "/thermostat-job":
+        return _display_form_for_page("thermostat", form)
+    if path == "/thermostat-backtest":
+        return _display_form_for_page("backtest", form)
+    if path == "/portfolio-init":
+        return {"path": _account_path_for_form(form, page="portfolio")}
+    if path == "/portfolio-summary":
+        return _display_form_for_page("portfolio", form)
+    if path in {"/portfolio-buy", "/portfolio-sell", "/portfolio-adjust-cost"}:
+        return _clear_trade_form(form)
+    if path == "/watchlist-create":
+        display = {"path": _account_path_for_form(form, page="portfolio")}
+        if _optional(form, "account_path") is not None:
+            display["account_path"] = _value(form, "account_path")
+        return display
+    if path in {"/watchlist-add-symbol", "/watchlist-remove-symbol", "/watchlist-rename"}:
+        display = {"path": _account_path_for_form(form, page="portfolio")}
+        if _optional(form, "account_path") is not None:
+            display["account_path"] = _value(form, "account_path")
+        if _optional(form, "watchlist_name") is not None:
+            display["watchlist_name"] = _value(form, "watchlist_name")
+        return display
+    if path == "/watchlist-delete":
+        display = {"path": _account_path_for_form(form, page="portfolio")}
+        if _optional(form, "account_path") is not None:
+            display["account_path"] = _value(form, "account_path")
+        return display
+    if path == "/watchlist-save-manual":
+        return _display_form_for_page("thermostat", form)
+    return dict(form)
 
 
 def _turtle_summary(form: dict[str, str], start: str, end: str, cash: float, portfolio) -> dict[str, object]:
