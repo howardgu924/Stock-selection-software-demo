@@ -307,6 +307,30 @@ COLUMN_LABELS.update(
     }
 )
 
+COLUMN_LABELS.update(
+    {
+        "pool_regime": "股票池强弱",
+        "pool_above_ma20_ratio": "股票池高于20日均线比例",
+        "pool_uptrend_count": "股票池上升数量",
+        "pool_downtrend_count": "股票池下跌数量",
+        "pool_ret20": "股票池20日收益",
+        "pool_avg_vol20": "股票池平均20日波动率",
+        "ret20": "20日收益",
+        "ret60": "60日收益",
+        "ma20": "20日均线",
+        "ma60": "60日均线",
+        "range20": "20日区间宽度",
+        "range60": "60日区间宽度",
+        "vol20": "20日波动率",
+        "ma20_slope": "20日均线斜率",
+        "ma60_slope": "60日均线斜率",
+        "close_ma20_distance": "收盘价偏离20日均线",
+        "close_ma60_distance": "收盘价偏离60日均线",
+        "trend_strength": "趋势强度",
+        "grid_score": "网格评分",
+    }
+)
+
 INTEGER_DISPLAY_COLUMNS = {
     "rank",
     "shares",
@@ -431,9 +455,61 @@ OPTION_LABELS = {
     "traded": {"yes": "是", "no": "否"},
 }
 
+OPTION_LABELS.update(
+    {
+        "action": {
+            **OPTION_LABELS["action"],
+            "trial_buy": "试探买入",
+        },
+        "market_regime": {
+            **OPTION_LABELS["market_regime"],
+            "market_uptrend": "市场上升",
+            "market_range": "市场震荡",
+            "market_downtrend": "市场下行",
+            "market_transition": "市场过渡",
+            "insufficient_data": "数据不足",
+        },
+        "stock_regime": {
+            **OPTION_LABELS["stock_regime"],
+            "strong_uptrend": "强上升",
+            "insufficient_data": "数据不足",
+        },
+        "strategy_family": {
+            **OPTION_LABELS["strategy_family"],
+            "grid_candidate": "网格候选",
+            "observe": "观察",
+            "transition": "过渡观察",
+        },
+        "data_source": {
+            **OPTION_LABELS["data_source"],
+            "composite_index": "组合市场基准",
+            "candidate_aggregate": "候选池聚合",
+        },
+        "pool_regime": {
+            "pool_strong": "股票池偏强",
+            "pool_neutral": "股票池中性",
+            "pool_weak": "股票池偏弱",
+            "pool_chaotic": "股票池分化",
+        },
+        "strength": {
+            "high": "高",
+            "medium": "中",
+            "low": "低",
+            "normal": "正常",
+            "reduced": "降低",
+        },
+        "executable": {
+            "True": "是",
+            "False": "否",
+            "true": "是",
+            "false": "否",
+        },
+    }
+)
+
 
 class WebAppHandler(BaseHTTPRequestHandler):
-    server_version = "StockPickerWeb/1.1.3"
+    server_version = "StockPickerWeb/1.1.4"
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)

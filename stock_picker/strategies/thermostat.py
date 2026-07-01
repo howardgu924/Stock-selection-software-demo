@@ -9,6 +9,14 @@ import pandas as pd
 from stock_picker.data.models import normalize_symbol, symbol_code
 
 
+DEFAULT_MARKET_BENCHMARKS = [
+    ("000852.SH", 0.50, "CSI1000"),
+    ("399006.SZ", 0.30, "ChiNext"),
+    ("000688.SH", 0.20, "STAR50"),
+]
+RISK_ANCHOR_INDEX = "000300.SH"
+RISK_ANCHOR_COMPONENTS = ["000300.SH", "000852.SH", "399006.SZ"]
+
 REQUIRED_ADVICE_COLUMNS = [
     "symbol",
     "code",
@@ -70,69 +78,137 @@ class ThermostatBacktestResult:
     equity: pd.DataFrame
 
 
-def classify_regime(history: pd.DataFrame, min_periods: int = 20) -> dict[str, object]:
+def calculate_regime_metrics(history: pd.DataFrame) -> dict[str, object]:
+    frame = _prepare_history(history)
+    closes = pd.to_numeric(frame.get("close"), errors="coerce").dropna()
+    count = len(closes)
+    last = float(closes.iloc[-1]) if count else None
+    ma20 = _tail_mean(closes, 20)
+    ma60 = _tail_mean(closes, 60)
+    ret20 = _tail_return(closes, 20)
+    ret60 = _tail_return(closes, 60)
+    range20 = _tail_range(closes, 20)
+    range60 = _tail_range(closes, 60)
+    daily = closes.pct_change().dropna()
+    vol20 = float(daily.tail(20).std()) if len(daily.tail(20)) >= 2 else 0.0
+    ma20_slope = _ma_slope(closes, window=20, lag=5)
+    ma60_slope = _ma_slope(closes, window=60, lag=10)
+    close_ma20_distance = (last / ma20 - 1) if last is not None and ma20 else 0.0
+    close_ma60_distance = (last / ma60 - 1) if last is not None and ma60 else 0.0
+    trend_strength = ret60 / (vol20 * sqrt(60)) if vol20 else 0.0
+    vol20_percentile = None
+    range20_percentile = None
+    if count >= 252:
+        rolling_vol20 = closes.pct_change().rolling(20).std().dropna().tail(252)
+        rolling_range20 = closes.rolling(20).apply(
+            lambda values: (values.max() - values.min()) / values.mean() if values.mean() else 0.0,
+            raw=False,
+        ).dropna().tail(252)
+        if not rolling_vol20.empty:
+            current = float(rolling_vol20.iloc[-1])
+            vol20_percentile = float((rolling_vol20 <= current).mean() * 100)
+        if not rolling_range20.empty:
+            current = float(rolling_range20.iloc[-1])
+            range20_percentile = float((rolling_range20 <= current).mean() * 100)
+    if count < 60:
+        bucket = "insufficient"
+    elif count < 120:
+        bucket = "reduced"
+    elif count < 252:
+        bucket = "normal"
+    else:
+        bucket = "full"
+    return {
+        "close": last,
+        "ret20": ret20,
+        "ret60": ret60,
+        "ma20": ma20,
+        "ma60": ma60,
+        "range20": range20,
+        "range60": range60,
+        "vol20": vol20,
+        "ma20_slope": ma20_slope,
+        "ma60_slope": ma60_slope,
+        "close_ma20_distance": close_ma20_distance,
+        "close_ma60_distance": close_ma60_distance,
+        "vol20_percentile_252": vol20_percentile,
+        "range20_percentile_252": range20_percentile,
+        "trend_strength": trend_strength,
+        "data_sufficient": count >= 60,
+        "length_bucket": bucket,
+        "count": count,
+        "regime_date": _last_date(frame),
+    }
+
+
+def classify_market_regime(history: pd.DataFrame) -> dict[str, object]:
+    metrics = calculate_regime_metrics(history)
+    if not metrics["data_sufficient"]:
+        return _regime_result("insufficient_data", "low", "数据不足，至少需要60个交易日", metrics)
+    ret60 = float(metrics["ret60"])
+    close = metrics["close"]
+    ma60 = float(metrics["ma60"])
+    ma20_slope = float(metrics["ma20_slope"])
+    ma60_slope = float(metrics["ma60_slope"])
+    range20 = float(metrics["range20"])
+    range60 = float(metrics["range60"])
+    vol20 = float(metrics["vol20"])
+    conflict = (ret60 > 0 and close is not None and close < ma60) or (ret60 < 0 and close is not None and close > ma60)
+    if ret60 <= -0.06 and close is not None and close < ma60 and ma20_slope < 0:
+        return _regime_result("market_downtrend", "medium", "市场60日收益为负且跌破60日均线", metrics)
+    if vol20 > 0.035 or range20 > 0.12 or conflict:
+        return _regime_result("market_transition", "low", "市场波动过高或趋势证据冲突", metrics)
+    if ret60 >= 0.05 and close is not None and close > ma60 and ma20_slope > 0:
+        return _regime_result("market_uptrend", "medium", "市场60日收益向上且均线斜率为正", metrics)
+    if abs(ret60) <= 0.05 and range60 <= 0.15 and abs(ma60_slope) <= 0.02:
+        return _regime_result("market_range", "medium", "市场处于震荡区间", metrics)
+    return _regime_result("market_transition", "low", "市场趋势证据不稳定", metrics)
+
+
+def classify_stock_regime(history: pd.DataFrame) -> dict[str, object]:
+    metrics = calculate_regime_metrics(history)
+    if not metrics["data_sufficient"]:
+        return _regime_result("insufficient_data", "low", "数据不足，至少需要60个交易日", metrics)
+    ret20 = float(metrics["ret20"])
+    ret60 = float(metrics["ret60"])
+    close = metrics["close"]
+    ma20 = float(metrics["ma20"])
+    ma60 = float(metrics["ma60"])
+    ma20_slope = float(metrics["ma20_slope"])
+    range20 = float(metrics["range20"])
+    close_ma20_distance = float(metrics["close_ma20_distance"])
+    trend_strength = float(metrics["trend_strength"])
+    vol_pct = metrics["vol20_percentile_252"]
+    range_pct = metrics["range20_percentile_252"]
+    conflict = (ret60 > 0 and close is not None and close < ma60) or (ret60 < 0 and close is not None and close > ma60)
+    extreme_transition = (
+        (vol_pct is not None and vol_pct >= 80)
+        or (range_pct is not None and range_pct >= 80)
+        or range20 > 0.30
+        or conflict
+    )
+    if ret60 <= -0.08 and close is not None and close < ma60 and ma20_slope < 0:
+        return _regime_result("downtrend", "medium", "个股60日收益为负且跌破60日均线", metrics)
+    if extreme_transition:
+        return _regime_result("transition", "low", "个股波动过高或趋势证据冲突", metrics)
+    if ret60 >= 0.12 and close is not None and close > ma20 and ma20 > ma60 and trend_strength >= 1.2:
+        return _regime_result("strong_uptrend", "high", "个股强势上升趋势", metrics)
+    if ret60 >= 0.08 and close is not None and close > ma60 and ma20 > ma60 and ma20_slope > 0:
+        return _regime_result("uptrend", "medium", "个股中期上升趋势", metrics)
+    if abs(ret20) <= 0.05 and 0.06 <= range20 <= 0.20 and abs(ma20_slope) <= 0.02 and abs(close_ma20_distance) <= 0.03:
+        return _regime_result("range", "medium", "个股震荡区间", metrics)
+    return _regime_result("transition", "low", "个股状态不稳定", metrics)
+
+
+def classify_regime(history: pd.DataFrame, min_periods: int = 20, mode: str = "stock") -> dict[str, object]:
+    if mode == "market":
+        return classify_market_regime(history)
+    if mode == "stock":
+        return classify_stock_regime(history)
     frame = _prepare_history(history)
     if len(frame) < min_periods:
-        return {
-            "regime": "insufficient_data",
-            "confidence": "low",
-            "data_sufficient": False,
-            "regime_date": _last_date(frame),
-            "evidence": f"历史数据不足，至少需要{min_periods}条",
-        }
-
-    recent = frame.tail(min_periods).copy()
-    closes = pd.to_numeric(recent["close"], errors="coerce").dropna()
-    if len(closes) < min_periods:
-        return {
-            "regime": "insufficient_data",
-            "confidence": "low",
-            "data_sufficient": False,
-            "regime_date": _last_date(frame),
-            "evidence": "收盘价数据不足",
-        }
-
-    first = float(closes.iloc[0])
-    last = float(closes.iloc[-1])
-    ret20 = last / first - 1 if first else 0.0
-    ma20 = float(closes.mean())
-    daily = closes.pct_change().dropna()
-    volatility = float(daily.std()) if not daily.empty else 0.0
-    range_pct = (float(closes.max()) - float(closes.min())) / ma20 if ma20 else 0.0
-
-    if volatility > 0.07 and range_pct > 0.25:
-        regime = "transition"
-        confidence = "low"
-        label = "方向和波动证据冲突"
-    elif abs(ret20) <= 0.04 and range_pct <= 0.18 and (volatility >= 0.01 or range_pct <= 0.01):
-        regime = "range"
-        confidence = "medium"
-        label = "区间波动占主导"
-    elif ret20 >= 0.03 and last >= ma20:
-        regime = "uptrend"
-        confidence = "medium"
-        label = "价格位于20日均线上方"
-    elif ret20 <= -0.03 and last <= ma20:
-        regime = "downtrend"
-        confidence = "medium"
-        label = "价格位于20日均线下方"
-    else:
-        regime = "transition"
-        confidence = "low"
-        label = "趋势证据不稳定"
-
-    return {
-        "regime": regime,
-        "confidence": confidence,
-        "data_sufficient": True,
-        "regime_date": _last_date(frame),
-        "evidence": f"20日收益{ret20:.2%}，20日均线{ma20:.2f}，波动率{volatility:.2%}，区间宽度{range_pct:.2%}；{label}",
-        "ret20": ret20,
-        "ma20": ma20,
-        "volatility": volatility,
-        "range_pct": range_pct,
-        "last_close": last,
-    }
+        return _regime_result("insufficient_data", "low", f"数据不足，至少需要{min_periods}条", calculate_regime_metrics(frame))
+    return classify_stock_regime(frame)
 
 
 def evaluate_thermostat(
@@ -146,11 +222,21 @@ def evaluate_thermostat(
 ) -> ThermostatResult:
     if progress_callback:
         progress_callback({"stage": "classify_market", "completed": 0, "total": 1, "current_symbol": "", "node": "判断市场状态"})
-    market = classify_regime(market_history if market_history is not None else _aggregate_market_history(histories))
+    market_frame = market_history if market_history is not None and not market_history.empty else _aggregate_market_history(histories)
+    market = classify_market_regime(market_frame)
+    if bool(getattr(market_frame, "attrs", {}).get("defensive_anchor")):
+        market["regime"] = "market_downtrend"
+        market["evidence"] = f"{market['evidence']}；沪深300、中证1000、创业板指同时下行，进入防守状态"
     market_regime = str(market["regime"])
     date = as_of or str(market.get("regime_date") or "")
     if progress_callback:
         progress_callback({"stage": "classify_market", "completed": 1, "total": 1, "current_symbol": "", "node": "判断市场状态"})
+
+    stock_classifications = {
+        symbol: classify_stock_regime(frame)
+        for symbol, frame in histories.items()
+    }
+    pool = _pool_strength(histories, stock_classifications)
     overview = pd.DataFrame(
         [
             {
@@ -158,8 +244,14 @@ def evaluate_thermostat(
                 "confidence": market["confidence"],
                 "evidence": market["evidence"],
                 "regime_date": date,
-                "data_source": "index_history" if market_history is not None else "candidate_aggregate",
+                "data_source": getattr(market_frame, "attrs", {}).get("data_source", "index_history" if market_history is not None else "candidate_aggregate"),
                 "data_sufficient": bool(market["data_sufficient"]),
+                "pool_regime": pool["pool_regime"],
+                "pool_above_ma20_ratio": pool["pool_above_ma20_ratio"],
+                "pool_uptrend_count": pool["pool_uptrend_count"],
+                "pool_downtrend_count": pool["pool_downtrend_count"],
+                "pool_ret20": pool["pool_ret20"],
+                "pool_avg_vol20": pool["pool_avg_vol20"],
             }
         ]
     )
@@ -170,18 +262,17 @@ def evaluate_thermostat(
         symbol = normalize_symbol(str(item.get("symbol", "")))
         if not symbol:
             continue
-        stock = classify_regime(histories.get(symbol, pd.DataFrame()))
+        stock = stock_classifications.get(symbol) or classify_stock_regime(histories.get(symbol, pd.DataFrame()))
         holding_rows.append(
             _advice_row(
                 item=item,
                 history=histories.get(symbol, pd.DataFrame()),
-                stock_regime=str(stock["regime"]),
+                stock=stock,
                 market_regime=market_regime,
                 date=date or str(stock.get("regime_date") or ""),
                 cash=cash,
                 is_holding=True,
-                stock_evidence=str(stock["evidence"]),
-                data_sufficient=bool(stock["data_sufficient"]),
+                pool_regime=str(pool["pool_regime"]),
             )
         )
         if progress_callback:
@@ -194,27 +285,29 @@ def evaluate_thermostat(
         symbol = normalize_symbol(str(item.get("symbol", "")))
         if not symbol or symbol in holding_symbols:
             continue
-        stock = classify_regime(histories.get(symbol, pd.DataFrame()))
-        row = _advice_row(
-            item={**item, "symbol": symbol},
-            history=histories.get(symbol, pd.DataFrame()),
-            stock_regime=str(stock["regime"]),
-            market_regime=market_regime,
-            date=date or str(stock.get("regime_date") or ""),
-            cash=cash,
-            is_holding=False,
-            stock_evidence=str(stock["evidence"]),
-            data_sufficient=bool(stock["data_sufficient"]),
+        stock = stock_classifications.get(symbol) or classify_stock_regime(histories.get(symbol, pd.DataFrame()))
+        candidate_rows.append(
+            _advice_row(
+                item={**item, "symbol": symbol},
+                history=histories.get(symbol, pd.DataFrame()),
+                stock=stock,
+                market_regime=market_regime,
+                date=date or str(stock.get("regime_date") or ""),
+                cash=cash,
+                is_holding=False,
+                pool_regime=str(pool["pool_regime"]),
+            )
         )
-        if row["action"] != "blocked":
-            candidate_rows.append(row)
         if progress_callback:
             progress_callback({"stage": "evaluate_candidates", "completed": index, "total": len(candidate_items), "current_symbol": symbol, "node": "评估候选股"})
 
+    all_rows = _apply_grid_limits(candidate_rows + holding_rows, market_regime, market)
+    candidate_rows = [row for row in all_rows if row["symbol"] not in holding_symbols]
+    holding_rows = [row for row in all_rows if row["symbol"] in holding_symbols]
     holding_advice = _advice_frame(holding_rows)
-    new_candidates = _advice_frame([row for row in candidate_rows if row["action"] in {"buy", "observe", "wait_confirm"}])
-    grid_advice = _advice_frame([row for row in candidate_rows + holding_rows if row["strategy_family"] == "grid"])
-    trend_advice = _advice_frame([row for row in candidate_rows + holding_rows if row["strategy_family"] == "trend_following"])
+    new_candidates = _advice_frame([row for row in candidate_rows if row["action"] in {"buy", "add", "observe", "wait_confirm", "blocked"}])
+    grid_advice = _advice_frame([row for row in all_rows if row["strategy_family"] == "grid"])
+    trend_advice = _advice_frame([row for row in all_rows if row["strategy_family"] == "trend_following"])
     return ThermostatResult(
         market_overview=overview,
         holding_advice=holding_advice,
@@ -250,10 +343,10 @@ def run_thermostat_strategy(
         if progress_callback:
             progress_callback({"stage": "load_candidate_history", "completed": index, "total": len(normalized), "current_symbol": symbol, "node": "加载候选股历史"})
     if progress_callback:
-        progress_callback({"stage": "load_market_history", "completed": 0, "total": 1, "current_symbol": market_index, "node": "加载市场基准"})
-    market_history = _load_market_history(service, market_index, start_date, end_date)
+        progress_callback({"stage": "load_market_history", "completed": 0, "total": len(DEFAULT_MARKET_BENCHMARKS), "current_symbol": market_index, "node": "加载市场基准"})
+    market_history = _load_composite_market_history(service, histories, start_date, end_date)
     if progress_callback:
-        progress_callback({"stage": "load_market_history", "completed": 1, "total": 1, "current_symbol": market_index, "node": "加载市场基准"})
+        progress_callback({"stage": "load_market_history", "completed": 1, "total": 1, "current_symbol": "", "node": "加载市场基准"})
     holdings = getattr(portfolio, "positions", None)
     result = evaluate_thermostat(
         histories=histories,
@@ -298,18 +391,20 @@ def backtest_thermostat_strategy(
 def _advice_row(
     item: dict[str, object],
     history: pd.DataFrame,
-    stock_regime: str,
+    stock: dict[str, object],
     market_regime: str,
     date: str,
     cash: float,
     is_holding: bool,
-    stock_evidence: str,
-    data_sufficient: bool,
+    pool_regime: str,
 ) -> dict[str, object]:
     symbol = normalize_symbol(str(item.get("symbol", "")))
     prepared = _prepare_history(history)
     last = _last_close(prepared)
     name = str(item.get("name") or "")
+    stock_regime = str(stock["regime"])
+    stock_evidence = str(stock["evidence"])
+    data_sufficient = bool(stock["data_sufficient"])
     row = {
         "symbol": symbol,
         "code": symbol_code(symbol),
@@ -338,75 +433,53 @@ def _advice_row(
         "reason": stock_evidence,
         "risk_note": "",
         "executable": False,
-        "data_sufficient": bool(data_sufficient),
+        "data_sufficient": data_sufficient,
     }
     if not data_sufficient:
         row.update(
             {
                 "action": "wait_confirm",
                 "strength": "reduced",
-                "risk_note": "数据不足，禁止强买入",
-                "reason": f"{stock_evidence}；等待更多数据确认",
+                "risk_note": "数据不足，禁止买入、加仓或开网格",
+                "reason": f"{stock_evidence}；数据不足，等待更多数据确认",
             }
         )
         return row
-
     if stock_regime == "downtrend":
         row.update(
             {
                 "strategy_family": "risk_control",
                 "action": "sell" if is_holding else "blocked",
-                "strength": "normal",
                 "score": 0.2,
                 "priority": 1 if is_holding else 90,
                 "stop_price": last,
-                "reference_price": last,
-                "risk_note": "趋势下行，默认不新增多仓",
+                "risk_note": "个股下行，非持仓禁买，持仓进入风控",
+                "executable": is_holding,
             }
         )
         return row
-
     if stock_regime == "range":
         grid = _grid_prices(prepared)
         row.update(
             {
                 "strategy_family": "grid",
                 "action": "hold" if is_holding else "observe",
-                "score": 0.55,
-                "priority": 2 if is_holding else 20,
-                "suggested_position_pct": 0.08,
-                "suggested_shares": _suggested_shares(cash, last, 0.08),
+                "strength": "reduced" if market_regime in {"market_transition", "market_downtrend"} else "normal",
+                "score": _grid_score(stock, grid),
+                "priority": 20,
                 "grid_upper": grid["upper"],
                 "grid_lower": grid["lower"],
                 "grid_mid": grid["mid"],
                 "grid_unit_pct": 0.08,
                 "grid_max_layers": 4,
-                "grid_stop_condition": "价格有效跌破区间下沿或向上突破区间上沿后停止网格",
-                "risk_note": "震荡策略不得无限补仓",
+                "grid_stop_condition": "价格跌破区间下沿或趋势突破区间后停止网格",
+                "reason": f"{stock_evidence}；先作为网格候选排序",
+                "risk_note": "网格候选需要经过市场状态和评分限制",
             }
         )
         return row
-
-    if stock_regime == "uptrend":
-        conflict = market_regime == "downtrend"
-        row.update(
-            {
-                "strategy_family": "trend_following",
-                "action": "observe" if conflict else ("add" if is_holding else "buy"),
-                "strength": "reduced" if conflict else "normal",
-                "score": 0.62 if conflict else 0.82,
-                "priority": 10 if conflict else (2 if is_holding else 5),
-                "suggested_position_pct": 0.05 if conflict else 0.12,
-                "suggested_shares": 0 if conflict else _suggested_shares(cash, last, 0.12),
-                "entry_price": last,
-                "stop_price": _round_price(last * 0.92),
-                "target_price": _round_price(last * 1.18),
-                "risk_note": "逆市场风险，降低建议强度" if conflict else "趋势恶化或跌破止损价时退出",
-                "executable": not conflict,
-            }
-        )
-        return row
-
+    if stock_regime in {"strong_uptrend", "uptrend"}:
+        return _trend_row(row, prepared, stock_regime, stock_evidence, market_regime, cash, last, is_holding, pool_regime)
     row.update(
         {
             "strategy_family": "transition",
@@ -414,9 +487,81 @@ def _advice_row(
             "strength": "reduced",
             "score": 0.3,
             "priority": 50,
-            "risk_note": "状态不稳定，等待确认",
+            "risk_note": "个股状态不稳定，默认观察",
         }
     )
+    return row
+
+
+def _trend_row(
+    row: dict[str, object],
+    history: pd.DataFrame,
+    stock_regime: str,
+    stock_evidence: str,
+    market_regime: str,
+    cash: float,
+    last: float | None,
+    is_holding: bool,
+    pool_regime: str,
+) -> dict[str, object]:
+    pct = 0.0
+    action = "observe"
+    strength = "normal"
+    executable = False
+    reason_suffix = ""
+    if market_regime == "market_downtrend":
+        action = "hold" if is_holding else "observe"
+        strength = "reduced"
+        reason_suffix = "；市场防守状态，不新买不加仓"
+    elif market_regime == "market_transition":
+        if stock_regime == "strong_uptrend" and not is_holding:
+            pct = 0.04
+            action = "buy"
+            strength = "reduced"
+            executable = True
+            reason_suffix = "；市场过渡期，仅试探仓"
+        else:
+            action = "hold" if is_holding else "observe"
+            strength = "reduced"
+            reason_suffix = "；市场过渡期，普通趋势股观察"
+    elif market_regime == "market_range":
+        if stock_regime in {"strong_uptrend", "uptrend"}:
+            pct = 0.04
+            action = "add" if is_holding else "buy"
+            strength = "reduced"
+            executable = True
+            reason_suffix = "；震荡市场，仅试探仓"
+    elif market_regime == "market_uptrend":
+        pct = 0.11 if stock_regime == "strong_uptrend" else 0.09
+        action = "add" if is_holding else "buy"
+        executable = True
+        reason_suffix = "；上升市场，趋势跟随"
+    if pool_regime in {"pool_weak", "pool_chaotic"} and pct > 0:
+        pct = min(pct, 0.04)
+        strength = "reduced"
+        reason_suffix += "；股票池偏弱，降低仓位"
+    shares, final_pct, cash_note = _position_from_cash(cash, last, pct)
+    stop, target = _stop_target(history, last)
+    row.update(
+        {
+            "strategy_family": "trend_following",
+            "action": action,
+            "strength": strength,
+            "score": 0.9 if stock_regime == "strong_uptrend" else 0.75,
+            "priority": 2 if is_holding else (3 if stock_regime == "strong_uptrend" else 6),
+            "suggested_position_pct": final_pct,
+            "suggested_shares": shares,
+            "entry_price": last,
+            "stop_price": stop,
+            "target_price": target,
+            "reason": f"{stock_evidence}{reason_suffix}{cash_note}",
+            "risk_note": cash_note.strip("；") if cash_note else "",
+            "executable": executable and shares > 0,
+        }
+    )
+    if shares == 0 and pct > 0:
+        row["action"] = "observe"
+        row["executable"] = False
     return row
 
 
@@ -438,8 +583,14 @@ def _prepare_history(history: pd.DataFrame | None) -> pd.DataFrame:
     data = history.copy()
     if "date" in data:
         data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    else:
+        data["date"] = pd.RangeIndex(start=0, stop=len(data), step=1)
     data["close"] = pd.to_numeric(data.get("close"), errors="coerce")
-    return data.dropna(subset=["close"]).sort_values("date" if "date" in data else "close").reset_index(drop=True)
+    if "high" in data:
+        data["high"] = pd.to_numeric(data.get("high"), errors="coerce")
+    if "low" in data:
+        data["low"] = pd.to_numeric(data.get("low"), errors="coerce")
+    return data.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
 
 
 def _aggregate_market_history(histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -455,14 +606,224 @@ def _aggregate_market_history(histories: dict[str, pd.DataFrame]) -> pd.DataFram
         merged = merged.merge(frame, on="date", how="inner")
     close_cols = [column for column in merged.columns if column.startswith("close_")]
     merged["close"] = merged[close_cols].mean(axis=1)
-    return merged[["date", "close"]]
+    result = merged[["date", "close"]]
+    result.attrs["data_source"] = "candidate_aggregate"
+    return result
 
 
-def _load_market_history(service, market_index: str, start_date: str, end_date: str) -> pd.DataFrame:
+def _load_composite_market_history(service, histories: dict[str, pd.DataFrame], start_date: str, end_date: str) -> pd.DataFrame:
+    loaded: list[tuple[pd.DataFrame, float, str]] = []
+    index_states: dict[str, str] = {}
+    for code, weight, name in DEFAULT_MARKET_BENCHMARKS:
+        frame = _load_index_history(service, code, start_date, end_date)
+        if not frame.empty:
+            loaded.append((frame, weight, name))
+            index_states[code] = str(classify_market_regime(frame)["regime"])
+    anchor = _load_index_history(service, RISK_ANCHOR_INDEX, start_date, end_date)
+    if not anchor.empty:
+        index_states[RISK_ANCHOR_INDEX] = str(classify_market_regime(anchor)["regime"])
+    if not loaded:
+        fallback = _aggregate_market_history(histories)
+        fallback.attrs["data_source"] = "candidate_aggregate"
+        return fallback
+    total_weight = sum(weight for _, weight, _ in loaded)
+    merged = None
+    weighted_cols = []
+    for index, (frame, weight, _) in enumerate(loaded):
+        prepared = _prepare_history(frame)[["date", "close"]].copy()
+        if prepared.empty:
+            continue
+        first = float(prepared.iloc[0]["close"])
+        prepared[f"weighted_{index}"] = prepared["close"] / first * (weight / total_weight) if first else 0.0
+        prepared = prepared[["date", f"weighted_{index}"]]
+        weighted_cols.append(f"weighted_{index}")
+        merged = prepared if merged is None else merged.merge(prepared, on="date", how="inner")
+    if merged is None or merged.empty:
+        fallback = _aggregate_market_history(histories)
+        fallback.attrs["data_source"] = "candidate_aggregate"
+        return fallback
+    merged["close"] = merged[weighted_cols].sum(axis=1) * 1000
+    result = merged[["date", "close"]]
+    result.attrs["data_source"] = "composite_index"
+    result.attrs["defensive_anchor"] = all(index_states.get(code) == "market_downtrend" for code in RISK_ANCHOR_COMPONENTS)
+    return result
+
+
+def _load_index_history(service, index_code: str, start_date: str, end_date: str) -> pd.DataFrame:
     try:
-        return service.get_index_history(market_index, start_date=start_date, end_date=end_date)
+        return _prepare_history(service.get_index_history(index_code, start_date=start_date, end_date=end_date))
     except Exception:
         return pd.DataFrame()
+
+
+def _pool_strength(histories: dict[str, pd.DataFrame], classifications: dict[str, dict[str, object]]) -> dict[str, object]:
+    metrics = [calculate_regime_metrics(frame) for frame in histories.values()]
+    usable = [metric for metric in metrics if metric["data_sufficient"] and metric["ma20"] and metric["close"] is not None]
+    if not usable:
+        return {
+            "pool_regime": "pool_neutral",
+            "pool_above_ma20_ratio": 0.0,
+            "pool_uptrend_count": 0,
+            "pool_downtrend_count": 0,
+            "pool_ret20": 0.0,
+            "pool_avg_vol20": 0.0,
+        }
+    above_ratio = sum(1 for metric in usable if float(metric["close"]) > float(metric["ma20"])) / len(usable)
+    ret20_values = [float(metric["ret20"]) for metric in usable]
+    avg_vol20 = sum(float(metric["vol20"]) for metric in usable) / len(usable)
+    ret20_std = pd.Series(ret20_values).std() if len(ret20_values) > 1 else 0.0
+    regimes = [str(value["regime"]) for value in classifications.values()]
+    if ret20_std >= 0.08 and avg_vol20 >= 0.04:
+        pool_regime = "pool_chaotic"
+    elif above_ratio >= 0.60:
+        pool_regime = "pool_strong"
+    elif above_ratio >= 0.40:
+        pool_regime = "pool_neutral"
+    else:
+        pool_regime = "pool_weak"
+    return {
+        "pool_regime": pool_regime,
+        "pool_above_ma20_ratio": above_ratio,
+        "pool_uptrend_count": sum(1 for regime in regimes if regime in {"strong_uptrend", "uptrend"}),
+        "pool_downtrend_count": sum(1 for regime in regimes if regime == "downtrend"),
+        "pool_ret20": sum(ret20_values) / len(ret20_values),
+        "pool_avg_vol20": avg_vol20,
+    }
+
+
+def _apply_grid_limits(rows: list[dict[str, object]], market_regime: str, market: dict[str, object]) -> list[dict[str, object]]:
+    grid_rows = [row for row in rows if row["strategy_family"] == "grid"]
+    if not grid_rows:
+        return rows
+    if market_regime in {"market_downtrend", "market_transition", "insufficient_data"}:
+        limit = 0
+    elif market_regime == "market_range":
+        stable = float(market.get("range60", 1.0)) <= 0.10 and float(market.get("vol20", 1.0)) <= 0.015 and abs(float(market.get("ma60_slope", 1.0))) <= 0.01
+        limit = 3 if stable else 2
+    elif market_regime == "market_uptrend":
+        has_trend = any(row["strategy_family"] == "trend_following" and row["executable"] for row in rows)
+        limit = 1 if has_trend else 2
+    else:
+        limit = 0
+    sorted_grid = sorted(grid_rows, key=lambda row: float(row.get("score") or 0), reverse=True)
+    enabled_symbols = {row["symbol"] for row in sorted_grid[:limit]}
+    for row in grid_rows:
+        if row["symbol"] in enabled_symbols:
+            row["action"] = "hold" if row["action"] == "hold" else "buy"
+            row["executable"] = True
+            row["reason"] = f"{row['reason']}；网格评分进入本轮启用名单"
+        else:
+            row["action"] = "observe"
+            row["executable"] = False
+            row["reason"] = f"{row['reason']}；符合震荡条件，但网格优先级不足，未进入本轮启用名单。"
+            row["suggested_position_pct"] = 0.0
+            row["suggested_shares"] = 0
+    return rows
+
+
+def _grid_score(stock: dict[str, object], grid: dict[str, float | None]) -> float:
+    ret20 = abs(float(stock.get("ret20", 0.0)))
+    ma20_slope = abs(float(stock.get("ma20_slope", 0.0)))
+    range20 = float(stock.get("range20", 0.0))
+    vol20 = float(stock.get("vol20", 0.0))
+    close = stock.get("close")
+    mid = grid.get("mid")
+    upper = grid.get("upper")
+    stability = max(0.0, 1 - ret20 / 0.05) * 0.15 + max(0.0, 1 - ma20_slope / 0.02) * 0.15
+    width = max(0.0, 1 - abs(range20 - 0.13) / 0.10) * 0.20
+    volatility = max(0.0, 1 - abs(vol20 - 0.03) / 0.04) * 0.20
+    position = 0.0
+    if close is not None and mid and upper:
+        distance_mid = abs(float(close) / mid - 1)
+        near_upper = float(close) >= mid + (upper - mid) * 0.75
+        position = (max(0.0, 1 - distance_mid / 0.03) * 0.15) if not near_upper else 0.02
+    return round(stability + width + volatility + position, 6)
+
+
+def _position_from_cash(cash: float, price: float | None, pct: float) -> tuple[int, float, str]:
+    if pct <= 0 or not price or price <= 0 or cash <= 0:
+        return 0, 0.0, ""
+    shares = int((cash * pct / price) // 100) * 100
+    if shares <= 0:
+        return 0, 0.0, "；现金不足以买入一手"
+    return shares, pct, ""
+
+
+def _stop_target(history: pd.DataFrame, close: float | None) -> tuple[float | None, float | None]:
+    if close is None:
+        return None, None
+    prepared = _prepare_history(history)
+    atr20 = _atr20(prepared)
+    if atr20:
+        stop_pct = min(max(2 * atr20 / close, 0.06), 0.12)
+        target_pct = 2 * stop_pct
+        return _round_price(close * (1 - stop_pct)), _round_price(close * (1 + target_pct))
+    return _round_price(close * 0.92), _round_price(close * 1.18)
+
+
+def _atr20(history: pd.DataFrame) -> float | None:
+    if history.empty or "high" not in history or "low" not in history:
+        return None
+    data = history.copy()
+    high = pd.to_numeric(data["high"], errors="coerce")
+    low = pd.to_numeric(data["low"], errors="coerce")
+    close = pd.to_numeric(data["close"], errors="coerce")
+    prev_close = close.shift(1)
+    true_range = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    values = true_range.dropna().tail(20)
+    return float(values.mean()) if len(values) >= 5 else None
+
+
+def _regime_result(regime: str, confidence: str, label: str, metrics: dict[str, object]) -> dict[str, object]:
+    evidence = (
+        f"ret20={float(metrics.get('ret20') or 0):.2%}，"
+        f"ret60={float(metrics.get('ret60') or 0):.2%}，"
+        f"ma20={float(metrics.get('ma20') or 0):.2f}，"
+        f"ma60={float(metrics.get('ma60') or 0):.2f}，"
+        f"range20={float(metrics.get('range20') or 0):.2%}，"
+        f"vol20={float(metrics.get('vol20') or 0):.2%}；{label}"
+    )
+    return {
+        "regime": regime,
+        "confidence": confidence,
+        "data_sufficient": bool(metrics.get("data_sufficient")),
+        "regime_date": str(metrics.get("regime_date") or ""),
+        "evidence": evidence,
+        **metrics,
+    }
+
+
+def _tail_mean(closes: pd.Series, window: int) -> float:
+    values = closes.tail(window)
+    return float(values.mean()) if not values.empty else 0.0
+
+
+def _tail_return(closes: pd.Series, window: int) -> float:
+    if len(closes) < 2:
+        return 0.0
+    values = closes.tail(min(window, len(closes)))
+    first = float(values.iloc[0])
+    last = float(values.iloc[-1])
+    return last / first - 1 if first else 0.0
+
+
+def _tail_range(closes: pd.Series, window: int) -> float:
+    values = closes.tail(min(window, len(closes)))
+    if values.empty:
+        return 0.0
+    mean = float(values.mean())
+    return (float(values.max()) - float(values.min())) / mean if mean else 0.0
+
+
+def _ma_slope(closes: pd.Series, window: int, lag: int) -> float:
+    if len(closes) < window + lag:
+        return 0.0
+    rolling = closes.rolling(window).mean().dropna()
+    if len(rolling) <= lag:
+        return 0.0
+    current = float(rolling.iloc[-1])
+    previous = float(rolling.iloc[-1 - lag])
+    return current / previous - 1 if previous else 0.0
 
 
 def _last_date(frame: pd.DataFrame) -> str:
@@ -488,12 +849,6 @@ def _grid_prices(history: pd.DataFrame) -> dict[str, float | None]:
     upper = float(prepared["close"].max())
     lower = float(prepared["close"].min())
     return {"upper": _round_price(upper), "lower": _round_price(lower), "mid": _round_price((upper + lower) / 2)}
-
-
-def _suggested_shares(cash: float, price: float | None, pct: float) -> int:
-    if not price or price <= 0 or cash <= 0:
-        return 0
-    return max(int((cash * pct / price) // 100) * 100, 0)
 
 
 def _round_price(value: float | None) -> float | None:
@@ -570,10 +925,10 @@ def _regime_performance(benchmark: pd.DataFrame, equity: pd.DataFrame) -> pd.Dat
     rows = []
     previous_regime = None
     for start in range(0, len(bench), 20):
-        window = bench.iloc[start : start + 20]
-        if len(window) < 5:
+        window = bench.iloc[start : start + 60]
+        if len(window) < 20:
             continue
-        regime = str(classify_regime(window, min_periods=min(20, len(window)))["regime"])
+        regime = str(classify_market_regime(window)["regime"])
         rows.append(
             {
                 "market_regime": regime,
