@@ -160,9 +160,11 @@ first failure.
 
 ## 历史兼容
 
-The old CLI strategy examples, old screening engine, and old Turtle source code
-are kept for compatibility and reference. They are no longer the recommended
-normal workflow and are not exposed by the web app's normal user path.
+The old CLI strategy commands, old screening engine, and Turtle strategy modules
+are kept for compatibility and reference. The legacy text files that previously
+lived under `strategy/` have been removed from the normal project surface. These
+features are no longer the recommended normal workflow and are not exposed by the
+web app's normal user path.
 
 ## Screen Stocks
 
@@ -209,10 +211,10 @@ and whose volume stayed elevated for those three sessions:
 
 Use the latest completed trading day for `--end` if the current day's daily bar is not available yet. Keep JQData optional because account permissions may not cover the requested date range.
 
-## Run Strategy Lists
+## Legacy CLI Strategy Lists
 
-Strategies under `strategy/` are implemented as selection or rotation lists,
-not as automatic orders or full portfolio backtests. Output columns are:
+The legacy CLI strategy commands are selection or rotation lists, not automatic
+orders or full portfolio backtests. Output columns are:
 
 ```text
 strategy, symbol, code, name, date, action, score, rank, weight, reason

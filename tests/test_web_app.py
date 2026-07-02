@@ -8,6 +8,14 @@ from examples import web_app
 from stock_picker.user import ManualPortfolioStore, WatchlistStore
 
 
+MOJIBAKE_MARKERS = ("锛", "涓", "浠", "绯", "鎭", "鍔", "瀹", "�")
+
+
+def _assert_no_mojibake(text: str, *, context: str) -> None:
+    found = [marker for marker in MOJIBAKE_MARKERS if marker in text]
+    assert not found, f"{context} contains mojibake markers: {found}"
+
+
 def _history(symbol: str, closes: list[float]) -> pd.DataFrame:
     dates = pd.date_range("2026-04-01", periods=len(closes), freq="D")
     return pd.DataFrame(
@@ -333,16 +341,54 @@ def test_web_watchlist_table_flags_historical_invalid_symbols(tmp_path) -> None:
     assert "存在异常代码" in html
     assert "516650" in html
     assert "515070" in html
+    assert "未翻译字段" not in html
+    assert "更新时间" in html
 
 
 def test_web_normal_pages_do_not_show_old_strategy_entries() -> None:
     for page in ["thermostat", "backtest", "portfolio"]:
         html = web_app.render_page(page=page)
+        _assert_no_mojibake(html, context=page)
         assert 'action="/turtle"' not in html
         assert 'action="/turtle-backtest"' not in html
         assert 'href="/turtle"' not in html
         assert "海龟系统" not in html
         assert "旧策略列表" not in html
+
+
+def test_web_source_no_longer_keeps_unreachable_turtle_pages() -> None:
+    source = web_app.Path(web_app.__file__).read_text(encoding="utf-8")
+
+    assert "def render_turtle_section" not in source
+    assert "def turtle_fields" not in source
+    assert "def handle_turtle(" not in source
+    assert "def handle_turtle_backtest" not in source
+    assert "run_turtle_system" not in source
+    assert "backtest_turtle_system" not in source
+    assert "def _turtle_config" not in source
+    assert "def _resolve_turtle_universe" not in source
+    assert "def _resolve_backtest_universe" not in source
+
+
+def test_web_job_progress_messages_are_readable() -> None:
+    job = web_app.ThermostatJob("job-1", {"symbols": "600001"})
+
+    queued = web_app.job_status_payload("job-1")
+    assert queued["status"] == "missing"
+    _assert_no_mojibake(str(queued), context="missing job")
+
+    html = web_app.render_job_progress("job-1")
+    _assert_no_mojibake(html, context="job progress html")
+
+    job.update({"stage": "load_candidate_history", "completed": 3, "total": 5, "current_symbol": "600001.SH"})
+    payload = {
+        "node": job.node,
+        "message": job.message,
+        "stage": job.stage,
+    }
+    _assert_no_mojibake(str(payload), context="running job payload")
+    assert "正在加载候选股历史" in job.node
+    assert "已完成 3 / 5" in job.message
 
 
 def test_web_thermostat_result_contains_market_holdings_and_candidates(tmp_path, monkeypatch) -> None:
@@ -718,7 +764,19 @@ def test_web_thermostat_backtest_outputs_diagnostics(monkeypatch) -> None:
     )
 
     titles = [table.title for table in result.tables]
-    assert titles == ["Summary", "Regime Performance", "Diagnostics"]
+    assert titles[:3] == ["Summary", "Regime Performance", "Diagnostics"]
+    assert "Trades" in titles
+    assert "Daily Portfolio" in titles
+    assert result.summaries[0]["backtest_type"] == "event_driven"
+
+
+def test_backtest_page_shows_cache_parameters_results_and_download_sections() -> None:
+    html = web_app.render_thermostat_backtest_section({})
+
+    assert "数据缓存区" in html
+    assert "回测参数区" in html
+    assert "回测结果区" in html
+    assert "报告下载区" in html
 
 
 def test_portfolio_trade_form_is_cleared_after_record() -> None:

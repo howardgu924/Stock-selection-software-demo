@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import sqrt
 from typing import Callable, Iterable
 
 import pandas as pd
 
 from stock_picker.data.models import normalize_symbol, symbol_code
+from stock_picker.strategies.event_backtest import (
+    BacktestSettings,
+    EventBacktestEngine,
+    EventContext,
+    Signal,
+)
 
 
 DEFAULT_MARKET_BENCHMARKS = [
@@ -76,6 +82,13 @@ class ThermostatBacktestResult:
     regime_performance: pd.DataFrame
     diagnostics: pd.DataFrame
     equity: pd.DataFrame
+    daily_portfolio: pd.DataFrame = field(default_factory=pd.DataFrame)
+    evaluation_detail: pd.DataFrame = field(default_factory=pd.DataFrame)
+    trades: pd.DataFrame = field(default_factory=pd.DataFrame)
+    positions: pd.DataFrame = field(default_factory=pd.DataFrame)
+    symbol_performance: pd.DataFrame = field(default_factory=pd.DataFrame)
+    data_quality: pd.DataFrame = field(default_factory=pd.DataFrame)
+    parameters: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def calculate_regime_metrics(history: pd.DataFrame) -> dict[str, object]:
@@ -376,8 +389,93 @@ def backtest_thermostat_strategy(
         for symbol in normalized
     }
     benchmark = _prepare_history(service.get_index_history(benchmark_symbol, start_date, end_date))
-    equity = _simple_equity(histories, initial_cash)
-    summary = _backtest_summary(equity, benchmark, initial_cash)
+    event_prices = _histories_to_event_prices(histories)
+    engine = EventBacktestEngine(
+        BacktestSettings(
+            initial_cash=initial_cash,
+            force_final_liquidation=True,
+        )
+    )
+
+    def signal_provider(context: EventContext) -> list[Signal]:
+        if context.time_point != "noon":
+            return []
+        truncated = _truncate_histories(histories, context.date)
+        market = benchmark[benchmark["date"] <= pd.to_datetime(context.date)]
+        thermostat = evaluate_thermostat(
+            histories=truncated,
+            market_history=market,
+            candidates=[{"symbol": symbol, "name": ""} for symbol in normalized],
+            cash=context.cash,
+            as_of=context.date,
+        )
+        rows = []
+        for frame in [thermostat.new_candidates, thermostat.grid_advice, thermostat.trend_advice]:
+            if frame is None or frame.empty:
+                continue
+            rows.extend(frame.to_dict("records"))
+        signals: list[Signal] = []
+        seen: set[tuple[str, str]] = set()
+        for row in rows:
+            action = str(row.get("action") or "")
+            executable = bool(row.get("executable"))
+            shares = int(row.get("suggested_shares") or 0)
+            symbol = normalize_symbol(str(row.get("symbol") or ""))
+            if not symbol or (symbol, action) in seen:
+                continue
+            if action in {"buy", "add"} and executable and shares > 0:
+                signals.append(
+                    Signal(
+                        symbol=symbol,
+                        side="buy",
+                        shares=shares,
+                        reason=str(row.get("reason") or ""),
+                        strategy_family=str(row.get("strategy_family") or "thermostat"),
+                    )
+                )
+                seen.add((symbol, action))
+            elif action == "sell" and executable:
+                held = context.positions.get(symbol, {}).get("total_shares", 0)
+                if int(held) > 0:
+                    signals.append(
+                        Signal(
+                            symbol=symbol,
+                            side="sell",
+                            shares=int(held),
+                            reason=str(row.get("reason") or ""),
+                            strategy_family=str(row.get("strategy_family") or "thermostat"),
+                        )
+                    )
+                    seen.add((symbol, action))
+        return signals
+
+    event_result = engine.run(event_prices, signal_provider=signal_provider)
+    summary = event_result.summary.copy()
+    for column, default in {
+        "strategy": "thermostat",
+        "total_return": 0.0,
+        "annualized_return": 0.0,
+        "max_drawdown": 0.0,
+        "win_rate": 0.0,
+        "profit_loss_ratio": 0.0,
+        "average_holding_days": 0.0,
+        "trade_count": 0,
+        "position_utilization": 0.0,
+        "cash_ratio": 1.0,
+        "benchmark_return": _series_return(benchmark),
+        "backtest_type": "event_driven",
+    }.items():
+        if column not in summary:
+            summary[column] = default
+    summary.loc[:, "strategy"] = "thermostat"
+    summary.loc[:, "backtest_type"] = "event_driven"
+    equity = event_result.daily_portfolio.rename(
+        columns={"total_value_end": "total_value", "position_value_end": "position_value"}
+    )
+    if "total_value" not in equity:
+        equity = pd.DataFrame(columns=["date", "total_value", "daily_return", "drawdown", "position_value"])
+    elif "date" in equity:
+        equity["date"] = pd.to_datetime(equity["date"], errors="coerce")
     regime_performance = _regime_performance(benchmark, equity)
     diagnostics = _diagnostics(regime_performance)
     return ThermostatBacktestResult(
@@ -385,7 +483,80 @@ def backtest_thermostat_strategy(
         regime_performance=regime_performance,
         diagnostics=diagnostics,
         equity=equity,
+        daily_portfolio=event_result.daily_portfolio,
+        evaluation_detail=event_result.evaluation_detail,
+        trades=event_result.trades,
+        positions=event_result.positions,
+        symbol_performance=event_result.symbol_performance,
+        data_quality=event_result.data_quality,
+        parameters=event_result.parameters,
     )
+
+
+def simplified_backtest_thermostat_strategy(
+    service,
+    symbols: list[str],
+    start_date: str,
+    end_date: str,
+    initial_cash: float = 100000.0,
+    benchmark_symbol: str = "000001.SH",
+) -> ThermostatBacktestResult:
+    normalized = [normalize_symbol(symbol) for symbol in symbols]
+    histories = {
+        symbol: _prepare_history(service.get_history(symbol, start_date=start_date, end_date=end_date))
+        for symbol in normalized
+    }
+    benchmark = _prepare_history(service.get_index_history(benchmark_symbol, start_date, end_date))
+    equity = _simple_equity(histories, initial_cash)
+    summary = _backtest_summary(equity, benchmark, initial_cash)
+    regime_performance = _regime_performance(benchmark, equity)
+    diagnostics = _diagnostics(regime_performance)
+    summary["backtest_type"] = "simplified_backtest"
+    return ThermostatBacktestResult(
+        summary=summary,
+        regime_performance=regime_performance,
+        diagnostics=diagnostics,
+        equity=equity,
+    )
+
+
+def _histories_to_event_prices(histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for symbol, history in histories.items():
+        prepared = _prepare_history(history)
+        for item in prepared.to_dict("records"):
+            date = pd.to_datetime(item["date"]).strftime("%Y-%m-%d")
+            open_price = float(item.get("open", item.get("close")) or item.get("close"))
+            close_price = float(item["close"])
+            noon_price = (open_price + close_price) / 2
+            for time_point, price, simulated, warning in [
+                ("morning_open", open_price, False, ""),
+                ("noon", noon_price, True, "simulated_noon_price"),
+                ("afternoon_open", noon_price, True, "simulated_afternoon_open_price"),
+                ("close", close_price, False, ""),
+            ]:
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "date": date,
+                        "time_point": time_point,
+                        "price": round(float(price), 4),
+                        "limit_status": "normal",
+                        "is_suspended": False,
+                        "simulated": simulated,
+                        "warning": warning,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def _truncate_histories(histories: dict[str, pd.DataFrame], date: str) -> dict[str, pd.DataFrame]:
+    cutoff = pd.to_datetime(date)
+    result: dict[str, pd.DataFrame] = {}
+    for symbol, history in histories.items():
+        prepared = _prepare_history(history)
+        result[symbol] = prepared[prepared["date"] <= cutoff].reset_index(drop=True)
+    return result
 
 
 def _advice_row(

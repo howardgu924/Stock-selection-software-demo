@@ -1,435 +1,720 @@
-# Web 工作台进度与表单状态统一 tasks
+# 任务：恒温器事件驱动回测系统
 
-## 执行规则
+> 实施时必须逐项勾选。每个任务都应先补测试或验证点，再做最小实现，再运行指定测试。不要在一个任务里同时修改多个无关模块。
 
-- 本文件只定义任务，不开始实现。
-- 实现阶段必须先写测试或验证点，再改实现。
-- 每个任务都要能独立验证。
-- 每完成一组相关任务，运行该任务列出的测试。
-- 不修改恒温器策略计算逻辑、账户数据结构、行情数据源、龙虎榜抓取逻辑或回测核心结果。
-- 不重写旧 CLI，不引入新的前端框架。
+## 任务分组
 
-## 任务列表
+- A. 基线与回归保护
+- B. 数据缓存和涨跌停状态
+- C. 事件驱动回测核心
+- D. 恒温器信号接入
+- E. 参数来源和账户兼容
+- F. 报告输出
+- G. Web 回测入口
+- H. 端到端验证
 
-### T01. 锁定恒温器所有来源的提交入口
+---
 
-**目标**：先用测试证明所有股票池来源都应提交到同一套 job/progress 流程。
+## A. 基线与回归保护
 
-**涉及文件**：
-- `tests/test_web_app.py`
+### A1. 记录当前回测相关测试基线
 
-**任务**：
-- [ ] 增加测试：手动输入来源的“运行恒温器策略”表单使用统一 job 入口。
-- [ ] 增加测试：自选股组合来源的“运行恒温器策略”表单使用统一 job 入口。
-- [ ] 增加测试：市场范围来源的“运行恒温器策略”表单使用统一 job 入口。
-- [ ] 增加测试：龙虎榜来源继续使用同一套 job 入口。
-- [ ] 增加测试：四种来源的运行按钮文案和主要表单结构一致。
+影响文件：
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：测试能暴露当前只有部分来源走 job/progress 的问题。
+- 不改业务代码。
+- 可按需要补充 `tests/test_thermostat_backtest.py` 中的旧行为保护测试。
 
-### T02. 统一恒温器运行入口
+步骤：
 
-**目标**：让恒温器页面所有来源进入同一套 job/progress 流程，但不改实际策略计算入口。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_thermostat_backtest.py -q`，记录当前失败或通过情况。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`，记录当前失败或通过情况。
+- [ ] 若当前测试已有失败，先记录失败测试名和错误摘要，不在本任务修复。
 
-**涉及文件**：
-- `examples/web_app.py`
-- `tests/test_web_app.py`
+验证：
 
-**任务**：
-- [ ] 调整恒温器页面运行表单，使手动输入、自选股组合、市场范围、龙虎榜都提交到统一 job 入口。
-- [ ] 保留现有 `handle_thermostat()` 作为实际策略运行函数。
-- [ ] 保留现有 `handle_thermostat_job()`、`ThermostatJob`、`start_thermostat_job()`、`render_job_progress()` 的基本职责。
-- [ ] 不改 `stock_picker/strategies/thermostat.py`。
+- 能明确知道本次改动前回测和 Web 测试的基线状态。
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：T01 中来源入口相关测试通过。
+### A2. 锁定旧简化回测的 legacy 标识测试
 
-### T03. 锁定 job 完成和失败后的页面行为
+影响文件：
 
-**目标**：确保统一 job 后，短任务和长任务都能在页面上显示完成结果或失败原因。
+- `tests/test_thermostat_backtest.py`
+- 后续可能涉及 `stock_picker/strategies/thermostat.py`
 
-**涉及文件**：
-- `tests/test_web_app.py`
+步骤：
 
-**任务**：
-- [ ] 增加测试：普通手动输入 job 完成后，状态接口或渲染结果包含完成状态和结果 HTML。
-- [ ] 增加测试：自选股组合 job 完成后，结果显示在同一页面区域。
-- [ ] 增加测试：市场范围 job 失败时，错误文案显示在进度或结果区域。
-- [ ] 增加测试：龙虎榜 job 失败时，错误文案显示在进度或结果区域。
-- [ ] 增加测试：任务失败不会修改账户现金、持仓或自选组合。
+- [ ] 新增测试：旧简化回测如果仍可调用，结果必须包含或暴露 `simplified_backtest` 标识。
+- [ ] 新增测试：正式回测默认路径不能把旧简化结果当作正式事件驱动结果。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_thermostat_backtest.py -q`，确认新测试先失败或暴露当前缺口。
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：失败点集中在 job 状态输出或错误渲染，不应触发策略逻辑修改。
+验证：
 
-### T04. 补齐统一 job 状态输出
+- 测试能区分“正式事件驱动回测”和“旧简化回测”。
 
-**目标**：统一完成、失败、运行中三种状态的页面输出。
+---
 
-**涉及文件**：
-- `examples/web_app.py`
-- `tests/test_web_app.py`
+## B. 数据缓存和涨跌停状态
 
-**任务**：
-- [ ] 确保 job 运行中时显示阶段名称、阶段说明、进度和已处理数量。
-- [ ] 确保 job 完成时返回结果区域。
-- [ ] 确保 job 失败时返回清晰错误原因。
-- [ ] 确保短任务即使很快完成，也不会绕过统一结果展示。
+### B1. 增加事件价格缓存 schema 测试
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：T03 中 job 状态输出测试通过。
+影响文件：
 
-### T05. 锁定账户页自选组合表单清空规则
+- `tests/test_data_service.py` 或新增 `tests/test_event_price_cache.py`
+- 后续涉及 `stock_picker/data/storage.py`
 
-**目标**：先测试自选组合相关表单提交后，临时输入被清空，配置字段被保留。
+步骤：
 
-**涉及文件**：
-- `tests/test_web_app.py`
+- [ ] 新增测试：事件价格缓存 key 必须区分 `symbol`、`date`、`time_point`、`frequency`、`adjust_type`、`source`。
+- [ ] 新增测试：同一股票同一天的 `daily`、`morning_open`、`noon`、`afternoon_open`、`close` 记录可以并存。
+- [ ] 新增测试：旧日线缓存读写仍保持可用。
+- [ ] 运行对应测试，确认新增测试失败且旧日线缓存测试不受影响。
 
-**任务**：
-- [ ] 增加测试：创建组合成功后，组合名称输入框清空，账户路径保留。
-- [ ] 增加测试：添加股票成功后，股票代码输入框清空，自选组合选择保留。
-- [ ] 增加测试：删除股票成功后，股票代码输入框清空，自选组合选择保留。
-- [ ] 增加测试：重命名组合成功后，新组合名称输入框清空。
-- [ ] 增加测试：删除组合成功后，页面不再选中已删除组合。
+验证：
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：测试暴露当前输入框残留或已删除组合仍被选中的问题。
+- 事件缓存需求被测试覆盖。
+- 旧缓存兼容性被测试保护。
 
-### T06. 实现自选组合表单清空规则
+### B2. 实现事件价格缓存读写
 
-**目标**：只清理自选组合操作的临时输入，不改变自选组合数据语义。
+影响文件：
 
-**涉及文件**：
-- `examples/web_app.py`
-- `tests/test_web_app.py`
+- `stock_picker/data/storage.py`
+- `tests/test_event_price_cache.py` 或 `tests/test_data_service.py`
 
-**任务**：
-- [ ] 创建组合成功后，不把本次组合名称回填到创建输入框。
-- [ ] 添加股票成功后，不把本次股票代码回填到添加输入框。
-- [ ] 删除股票成功后，不把本次股票代码回填到删除输入框。
-- [ ] 重命名成功后，不把新组合名称回填到重命名输入框。
-- [ ] 删除组合后，如果当前组合不存在，则选择剩余有效组合或显示空状态。
+步骤：
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：T05 测试通过。
+- [ ] 在缓存层新增事件价格记录的读写能力。
+- [ ] 保持现有 `historical_prices` 表和读取行为不破坏。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_event_price_cache.py tests/test_data_service.py -q`。
 
-### T07. 锁定账户页交易和估值表单清空规则
+验证：
 
-**目标**：测试账户页其他操作提交后不保留临时输入。
+- 事件缓存读写测试通过。
+- 旧日线缓存测试通过。
 
-**涉及文件**：
-- `tests/test_web_app.py`
+### B3. 增加涨跌停状态枚举和估算测试
 
-**任务**：
-- [ ] 增加测试：初始化账户成功后，本金、佣金率、最低佣金、印花税率输入不继续残留，账户路径保留。
-- [ ] 增加测试：刷新行情 / 更新估值成功后，标记价格输入清空，账户路径和数据源配置保留。
-- [ ] 增加测试：手动买入成功后，股票代码、价格、股数、目标价、高级信息和备注清空。
-- [ ] 增加测试：手动卖出成功后，股票代码、价格、股数、高级信息和备注清空。
-- [ ] 增加测试：调整成本成功后，股票代码、正确成本和备注清空。
+影响文件：
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：测试暴露当前账户页文本输入残留问题。
+- 新增 `tests/test_limit_status.py`
+- 后续新增或修改 `stock_picker/data/limits.py`
 
-### T08. 实现账户页交易和估值表单清空规则
+步骤：
 
-**目标**：统一账户页操作类输入的成功后清空行为。
+- [ ] 新增测试：普通 A 股按 10% 规则估算涨停价和跌停价。
+- [ ] 新增测试：创业板/科创板按 20% 规则估算。
+- [ ] 新增测试：ST 股票按 5% 规则估算。
+- [ ] 新增测试：缺少 `prev_close` 或板块/ST 判断信息时返回 `limit_status_unknown`，不能返回可成交。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_limit_status.py -q`，确认测试先失败。
 
-**涉及文件**：
-- `examples/web_app.py`
-- `tests/test_web_app.py`
+验证：
 
-**任务**：
-- [ ] 识别账户页配置字段：账户路径、历史源、股票列表源、实时源、是否强制刷新等。
-- [ ] 识别账户页临时输入字段：股票代码、价格、股数、成本、标记价格、原因、备注、信号日、执行日等。
-- [ ] 操作成功后只回填配置字段，不回填本次临时输入。
-- [ ] 操作失败时保留必要输入，方便用户修正；错误文案必须清楚。
+- 涨跌停估算和未知状态的保守规则被测试锁定。
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：T07 测试通过，且失败场景仍可修正输入。
+### B4. 实现涨跌停状态判断和数据质量说明
 
-### T09. 锁定跨页面状态隔离
+影响文件：
 
-**目标**：防止恒温器、账户、回测页面之间互相污染表单字段。
+- `stock_picker/data/limits.py`
+- `tests/test_limit_status.py`
 
-**涉及文件**：
-- `tests/test_web_app.py`
+步骤：
 
-**任务**：
-- [ ] 增加测试：账户页买入 `symbol` 不会出现在恒温器手动股票池输入里。
-- [ ] 增加测试：恒温器 `symbols` 不会出现在账户页买入或卖出输入框里。
-- [ ] 增加测试：账户页 `watchlist_name` 不会污染恒温器当前自选组合选择，除非用户在恒温器页明确选择。
-- [ ] 增加测试：回测诊断页日期、现金、股票池不会污染恒温器页面配置。
-- [ ] 增加测试：切换顶部页面后，页面只展示该页面自己的状态。
+- [ ] 实现 `normal`、`limit_up`、`limit_down`、`suspended`、`limit_status_unknown` 的统一判断。
+- [ ] 无法判断时返回可报告的数据质量说明。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_limit_status.py -q`。
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：测试暴露当前全局表单状态复用导致的串扰。
+验证：
 
-### T10. 实现页面级表单状态隔离
+- 所有涨跌停和未知状态测试通过。
 
-**目标**：降低 `LAST_FORM` 全局复用带来的串扰风险。
+### B5. 增加缓存完整性校验测试
 
-**涉及文件**：
-- `examples/web_app.py`
-- `tests/test_web_app.py`
+影响文件：
 
-**任务**：
-- [ ] 将页面回显状态按页面或用途隔离。
-- [ ] 恒温器页只读取恒温器相关配置字段。
-- [ ] 账户页只读取账户页相关配置字段。
-- [ ] 回测诊断页只读取回测相关配置字段。
-- [ ] 保留用户需要重复使用的配置项，不做全量清空。
+- `tests/test_event_price_cache.py`
+- 后续涉及 `stock_picker/data/service.py`
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：T09 测试通过。
+步骤：
 
-### T11. 锁定账户路径一致性
+- [ ] 新增测试：正式回测所需字段缺失时，缓存校验返回缺口列表。
+- [ ] 新增测试：缺少 `prev_close`、`limit_up_price`、`limit_down_price`、执行时间点状态时，返回 Data Quality warning。
+- [ ] 新增测试：缓存不完整时正式回测不得进入逐日循环。
+- [ ] 运行对应测试，确认新增测试先失败。
 
-**目标**：确认用户看到的账户路径和实际读取的账户路径一致。
+验证：
 
-**涉及文件**：
-- `tests/test_web_app.py`
+- 回测前缓存校验的阻断规则可测试。
 
-**任务**：
-- [ ] 增加测试：账户页各功能使用同一个账户路径字段语义。
-- [ ] 增加测试：恒温器页显示的账户路径用于读取现金。
-- [ ] 增加测试：`path` 和 `account_path` 同时出现时，不会读取两个不同账户。
-- [ ] 增加测试：切换账户路径后，账户概览和恒温器只读现金来自同一账户。
+### B6. 实现正式回测缓存校验
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：测试能定位路径字段不一致或优先级不清的问题。
+影响文件：
 
-### T12. 实现账户路径归一化
+- `stock_picker/data/service.py`
+- `stock_picker/data/storage.py`
+- `tests/test_event_price_cache.py`
 
-**目标**：统一 Web 层账户路径语义，不改账户文件结构。
+步骤：
 
-**涉及文件**：
-- `examples/web_app.py`
-- `tests/test_web_app.py`
+- [ ] 增加正式回测缓存校验接口。
+- [ ] 缓存缺失时返回缺失股票、日期、时间点、字段和 warning。
+- [ ] 缓存完整时返回可用于回测的本地数据摘要。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_event_price_cache.py tests/test_data_service.py -q`。
 
-**任务**：
-- [ ] 在 Web 边界统一解析账户路径字段。
-- [ ] 保留内部兼容字段，但用户可见行为只体现一个“账户路径”。
-- [ ] 恒温器现金读取、账户概览、账户操作使用一致路径。
-- [ ] 路径缺失或不存在时显示明确错误。
+验证：
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：T11 测试通过。
+- 缓存完整性校验通过测试。
+- 不破坏现有数据服务测试。
 
-### T13. 锁定股票池来源选项一致性
+---
 
-**目标**：避免页面展示不可运行或误导性的股票池来源。
+## C. 事件驱动回测核心
 
-**涉及文件**：
-- `tests/test_web_app.py`
+### C1. 增加事件顺序测试
 
-**任务**：
-- [ ] 增加测试：股票池来源下拉只展示实际可运行来源。
-- [ ] 增加测试：如果保留“同花顺龙虎榜”文案，页面必须说明它和普通龙虎榜的区别或降级行为。
-- [ ] 增加测试：如果不支持独立同花顺龙虎榜链路，则主下拉不显示该选项。
-- [ ] 增加测试：运行结果里的股票池来源、来源说明、实际日期范围和用户选择一致。
+影响文件：
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：测试暴露重复龙虎榜来源或文案不一致问题。
+- 新增 `tests/test_event_backtest_engine.py`
+- 后续新增 `stock_picker/strategies/event_backtest.py`
 
-### T14. 整理股票池来源选项和说明
+步骤：
 
-**目标**：让来源选项、后台能力和结果说明一致。
+- [ ] 新增测试：单个交易日事件顺序固定为 `morning_open`、`noon`、`afternoon_open`、`close`。
+- [ ] 新增测试：`noon` 只生成信号，不改变现金和持仓。
+- [ ] 新增测试：买入只能在 `afternoon_open` 成交。
+- [ ] 新增测试：卖出只能在 `morning_open`、`afternoon_open`、`close` 成交。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_event_backtest_engine.py -q`，确认测试先失败。
 
-**涉及文件**：
-- `examples/web_app.py`
-- `tests/test_web_app.py`
+验证：
 
-**任务**：
-- [ ] 清理不可运行或误导性的来源选项。
-- [ ] 保留可运行来源：手动输入、自选股组合、市场范围、龙虎榜。
-- [ ] 如果存在同花顺龙虎榜降级行为，必须在页面和结果中说明。
-- [ ] 不新增新的数据源抓取逻辑。
+- 回测时间顺序和成交时间限制被测试锁定。
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：T13 测试通过。
+### C2. 实现最小事件循环
 
-### T15. 锁定现金不足提示文案
+影响文件：
 
-**目标**：区分账户现金不足和建议仓位金额不足以买入一手。
+- `stock_picker/strategies/event_backtest.py`
+- `tests/test_event_backtest_engine.py`
 
-**涉及文件**：
-- `tests/test_web_app.py`
-- 必要时 `tests/test_thermostat_strategy.py`
+步骤：
 
-**任务**：
-- [ ] 增加测试：账户总现金不足时，提示“账户现金不足”。
-- [ ] 增加测试：账户现金充足但建议仓位金额不足一手时，提示“建议仓位金额不足以买入一手”或“试探仓金额不足以买入一手”。
-- [ ] 增加测试：页面不得把试探仓金额不足误写成账户现金不足。
-- [ ] 如果文案来自策略层，增加最小策略回归测试；如果只来自 Web 层，只写 Web 测试。
+- [ ] 新增最小事件循环结构。
+- [ ] 支持交易日列表和固定事件点。
+- [ ] 支持信号计划和执行状态分离。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_event_backtest_engine.py -q`。
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 必要时运行 `.\.venv\Scripts\python.exe -m pytest tests/test_thermostat_strategy.py -q`
-- [ ] 预期：测试明确文案来源和误导点。
+验证：
 
-### T16. 修正现金不足提示文案
+- 事件顺序测试通过。
 
-**目标**：只调整用户可见文案，不改仓位计算逻辑。
+### C3. 增加订单失败测试
 
-**涉及文件**：
-- `examples/web_app.py`
-- 必要时 `stock_picker/strategies/thermostat.py`
-- 对应测试文件
+影响文件：
 
-**任务**：
-- [ ] 优先在 Web 展示层修正文案。
-- [ ] 只有当误导文案直接由策略结果生成且 Web 层无法区分时，才做最小策略文案调整。
-- [ ] 不改市场判断、个股判断、仓位比例、建议股数计算。
+- `tests/test_event_backtest_engine.py`
+- 后续涉及 `stock_picker/strategies/event_backtest.py`
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 如修改策略文案，运行 `.\.venv\Scripts\python.exe -m pytest tests/test_thermostat_strategy.py -q`
-- [ ] 预期：T15 测试通过。
+步骤：
 
-### T17. 锁定“未翻译字段”回归
+- [ ] 新增测试：涨停时买入失败，状态为 `failed_limit_up`。
+- [ ] 新增测试：跌停时卖出失败，状态为 `failed_limit_down`。
+- [ ] 新增测试：停牌时买卖失败，状态为 `failed_suspended`。
+- [ ] 新增测试：涨跌停状态未知时订单不可成交，状态或原因包含 `limit_status_unknown`。
+- [ ] 新增测试：失败订单必须进入交易记录。
+- [ ] 运行对应测试，确认新增测试先失败。
 
-**目标**：确保本次调整不会重新引入未翻译字段。
+验证：
 
-**涉及文件**：
-- `tests/test_web_app.py`
+- 不可成交场景不会被静默忽略。
 
-**任务**：
-- [ ] 增加或强化测试：恒温器结果页不出现“未翻译字段”。
-- [ ] 增加或强化测试：账户页自选组合表格不出现“未翻译字段”。
-- [ ] 增加或强化测试：job 进度、完成、失败状态不出现“未翻译字段”。
-- [ ] 增加或强化测试：股票池摘要、市场概览、错误表格不出现“未翻译字段”。
+### C4. 实现订单执行约束
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：测试能覆盖本次新增或调整的可见字段。
+影响文件：
 
-### T18. 补齐本次新增展示字段的中文映射
+- `stock_picker/strategies/event_backtest.py`
+- `tests/test_event_backtest_engine.py`
 
-**目标**：只补 Web 展示映射，不改内部字段名和数据结构。
+步骤：
 
-**涉及文件**：
-- `examples/web_app.py`
-- `tests/test_web_app.py`
+- [ ] 实现涨停、跌停、停牌、未知状态的订单阻断。
+- [ ] 实现失败订单记录，不改变现金和持仓。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_event_backtest_engine.py -q`。
 
-**任务**：
-- [ ] 为 job 状态相关字段补中文显示。
-- [ ] 为股票池来源相关字段补中文显示。
-- [ ] 为账户表单反馈相关字段补中文显示。
-- [ ] 保留内部字段名，避免破坏策略和测试依赖。
+验证：
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：T17 测试通过。
+- 所有订单失败测试通过。
 
-### T19. 回归测试：Web 层
+### C5. 增加现金、费用和交易单位测试
 
-**目标**：集中验证本次 Web 行为改动。
+影响文件：
 
-**涉及文件**：
-- `examples/web_app.py`
-- `tests/test_web_app.py`
+- `tests/test_event_backtest_engine.py`
 
-**任务**：
-- [ ] 运行完整 Web 测试。
-- [ ] 如失败，先根据失败断言定位是进度、表单状态、路径、来源选项还是文案问题。
-- [ ] 修复后重新运行同一命令。
+步骤：
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`
-- [ ] 预期：Web 测试全部通过。
+- [ ] 新增测试：现金不足时买入失败并记录 `insufficient_cash`。
+- [ ] 新增测试：买入不足一手时失败并记录原因。
+- [ ] 新增测试：成功买入扣除成交金额、佣金、滑点。
+- [ ] 新增测试：成功卖出扣除佣金、印花税、滑点并更新现金。
+- [ ] 运行对应测试，确认新增测试先失败。
 
-### T20. 回归测试：策略和回测不变
+验证：
 
-**目标**：确认本次 Web 调整没有改变策略核心和回测核心结果。
+- 现金、费用、交易单位规则被测试覆盖。
 
-**涉及文件**：
+### C6. 实现现金、费用和交易单位处理
+
+影响文件：
+
+- `stock_picker/strategies/event_backtest.py`
+- `tests/test_event_backtest_engine.py`
+
+步骤：
+
+- [ ] 实现买入最小单位检查。
+- [ ] 实现现金充足性检查。
+- [ ] 实现佣金、最低佣金、印花税、滑点扣减。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_event_backtest_engine.py -q`。
+
+验证：
+
+- 现金、费用、交易单位测试通过。
+
+### C7. 增加 T+1 和最终清仓测试
+
+影响文件：
+
+- `tests/test_event_backtest_engine.py`
+
+步骤：
+
+- [ ] 新增测试：启用 T+1 时，当日买入股票当日不可卖出。
+- [ ] 新增测试：最后一个交易日按 `close` 尝试清仓。
+- [ ] 新增测试：最后一天跌停或停牌导致无法清仓时，最终报告保留未清仓持仓和原因。
+- [ ] 运行对应测试，确认新增测试先失败。
+
+验证：
+
+- T+1 和最终清仓规则被测试覆盖。
+
+### C8. 实现 T+1、可用股数和最终清仓
+
+影响文件：
+
+- `stock_picker/strategies/event_backtest.py`
+- `tests/test_event_backtest_engine.py`
+
+步骤：
+
+- [ ] 实现持仓总股数和可用股数区分。
+- [ ] 实现 T+1 可卖约束。
+- [ ] 实现最后交易日收盘清仓尝试。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_event_backtest_engine.py -q`。
+
+验证：
+
+- T+1、可用股数和最终清仓测试通过。
+
+---
+
+## D. 恒温器信号接入
+
+### D1. 增加恒温器信号适配测试
+
+影响文件：
+
+- `tests/test_thermostat_event_backtest.py`
+- 后续涉及 `stock_picker/strategies/thermostat_backtest.py`
+
+步骤：
+
+- [ ] 新增测试：正式回测调用现有恒温器信号生成能力，而不是旧等权净值逻辑。
+- [ ] 新增测试：`market_downtrend` 下非持仓股票不会生成可执行买入。
+- [ ] 新增测试：`noon` 生成的买入计划只能在 `afternoon_open` 执行。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_thermostat_event_backtest.py -q`，确认测试先失败。
+
+验证：
+
+- 恒温器信号和事件执行层的边界被测试覆盖。
+
+### D2. 新增正式恒温器事件回测入口
+
+影响文件：
+
+- `stock_picker/strategies/thermostat_backtest.py`
 - `stock_picker/strategies/thermostat.py`
-- `tests/test_thermostat_strategy.py`
+- `tests/test_thermostat_event_backtest.py`
 - `tests/test_thermostat_backtest.py`
 
-**任务**：
-- [ ] 运行恒温器策略测试。
-- [ ] 运行恒温器回测测试。
-- [ ] 如果失败，优先判断是否由 Web 文案或测试夹具变化导致；不得借机重写策略规则。
+步骤：
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_thermostat_strategy.py -q`
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_thermostat_backtest.py -q`
-- [ ] 预期：策略和回测测试通过，或失败原因与本次 Web 改动无关并记录风险。
+- [ ] 增加正式事件驱动回测入口。
+- [ ] 保留旧简化回测路径，并明确标记为 `simplified_backtest`。
+- [ ] 让现有公开入口在正式回测场景走事件驱动路径。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_thermostat_event_backtest.py tests/test_thermostat_backtest.py -q`。
 
-### T21. 窄屏和页面结构手动检查
+验证：
 
-**目标**：在自动测试通过后确认本次 Web 调整没有造成明显布局回退。
+- 正式回测和旧简化回测可区分。
+- 旧测试不被无关破坏。
 
-**涉及文件**：
+### D3. 增加网格和趋势策略分布测试
+
+影响文件：
+
+- `tests/test_thermostat_event_backtest.py`
+
+步骤：
+
+- [ ] 新增测试：趋势信号能进入交易计划和交易记录。
+- [ ] 新增测试：网格候选不会绕过事件成交限制。
+- [ ] 新增测试：失败网格或趋势订单仍进入 Trades。
+- [ ] 运行对应测试，确认新增测试先失败。
+
+验证：
+
+- 恒温器策略族信息能进入正式回测结果。
+
+### D4. 实现策略族结果写入
+
+影响文件：
+
+- `stock_picker/strategies/thermostat_backtest.py`
+- `stock_picker/strategies/event_backtest.py`
+- `tests/test_thermostat_event_backtest.py`
+
+步骤：
+
+- [ ] 将趋势、网格、风控、观察等策略族写入评估明细。
+- [ ] 将实际成交和失败原因写入交易明细。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_thermostat_event_backtest.py -q`。
+
+验证：
+
+- 策略族相关测试通过。
+
+---
+
+## E. 参数来源和账户兼容
+
+### E1. 增加参数优先级测试
+
+影响文件：
+
+- 新增 `tests/test_backtest_params.py`
+- 后续新增或修改 `stock_picker/strategies/backtest_params.py`
+
+步骤：
+
+- [ ] 新增测试：用户本次覆盖优先于账户设置。
+- [ ] 新增测试：账户设置优先于策略默认。
+- [ ] 新增测试：缺少账户字段时使用系统默认并记录来源。
+- [ ] 新增测试：本次覆盖不会写回账户文件。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_backtest_params.py -q`，确认测试先失败。
+
+验证：
+
+- 参数来源优先级和不写回账户规则被测试覆盖。
+
+### E2. 实现回测参数解析
+
+影响文件：
+
+- `stock_picker/strategies/backtest_params.py`
+- `stock_picker/user/portfolio.py`，仅在确需读取兼容字段时修改
+- `tests/test_backtest_params.py`
+
+步骤：
+
+- [ ] 实现回测参数解析和来源记录。
+- [ ] 保持账户文件格式兼容。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_backtest_params.py tests/test_portfolio_journal.py -q`。
+
+验证：
+
+- 参数来源测试通过。
+- 账户相关旧测试通过。
+
+### E3. 将参数来源接入正式回测
+
+影响文件：
+
+- `stock_picker/strategies/thermostat_backtest.py`
+- `stock_picker/strategies/event_backtest.py`
+- `tests/test_thermostat_event_backtest.py`
+- `tests/test_backtest_params.py`
+
+步骤：
+
+- [ ] 正式回测结果包含参数值和来源。
+- [ ] 账户缺省值、系统默认值和用户覆盖值能进入结果。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_backtest_params.py tests/test_thermostat_event_backtest.py -q`。
+
+验证：
+
+- 回测结果可解释本次使用了哪些参数以及来源。
+
+---
+
+## F. 报告输出
+
+### F1. 增加报告结构测试
+
+影响文件：
+
+- 新增 `tests/test_backtest_report.py`
+- 后续新增 `stock_picker/reporting/backtest_report.py`
+
+步骤：
+
+- [ ] 新增测试：报告对象能生成 Summary、Daily Portfolio、Daily Evaluation Detail、Trades、Positions、Symbol Performance、Data Quality、Parameters。
+- [ ] 新增测试：Trades 包含失败交易。
+- [ ] 新增测试：Data Quality 包含涨跌停未知、模拟价格、缺字段 warning。
+- [ ] 新增测试：用户可见标题不出现“未翻译字段”和明显乱码。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_backtest_report.py -q`，确认测试先失败。
+
+验证：
+
+- 报告结构和字段可读性被测试覆盖。
+
+### F2. 实现结构化报告生成
+
+影响文件：
+
+- `stock_picker/reporting/backtest_report.py`
+- `tests/test_backtest_report.py`
+
+步骤：
+
+- [ ] 实现从事件回测结果生成各报告表。
+- [ ] 使用中文表头或已有统一翻译。
+- [ ] 长文本字段保留摘要或完整内容。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_backtest_report.py -q`。
+
+验证：
+
+- 报告结构测试通过。
+
+### F3. 增加 Excel 导出测试
+
+影响文件：
+
+- `tests/test_backtest_report.py`
+
+步骤：
+
+- [ ] 新增测试：Excel 文件包含所有指定 sheet。
+- [ ] 新增测试：每个 sheet 第一行为表头。
+- [ ] 新增测试：冻结首行、开启筛选、关键金额和百分比字段格式可读。
+- [ ] 新增测试：长文本字段不会只输出不可读的原始对象。
+- [ ] 运行对应测试，确认新增测试先失败。
+
+验证：
+
+- Excel 可读性要求被测试覆盖。
+
+### F4. 实现 Excel 详细报告导出
+
+影响文件：
+
+- `stock_picker/reporting/backtest_report.py`
+- `tests/test_backtest_report.py`
+
+步骤：
+
+- [ ] 实现 Excel 导出。
+- [ ] 设置表头、筛选、冻结首行、列宽、数字格式和长文本换行。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_backtest_report.py -q`。
+
+验证：
+
+- Excel 报告测试通过。
+
+---
+
+## G. Web 回测入口
+
+### G1. 增加 Web 缓存区和正式回测默认路径测试
+
+影响文件：
+
+- `tests/test_web_app.py`
+- 后续涉及 `examples/web_app.py`
+
+步骤：
+
+- [ ] 新增测试：回测诊断页显示缓存区、参数区、结果区、报告下载区。
+- [ ] 新增测试：开始正式回测前，如果缓存缺失，页面提示缺失而不是静默继续。
+- [ ] 新增测试：Web 默认结果来自事件驱动正式回测，不是旧简化回测。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`，确认新增测试先失败或暴露缺口。
+
+验证：
+
+- Web 默认正式回测路径被测试覆盖。
+
+### G2. 接入 Web 正式回测流程
+
+影响文件：
+
 - `examples/web_app.py`
+- `tests/test_web_app.py`
 
-**任务**：
-- [ ] 手动打开恒温器页面，检查手动输入、自选股组合、市场范围、龙虎榜来源下的表单排列。
-- [ ] 手动打开账户页，检查自选组合、账户设置、持仓与估值、买入/卖出、成本调整、交易记录入口仍可用。
-- [ ] 手动缩窄浏览器宽度，检查按钮和输入框没有明显重叠。
-- [ ] 手动运行至少一个短任务，确认进度区和结果区显示连贯。
+步骤：
 
-**验证**：
-- [ ] 启动本地 Web 后访问 `http://127.0.0.1:8765`
-- [ ] 预期：页面可用，无明显重叠，无错误页面。
+- [ ] 回测诊断页增加缓存状态展示。
+- [ ] 正式回测入口调用事件驱动回测。
+- [ ] 缓存缺失时展示缺口和 warning。
+- [ ] 旧简化回测如果保留，必须明确标注。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`。
 
-### T22. 完整验证和变更范围检查
+验证：
 
-**目标**：完成前做最小但充分的全量确认。
+- Web 正式回测流程测试通过。
 
-**涉及文件**：
-- 全项目
+### G3. 增加 Web 报告展示测试
 
-**任务**：
-- [ ] 运行完整测试。
-- [ ] 查看 Git 工作区，确认没有临时文件、缓存文件或无关文件进入变更。
-- [ ] 核对修改文件是否符合计划范围。
-- [ ] 记录仍未验证的手动项或风险。
+影响文件：
 
-**验证**：
-- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest -q`
-- [ ] 运行 `git status --short --branch`
-- [ ] 预期：测试通过，变更范围只包含本次规格相关文件。
+- `tests/test_web_app.py`
 
-## 任务顺序说明
+步骤：
 
-1. T01 到 T04 先统一恒温器运行入口和进度反馈，解决“只有龙虎榜有进度条”的核心问题。
-2. T05 到 T08 再处理账户页输入残留，先自选组合，再交易和估值，避免一次改太多表单。
-3. T09 到 T12 处理跨页面状态和账户路径一致性，降低 `LAST_FORM` 串扰风险。
-4. T13 到 T16 处理来源选项和现金提示文案，属于用户可见一致性问题。
-5. T17 到 T18 处理未翻译字段回归，避免新增展示内容带来旧问题。
-6. T19 到 T22 先做 Web 自动回归，再做策略/回测回归，然后手动页面检查，最后完整验证。
+- [ ] 新增测试：Web 结果展示总收益、年化收益、最大回撤、胜率、交易次数、最终资金。
+- [ ] 新增测试：Web 结果展示每只股票收益表和数据质量 warning。
+- [ ] 新增测试：Web 结果提供详细报告下载入口。
+- [ ] 新增测试：页面不出现“未翻译字段”或乱码。
+- [ ] 运行对应测试，确认新增测试先失败。
 
-## Task Review 自查结论
+验证：
 
-1. 小步可执行：任务按入口、进度、表单清空、状态隔离、路径、来源、文案、验证拆分，没有把多个大改动塞进一个任务。
-2. 验证方式：每个任务都有明确测试或手动检查方式，且优先测试。
-3. 改动范围：主要集中在 `examples/web_app.py` 和 `tests/test_web_app.py`；只有现金文案来源无法在 Web 层区分时，才允许最小触碰策略文案。
-4. 回归覆盖：包含 Web 单测、策略测试、回测兼容检查、全量 pytest 和手动页面检查。
-5. 风险顺序：先锁定用户可见问题，再做最小实现，最后做全量验证，避免直接重构大文件。
+- Web 简版报告展示要求被测试覆盖。
 
-## 不做范围
+### G4. 实现 Web 简版报告和下载入口
 
-- 不修改恒温器市场判断、个股判断、网格评分、仓位建议等策略规则。
-- 不修改账户、自选组合、持仓、交易流水的数据结构。
-- 不新增或更换行情数据源。
-- 不修改龙虎榜候选池抓取逻辑。
-- 不重写旧 CLI。
-- 不重构为新的前端框架。
-- 不新增真实交易或自动下单能力。
+影响文件：
+
+- `examples/web_app.py`
+- `stock_picker/reporting/backtest_report.py`
+- `tests/test_web_app.py`
+
+步骤：
+
+- [ ] Web 展示摘要卡片、收益表、交易摘要和数据质量 warning。
+- [ ] 接入 Excel 下载入口。
+- [ ] 长文本默认摘要展示，不一次性铺开底层日志。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py tests/test_backtest_report.py -q`。
+
+验证：
+
+- Web 简版报告和下载入口测试通过。
+
+---
+
+## H. 端到端验证
+
+### H1. 增加小股票池端到端回测测试
+
+影响文件：
+
+- 新增 `tests/test_event_backtest_e2e.py`
+- 可复用 `stock_picker/strategies/thermostat_backtest.py`
+
+步骤：
+
+- [ ] 使用 2 到 3 只股票的确定性假缓存数据构造端到端回测。
+- [ ] 覆盖至少一次成功买入、一次成功卖出、一次失败交易、一次最终清仓。
+- [ ] 验证 Summary、Daily Portfolio、Trades、Positions、Data Quality 都有一致数据。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_event_backtest_e2e.py -q`，确认测试先失败。
+
+验证：
+
+- 正式回测主链路有端到端保护。
+
+### H2. 打通端到端正式回测
+
+影响文件：
+
+- `stock_picker/strategies/event_backtest.py`
+- `stock_picker/strategies/thermostat_backtest.py`
+- `stock_picker/reporting/backtest_report.py`
+- `tests/test_event_backtest_e2e.py`
+
+步骤：
+
+- [ ] 打通缓存数据、参数解析、事件引擎、恒温器信号和报告输出。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_event_backtest_e2e.py -q`。
+
+验证：
+
+- 小股票池端到端测试通过。
+
+### H3. 运行分组回归测试
+
+影响文件：
+
+- 不新增业务改动。
+
+步骤：
+
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_limit_status.py tests/test_event_price_cache.py tests/test_event_backtest_engine.py -q`。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_thermostat_event_backtest.py tests/test_thermostat_backtest.py -q`。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_backtest_params.py tests/test_backtest_report.py tests/test_event_backtest_e2e.py -q`。
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest tests/test_web_app.py -q`。
+
+验证：
+
+- 每个分组测试都通过。
+- 若失败，先定位属于缓存、引擎、报告还是 Web，不做猜测式修复。
+
+### H4. 运行完整测试
+
+影响文件：
+
+- 不新增业务改动。
+
+步骤：
+
+- [ ] 运行 `.\.venv\Scripts\python.exe -m pytest -q`。
+- [ ] 检查输出中是否还有失败、warning 或乱码相关失败。
+- [ ] 如果完整测试失败，回到对应最小失败测试定位。
+
+验证：
+
+- 完整测试通过，或明确记录剩余未验证项和失败根因。
+
+### H5. 手动检查 Web 回测页面
+
+影响文件：
+
+- 不新增业务改动。
+
+步骤：
+
+- [ ] 启动本地 Web 应用。
+- [ ] 打开回测诊断页。
+- [ ] 检查页面分区：缓存区、参数区、结果区、报告下载区。
+- [ ] 用小股票池运行一次正式事件驱动回测。
+- [ ] 检查缓存缺失提示、数据质量 warning、摘要卡片、收益表、交易摘要和下载入口。
+- [ ] 下载 Excel 报告并确认 sheet 和表头可读。
+
+验证：
+
+- 页面行为与规格一致。
+- 用户可见内容没有“未翻译字段”或明显乱码。
+
+---
+
+## 完成定义
+
+本任务集完成时必须满足：
+
+- [ ] 正式回测默认走事件驱动路径。
+- [ ] 旧简化回测被明确标记为 `simplified_backtest`，不再冒充正式回测。
+- [ ] 缓存缺失或涨跌停状态未知时不会静默成交。
+- [ ] `noon` 只评估不成交。
+- [ ] 买入只在 `afternoon_open` 成交。
+- [ ] 卖出只在 `morning_open`、`afternoon_open`、`close` 成交。
+- [ ] 失败交易进入 Trades。
+- [ ] 最后一天尝试收盘清仓，失败原因可见。
+- [ ] Web 和 Excel 报告字段可读，无“未翻译字段”和乱码。
+- [ ] 分组测试和完整测试已运行，并记录结果。

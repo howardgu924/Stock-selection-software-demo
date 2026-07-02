@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import sqlite3
 from pathlib import Path
 
 import pandas as pd
 
 from stock_picker.data.models import StockInfo
+
+
+@dataclass(frozen=True)
+class EventCacheValidationResult:
+    ok: bool
+    missing: list[dict[str, object]]
+    warnings: list[dict[str, object]]
 
 
 class SQLiteMarketDataStore:
@@ -40,6 +48,48 @@ class SQLiteMarketDataStore:
                     pct_chg = excluded.pct_chg,
                     change = excluded.change,
                     turnover = excluded.turnover
+                """,
+                rows,
+            )
+
+    def save_event_prices(self, frame: pd.DataFrame) -> None:
+        if frame.empty:
+            return
+        normalized = frame.copy()
+        for column in _EVENT_PRICE_COLUMNS:
+            if column not in normalized:
+                normalized[column] = None
+        rows = normalized[_EVENT_PRICE_COLUMNS].to_dict("records")
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO event_prices (
+                    symbol, date, time_point, frequency, adjust_type, source,
+                    price, open, high, low, close, prev_close, limit_up_price,
+                    limit_down_price, is_suspended, limit_status, simulated,
+                    warning, updated_at
+                )
+                VALUES (
+                    :symbol, :date, :time_point, :frequency, :adjust_type, :source,
+                    :price, :open, :high, :low, :close, :prev_close, :limit_up_price,
+                    :limit_down_price, :is_suspended, :limit_status, :simulated,
+                    :warning, CURRENT_TIMESTAMP
+                )
+                ON CONFLICT(symbol, date, time_point, frequency, adjust_type, source)
+                DO UPDATE SET
+                    price = excluded.price,
+                    open = excluded.open,
+                    high = excluded.high,
+                    low = excluded.low,
+                    close = excluded.close,
+                    prev_close = excluded.prev_close,
+                    limit_up_price = excluded.limit_up_price,
+                    limit_down_price = excluded.limit_down_price,
+                    is_suspended = excluded.is_suspended,
+                    limit_status = excluded.limit_status,
+                    simulated = excluded.simulated,
+                    warning = excluded.warning,
+                    updated_at = excluded.updated_at
                 """,
                 rows,
             )
@@ -81,6 +131,116 @@ class SQLiteMarketDataStore:
                 conn,
                 params=(symbol, start, end),
             )
+
+    def load_event_prices(
+        self,
+        symbols: list[str],
+        start_date: str,
+        end_date: str,
+        time_points: list[str] | None = None,
+    ) -> pd.DataFrame:
+        if not symbols:
+            return pd.DataFrame(columns=_EVENT_PRICE_SELECT_COLUMNS)
+        start = self._date_for_query(start_date)
+        end = self._date_for_query(end_date)
+        symbol_marks = ",".join("?" for _ in symbols)
+        params: list[object] = [*symbols, start, end]
+        time_clause = ""
+        if time_points:
+            time_marks = ",".join("?" for _ in time_points)
+            time_clause = f" AND time_point IN ({time_marks})"
+            params.extend(time_points)
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                f"""
+                SELECT {", ".join(_EVENT_PRICE_SELECT_COLUMNS)}
+                FROM event_prices
+                WHERE symbol IN ({symbol_marks})
+                  AND date >= ?
+                  AND date <= ?
+                  {time_clause}
+                ORDER BY date, time_point, symbol
+                """,
+                conn,
+                params=params,
+            )
+
+    def validate_event_cache(
+        self,
+        symbols: list[str],
+        start_date: str,
+        end_date: str,
+        required_time_points: list[str],
+    ) -> EventCacheValidationResult:
+        rows = self.load_event_prices(symbols, start_date, end_date)
+        missing: list[dict[str, object]] = []
+        warnings: list[dict[str, object]] = []
+        if rows.empty:
+            for symbol in symbols:
+                for time_point in required_time_points:
+                    missing.append(
+                        {
+                            "symbol": symbol,
+                            "date": self._date_for_query(start_date),
+                            "time_point": time_point,
+                            "field": "event_price",
+                        }
+                    )
+            return EventCacheValidationResult(False, missing, warnings)
+
+        dates = sorted(rows["date"].unique().tolist())
+        for symbol in symbols:
+            symbol_rows = rows[rows["symbol"] == symbol]
+            for date in dates:
+                date_rows = symbol_rows[symbol_rows["date"] == date]
+                for time_point in required_time_points:
+                    point_rows = date_rows[date_rows["time_point"] == time_point]
+                    if point_rows.empty:
+                        missing.append(
+                            {
+                                "symbol": symbol,
+                                "date": date,
+                                "time_point": time_point,
+                                "field": "event_price",
+                            }
+                        )
+                        warnings.append(
+                            {
+                                "symbol": symbol,
+                                "date": date,
+                                "time_point": time_point,
+                                "field": "limit_status",
+                                "warning": f"missing limit status for {time_point}",
+                            }
+                        )
+                        continue
+                    row = point_rows.iloc[0]
+                    for field in ("prev_close", "limit_up_price", "limit_down_price", "limit_status"):
+                        if pd.isna(row.get(field)) or row.get(field) in {"", None}:
+                            warnings.append(
+                                {
+                                    "symbol": symbol,
+                                    "date": date,
+                                    "time_point": time_point,
+                                    "field": field,
+                                    "warning": f"missing limit field: {field}",
+                                }
+                            )
+        if not warnings:
+            for row in rows.to_dict("records"):
+                warning = str(row.get("warning") or "")
+                status = str(row.get("limit_status") or "")
+                if warning or status == "limit_status_unknown":
+                    warnings.append(
+                        {
+                            "symbol": row["symbol"],
+                            "date": row["date"],
+                            "time_point": row["time_point"],
+                            "field": "limit_status",
+                            "warning": warning or "limit_status_unknown",
+                        }
+                    )
+        return EventCacheValidationResult(not missing, missing, warnings)
 
     def load_stock_symbols(self) -> list[StockInfo]:
         with self._connect() as conn:
@@ -128,6 +288,34 @@ class SQLiteMarketDataStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS event_prices (
+                    symbol TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    time_point TEXT NOT NULL,
+                    frequency TEXT NOT NULL,
+                    adjust_type TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    price REAL,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    prev_close REAL,
+                    limit_up_price REAL,
+                    limit_down_price REAL,
+                    is_suspended INTEGER,
+                    limit_status TEXT,
+                    simulated INTEGER,
+                    warning TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (
+                        symbol, date, time_point, frequency, adjust_type, source
+                    )
+                )
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
@@ -137,3 +325,30 @@ class SQLiteMarketDataStore:
         if "-" in value:
             return value
         return f"{value[0:4]}-{value[4:6]}-{value[6:8]}"
+
+
+_EVENT_PRICE_COLUMNS = [
+    "symbol",
+    "date",
+    "time_point",
+    "frequency",
+    "adjust_type",
+    "source",
+    "price",
+    "open",
+    "high",
+    "low",
+    "close",
+    "prev_close",
+    "limit_up_price",
+    "limit_down_price",
+    "is_suspended",
+    "limit_status",
+    "simulated",
+    "warning",
+]
+
+_EVENT_PRICE_SELECT_COLUMNS = [
+    *_EVENT_PRICE_COLUMNS,
+    "updated_at",
+]

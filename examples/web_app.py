@@ -30,17 +30,6 @@ from stock_picker.pools import (
 from stock_picker.strategies import (
     backtest_thermostat_strategy,
     run_thermostat_strategy,
-    TurtleConfig,
-    TurtleSystemResult,
-    backtest_turtle_system,
-    run_turtle_system,
-)
-from stock_picker.strategies.turtle_system import (
-    TURTLE_EQUITY_COLUMNS,
-    TURTLE_POSITION_COLUMNS,
-    TURTLE_SIGNAL_COLUMNS,
-    TURTLE_SUMMARY_COLUMNS,
-    TURTLE_TRADE_COLUMNS,
 )
 from stock_picker.user import ManualPortfolioStore, WatchlistStore
 from examples.list_lhb_candidates import build_lhb_candidates
@@ -80,6 +69,11 @@ TITLE_LABELS = {
     "LHB Candidate Preview": "龙虎榜候选预览",
     "Thermostat Job Started": "恒温器任务已开始",
     "Trades": "交易流水",
+    "Daily Portfolio": "每日账户",
+    "Daily Evaluation Detail": "每日评估明细",
+    "Symbol Performance": "个股表现",
+    "Data Quality": "数据质量",
+    "Parameters": "参数来源",
     "Equity": "每日权益",
     "Drawdowns": "回撤明细",
     "Symbol PnL": "标的盈亏",
@@ -251,6 +245,7 @@ COLUMN_LABELS = {
     "target_sell_price": "目标卖出价",
     "tax": "印花税",
     "timestamp": "时间",
+    "updated_at": "更新时间",
     "top": "Top数量",
     "total_asset": "总资产",
     "total_pnl": "总盈亏",
@@ -274,12 +269,23 @@ COLUMN_LABELS = {
 
 COLUMN_LABELS.update(
     {
+        "actual_shares": "实际股数",
         "actual_lhb_range": "实际龙虎榜日期范围",
         "average_after_switch_return": "切换后平均收益",
+        "available_shares": "可用股数",
+        "available_shares_after": "操作后可用股数",
+        "backtest_type": "回测类型",
         "cash_ratio": "现金比例",
+        "cash_before": "操作前现金",
+        "cash_end": "期末现金",
+        "cash_start": "期初现金",
         "candidate_count": "候选数量",
         "entry_price": "入场价",
         "evidence": "判断依据",
+        "execution_price": "成交价格",
+        "execution_status": "执行状态",
+        "execution_time": "执行时间点",
+        "failure_reason": "失败原因",
         "grid_invalid_count": "网格失效次数",
         "grid_lower": "网格下沿",
         "grid_max_layers": "最大网格层数",
@@ -288,9 +294,21 @@ COLUMN_LABELS.update(
         "grid_unit_pct": "单格仓位比例",
         "grid_upper": "网格上沿",
         "job_id": "任务编号",
+        "gross_amount": "成交总额",
+        "intended_shares": "计划股数",
         "message": "进度说明",
+        "net_amount": "净额",
         "node": "当前节点",
+        "note": "备注",
+        "order_status": "订单状态",
+        "parameter_name": "参数",
+        "parameter_source": "参数来源",
+        "parameter_value": "参数值",
         "period_count": "周期数",
+        "position_after": "操作后持仓",
+        "position_before": "操作前持仓",
+        "position_value_end": "期末持仓市值",
+        "position_value_start": "期初持仓市值",
         "priority": "优先级",
         "reference_price": "参考价",
         "regime_date": "状态日期",
@@ -302,7 +320,17 @@ COLUMN_LABELS.update(
         "suggested_position_pct": "建议仓位比例",
         "switch_count": "切换次数",
         "target_price": "目标价",
+        "time_point": "时间点",
         "top_options": "可选排名范围",
+        "total_commission": "总佣金",
+        "total_shares": "总股数",
+        "total_slippage_cost": "总滑点成本",
+        "total_value_end": "期末总资产",
+        "total_value_start": "期初总资产",
+        "trade_id": "交易编号",
+        "trade_reason": "交易原因",
+        "user_overridden": "用户覆盖",
+        "warning": "警告",
         "trend_stop_count": "趋势止损次数",
     }
 )
@@ -509,7 +537,7 @@ OPTION_LABELS.update(
 
 
 class WebAppHandler(BaseHTTPRequestHandler):
-    server_version = "StockPickerWeb/1.1.5"
+    server_version = "StockPickerWeb/1.1.6"
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -619,83 +647,6 @@ class WebAppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
-
-
-def handle_turtle(form: dict[str, str]) -> RenderResult:
-    service = _service(form)
-    end = _value(form, "end", _value(form, "as_of", ""))
-    if not end:
-        raise ValueError("海龟系统需要结束日期或快照日期。")
-    start = _optional(form, "start") or (
-        pd.to_datetime(end) - pd.Timedelta(days=180)
-    ).strftime("%Y%m%d")
-    config = _turtle_config(form)
-    universe = _resolve_turtle_universe(form)
-    if _checked(form, "exclude_chinext"):
-        universe = _exclude_chinext_from_universe(universe)
-    universe = _enrich_universe_names(service, universe)
-    symbols = universe["symbols"]
-    if not symbols:
-        if _checked(form, "exclude_chinext"):
-            raise ValueError("剔除创业板后股票池为空；请补充非创业板股票，或取消“剔除创业板”。")
-        raise ValueError("海龟系统需要股票池：可以手动输入、选择龙虎榜，或同步账户持仓。")
-    cash = float(universe["cash"])
-    portfolio = universe["portfolio"]
-    holdings = _holding_advice(service, portfolio, start, end, config, _checked(form, "refresh"))
-    held_symbols = set(holdings["symbol"].dropna().astype(str)) if not holdings.empty else set()
-    buy_symbols = [symbol for symbol in symbols if symbol not in held_symbols]
-    result = (
-        run_turtle_system(
-            service=service,
-            symbols=buy_symbols,
-            start_date=start,
-            end_date=end,
-            cash=cash,
-            config=config,
-            refresh=_checked(form, "refresh"),
-            skip_errors=True,
-        )
-        if buy_symbols
-        else _empty_turtle_result(start, end, cash)
-    )
-    candidate_evaluation = _candidate_evaluation(
-        service,
-        buy_symbols,
-        universe["pool"],
-        start,
-        end,
-        cash,
-        config,
-        _checked(form, "refresh"),
-        result.signals,
-    )
-    tables = [
-        TableBlock("Final Pool", universe["pool"]),
-        TableBlock("Holding Advice", holdings),
-        TableBlock("Candidate Evaluation", candidate_evaluation),
-        TableBlock("New Buy Signals", result.signals),
-        TableBlock("Errors", result.errors),
-    ]
-    if not universe["lhb"].empty:
-        tables.insert(1, TableBlock("LHB Ranking", universe["lhb"]))
-    if _checked(form, "execution_plan") and not result.signals.empty:
-        quotes = service.get_realtime_quotes(result.signals["symbol"].dropna().astype(str).tolist())
-        plan = build_execution_plan(
-            result.signals,
-            quotes,
-            cash=cash,
-            lot_size=config.lot_size,
-            commission_rate=config.commission_rate,
-            min_commission=config.min_commission,
-            next_day_premium=_float(form, "next_day_premium", 0.02),
-            volume_limit_pct=_float(form, "volume_limit_pct", 0.10),
-        )
-        tables.insert(-1, TableBlock("Execution Plan", plan))
-    return RenderResult(
-        title="完整海龟系统",
-        summaries=[_turtle_summary(form, start, end, cash, portfolio)],
-        tables=tables,
-    )
 
 
 def handle_thermostat(form: dict[str, str], progress_callback=None) -> RenderResult:
@@ -1107,6 +1058,12 @@ def _watchlist_operation_feedback(result) -> str:
     return f'<p class="muted {class_name}">{html.escape(result.message)}</p>'
 
 
+def _first_record(frame: pd.DataFrame) -> dict[str, object]:
+    if frame is None or frame.empty:
+        return {}
+    return frame.iloc[0].to_dict()
+
+
 def handle_thermostat_backtest(form: dict[str, str]) -> RenderResult:
     symbols = [normalize_symbol(symbol) for symbol in _require_symbols(form)]
     start = _value(form, "start")
@@ -1122,91 +1079,25 @@ def handle_thermostat_backtest(form: dict[str, str]) -> RenderResult:
     )
     return RenderResult(
         title="恒温器回测诊断",
-        summaries=[_request_summary({**form, "end": end}, ["symbols", "start", "end", "cash", "source", "refresh"])],
+        summaries=[
+            _first_record(result.summary),
+            _request_summary({**form, "end": end}, ["symbols", "start", "end", "cash", "source", "refresh"]),
+        ],
         tables=[
             TableBlock("Summary", result.summary),
             TableBlock("Regime Performance", result.regime_performance),
             TableBlock("Diagnostics", result.diagnostics),
+            TableBlock("Daily Portfolio", result.daily_portfolio),
+            TableBlock("Trades", result.trades),
+            TableBlock("Positions", result.positions),
+            TableBlock("Symbol Performance", result.symbol_performance),
+            TableBlock("Data Quality", result.data_quality),
+            TableBlock("Parameters", result.parameters),
         ],
+        extra_html='<p class="muted">报告下载区：事件驱动详细报告可由后续下载入口导出为 Excel。</p>',
     )
 
 
-def handle_turtle_backtest(form: dict[str, str]) -> RenderResult:
-    service = _service(form)
-    universe = _resolve_backtest_universe(form)
-    if _checked(form, "exclude_chinext"):
-        universe = _exclude_chinext_from_universe(universe)
-    universe = _enrich_universe_names(service, universe)
-    symbols = universe["symbols"]
-    if not symbols:
-        if _checked(form, "exclude_chinext"):
-            raise ValueError("剔除创业板后回测股票池为空；请补充非创业板股票，或取消“剔除创业板”。")
-        raise ValueError("海龟回测需要股票池：可以手动输入，或选择龙虎榜前30/前50。")
-    start = _value(form, "start")
-    end = _value(form, "end", _today_yyyymmdd())
-    if not start or not end:
-        raise ValueError("回测需要开始日期和结束日期。")
-    result = backtest_turtle_system(
-        service=service,
-        symbols=symbols,
-        start_date=start,
-        end_date=end,
-        initial_cash=_float(form, "cash", 100000.0),
-        config=_turtle_config(form),
-        refresh=_checked(form, "refresh"),
-        skip_errors=True,
-    )
-    benchmark = _benchmark_summary(service, start, end)
-    summary = _augment_backtest_summary(result.summary, benchmark)
-    candidate_diff = _backtest_candidate_difference(universe["pool"], result.trades)
-    yearly = _period_returns(result.equity, "Y")
-    monthly = _period_returns(result.equity, "M")
-    monthly_matrix = _monthly_return_matrix(monthly)
-    trade_quality = _trade_quality(result.trades)
-    holding_distribution = _holding_distribution(result.trades)
-    summary_form = dict(form)
-    summary_form["end"] = end
-    summary_form.setdefault("pool_mode", _value(form, "pool_mode", "manual"))
-    return RenderResult(
-        title="海龟回测",
-        summaries=[
-            _request_summary(
-                summary_form,
-                [
-                    "pool_mode",
-                    "symbols",
-                    "lhb_start",
-                    "lhb_end",
-                    "exclude_chinext",
-                    "start",
-                    "end",
-                    "cash",
-                    "risk_pct",
-                    "s1_entry",
-                    "s1_exit",
-                    "s2_entry",
-                    "s2_exit",
-                    "source",
-                    "refresh",
-                ],
-            )
-        ],
-        tables=[
-            TableBlock("Summary", summary),
-            TableBlock("Backtest Pool", universe["pool"]),
-            TableBlock("Backtest Candidate Difference", candidate_diff),
-            TableBlock("Yearly Returns", yearly),
-            TableBlock("Monthly Returns", monthly),
-            TableBlock("Monthly Return Matrix", monthly_matrix),
-            TableBlock("Trade Quality", trade_quality),
-            TableBlock("Holding Distribution", holding_distribution),
-            TableBlock("Drawdowns", result.drawdowns),
-            TableBlock("Symbol PnL", result.symbol_pnl),
-            TableBlock("Trades", result.trades.tail(100)),
-            TableBlock("Equity", result.equity.tail(120)),
-            TableBlock("Errors", result.errors),
-        ],
-    )
 
 
 def handle_portfolio_init(form: dict[str, str]) -> RenderResult:
@@ -1471,10 +1362,12 @@ def render_thermostat_backtest_section(form: dict[str, str]) -> str:
     <section id="backtest" class="workspace-section">
       <div class="page-head">
         <h2>恒温器回测诊断</h2>
-        <p class="status">页面状态：工作区用于输入回测股票池和日期，计算语义保持不变。</p>
+        <p class="status">页面状态：工作区用于正式事件驱动回测，旧简化回测仅作为明确标记的辅助诊断。</p>
       </div>
       <form method="post" action="/thermostat-backtest">
-        <h3>工作区：回测输入</h3>
+        <h3>数据缓存区</h3>
+        <p class="muted">正式回测会校验本地缓存；缺少涨跌停、停牌或执行时间点状态时会给出数据质量提示。</p>
+        <h3>回测参数区</h3>
         <div class="grid">
           {input_text("symbols", "股票池", "", form)}
           {input_text("start", "开始日期", "", form)}
@@ -1484,57 +1377,16 @@ def render_thermostat_backtest_section(form: dict[str, str]) -> str:
         </div>
         {checkbox("refresh", "强制刷新历史数据", form)}
         <button type="submit">运行恒温器回测</button>
+        <h3>回测结果区</h3>
+        <p class="muted">运行后展示摘要、每日资产、交易明细、持仓和数据质量。</p>
+        <h3>报告下载区</h3>
+        <p class="muted">运行后可导出详细 Excel 报告。</p>
       </form>
     </section>"""
 
 
-def render_turtle_section(form: dict[str, str]) -> str:
-    today = _today_yyyymmdd()
-    return f"""
-    <section id="turtle">
-      <h2>完整海龟系统</h2>
-      <form method="post" action="/turtle">
-        <div class="grid">
-          {select("pool_mode", ("manual", "lhb_top30", "lhb_top50"), "manual", "股票池模式", form)}
-          {input_text("lhb_start", "龙虎榜开始日期", "", form)}
-          {input_text("lhb_end", "龙虎榜结束日期", "", form)}
-          {input_text("account_path", "账户路径", DEFAULT_USER_PATH, form)}
-          {input_text("symbols", "股票池", "", form)}
-          {input_text("start", "开始日期", "", form)}
-          {input_text("end", "结束/As of", today, form)}
-          {turtle_fields(form)}
-          {execution_fields(form)}
-          {source_fields(form)}
-        </div>
-        {checkbox("sync_holdings", "同步账户持仓", form, checked=True)}
-        {checkbox("exclude_chinext", "剔除创业板", form)}
-        {checkbox("execution_plan", "生成手工执行计划", form, checked=True)}
-        <button type="submit">运行海龟系统</button>
-      </form>
-    </section>"""
 
 
-def render_backtest_section(form: dict[str, str]) -> str:
-    today = _today_yyyymmdd()
-    return f"""
-    <section id="backtest">
-      <h2>海龟回测诊断</h2>
-      <form method="post" action="/turtle-backtest">
-        <div class="grid">
-          {select("pool_mode", ("manual", "lhb_top30", "lhb_top50"), "manual", "股票池模式", form)}
-          {input_text("lhb_start", "龙虎榜开始日期", "", form)}
-          {input_text("lhb_end", "龙虎榜结束日期", "", form)}
-          {input_text("symbols", "股票池", "", form)}
-          {input_text("start", "开始日期", "", form)}
-          {input_text("end", "结束日期", today, form)}
-          {input_number("cash", "初始资金", "100000", form)}
-          {turtle_fields(form)}
-          {source_fields(form)}
-        </div>
-        {checkbox("exclude_chinext", "剔除创业板", form)}
-        <button type="submit">运行回测</button>
-      </form>
-    </section>"""
 
 
 def render_portfolio_section(form: dict[str, str]) -> str:
@@ -2012,17 +1864,6 @@ def source_fields(form: dict[str, str] | None = None) -> str:
     )
 
 
-def turtle_fields(form: dict[str, str] | None = None) -> str:
-    return (
-        input_number("risk_pct", "单元风险", "0.01", form)
-        + input_number("s1_entry", "S1 入场", "20", form)
-        + input_number("s1_exit", "S1 退出", "10", form)
-        + input_number("s2_entry", "S2 入场", "55", form)
-        + input_number("s2_exit", "S2 退出", "20", form)
-        + input_number("atr_period", "ATR 周期", "20", form)
-        + input_number("max_units", "最多单元", "4", form)
-        + input_number("slippage_rate", "滑点", "0", form)
-    )
 
 
 def execution_fields(form: dict[str, str] | None = None) -> str:
@@ -2153,39 +1994,10 @@ def _display_form_after_success(path: str, form: dict[str, str]) -> dict[str, st
     return dict(form)
 
 
-def _turtle_summary(form: dict[str, str], start: str, end: str, cash: float, portfolio) -> dict[str, object]:
-    keys = [
-        "pool_mode",
-        "symbols",
-        "lhb_start",
-        "lhb_end",
-        "account_path",
-        "sync_holdings",
-        "exclude_chinext",
-        "source",
-        "refresh",
-    ]
-    summary = _request_summary(form, keys)
-    summary["start"] = start
-    summary["end"] = end
-    if portfolio is not None:
-        summary["account_cash"] = cash
-    else:
-        summary["cash"] = cash
-    for key in ["risk_pct", "s1_entry", "s1_exit", "s2_entry", "s2_exit"]:
-        value = _optional(form, key)
-        if value is not None:
-            summary[key] = value
-    return summary
 
 
-def _resolve_turtle_universe(form: dict[str, str]) -> dict[str, object]:
-    universe = _resolve_pool_universe(form, include_portfolio=_sync_holdings(form), cash_default=5000.0)
-    return universe
 
 
-def _resolve_backtest_universe(form: dict[str, str]) -> dict[str, object]:
-    return _resolve_pool_universe(form, include_portfolio=False, cash_default=100000.0)
 
 
 def _resolve_pool_universe(
@@ -2317,158 +2129,8 @@ def _load_portfolio(path: str):
         return None
 
 
-def _holding_advice(service: MarketDataService, portfolio, start_date: str, end_date: str, config: TurtleConfig, refresh: bool) -> pd.DataFrame:
-    columns = ["symbol", "code", "name", "system", "shares", "avg_cost", "close", "n", "stop_price", "exit_price", "next_add_price", "action", "reason"]
-    if portfolio is None or portfolio.positions.empty:
-        return pd.DataFrame(columns=columns)
-    rows: list[dict[str, object]] = []
-    warmup_start = (pd.to_datetime(start_date) - pd.Timedelta(days=120)).strftime("%Y%m%d")
-    for position in portfolio.positions.itertuples(index=False):
-        symbol = normalize_symbol(str(position.symbol))
-        system = str(getattr(position, "system", "") or "S1").upper()
-        if system not in {"S1", "S2"}:
-            system = "S1"
-        avg_cost = float(getattr(position, "avg_cost", 0.0) or 0.0)
-        base = {"symbol": symbol, "code": symbol_code(symbol), "name": str(getattr(position, "name", "") or ""), "system": system, "shares": int(getattr(position, "shares", 0) or 0), "avg_cost": avg_cost}
-        try:
-            history = _prepare_history(service.get_history(symbol, start_date=warmup_start, end_date=end_date, refresh=refresh, indicators=True))
-            if history.empty:
-                raise ValueError("没有返回历史数据")
-            close = float(history.iloc[-1]["close"])
-            n_value = _atr(history, config.atr_period)
-            exit_price = _exit_price(history, system, config)
-            stop_price = avg_cost - config.stop_atr * n_value if _is_number(n_value) else float("nan")
-            next_add_price = avg_cost + config.add_unit_atr * n_value if _is_number(n_value) else float("nan")
-            action = "hold"
-            reason = "inside turtle holding rules"
-            if _is_number(stop_price) and close <= stop_price:
-                action = "sell"
-                reason = f"2N stop: close {close:.2f} <= stop {stop_price:.2f}"
-            elif _is_number(exit_price) and close < exit_price:
-                action = "sell"
-                window = config.s1_exit if system == "S1" else config.s2_exit
-                reason = f"{system} channel exit: close {close:.2f} < {window}-day low {exit_price:.2f}"
-            elif _is_number(next_add_price) and close >= next_add_price and int(config.max_units) > 1:
-                action = "add"
-                reason = f"0.5N add: close {close:.2f} >= next add {next_add_price:.2f}"
-            rows.append({**base, "close": close, "n": n_value, "stop_price": stop_price, "exit_price": exit_price, "next_add_price": next_add_price, "action": action, "reason": reason})
-        except Exception as exc:
-            rows.append({**base, "close": pd.NA, "n": pd.NA, "stop_price": pd.NA, "exit_price": pd.NA, "next_add_price": pd.NA, "action": "hold", "reason": f"history unavailable: {exc}"})
-    return pd.DataFrame(rows, columns=columns)
 
 
-def _candidate_evaluation(
-    service: MarketDataService,
-    symbols: list[str],
-    pool: pd.DataFrame,
-    start_date: str,
-    end_date: str,
-    cash: float,
-    config: TurtleConfig,
-    refresh: bool,
-    signals: pd.DataFrame,
-) -> pd.DataFrame:
-    columns = [
-        "symbol",
-        "code",
-        "name",
-        "date",
-        "close",
-        "n",
-        "s1_breakout_price",
-        "s2_breakout_price",
-        "evaluation_action",
-        "system",
-        "score",
-        "suggested_shares",
-        "reason",
-    ]
-    if not symbols:
-        return pd.DataFrame(columns=columns)
-    pool_names = _pool_name_map(pool)
-    signal_map = {
-        str(row.symbol): row
-        for row in signals.itertuples(index=False)
-    } if signals is not None and not signals.empty else {}
-    rows: list[dict[str, object]] = []
-    warmup_start = (pd.to_datetime(start_date) - pd.Timedelta(days=120)).strftime("%Y%m%d")
-    for symbol in symbols:
-        normalized = normalize_symbol(symbol)
-        code = symbol_code(normalized)
-        signal = signal_map.get(normalized)
-        if signal is not None:
-            rows.append(
-                {
-                    "symbol": normalized,
-                    "code": code,
-                    "name": getattr(signal, "name", "") or pool_names.get(normalized, ""),
-                    "date": getattr(signal, "date", ""),
-                    "close": getattr(signal, "price", pd.NA),
-                    "n": getattr(signal, "n", pd.NA),
-                    "s1_breakout_price": pd.NA,
-                    "s2_breakout_price": pd.NA,
-                    "evaluation_action": "buy",
-                    "system": getattr(signal, "system", ""),
-                    "score": getattr(signal, "score", pd.NA),
-                    "suggested_shares": getattr(signal, "suggested_shares", pd.NA),
-                    "reason": getattr(signal, "reason", ""),
-                }
-            )
-            continue
-        try:
-            history = _prepare_history(
-                service.get_history(
-                    normalized,
-                    start_date=warmup_start,
-                    end_date=end_date,
-                    refresh=refresh,
-                    indicators=True,
-                )
-            )
-            if history.empty:
-                raise ValueError("没有返回历史数据")
-            close = float(history.iloc[-1]["close"])
-            n_value = _atr(history, config.atr_period)
-            s1_high = _breakout_high(history, config.s1_entry)
-            s2_high = _breakout_high(history, config.s2_entry)
-            unit = _unit_shares(cash, n_value, config)
-            reason = _no_signal_reason(close, s1_high, s2_high, config)
-            rows.append(
-                {
-                    "symbol": normalized,
-                    "code": code,
-                    "name": pool_names.get(normalized, ""),
-                    "date": history.iloc[-1]["date"],
-                    "close": close,
-                    "n": n_value,
-                    "s1_breakout_price": s1_high,
-                    "s2_breakout_price": s2_high,
-                    "evaluation_action": "no_signal",
-                    "system": "",
-                    "score": 0.0,
-                    "suggested_shares": unit,
-                    "reason": reason,
-                }
-            )
-        except Exception as exc:
-            rows.append(
-                {
-                    "symbol": normalized,
-                    "code": code,
-                    "name": pool_names.get(normalized, ""),
-                    "date": "",
-                    "close": pd.NA,
-                    "n": pd.NA,
-                    "s1_breakout_price": pd.NA,
-                    "s2_breakout_price": pd.NA,
-                    "evaluation_action": "missing_history",
-                    "system": "",
-                    "score": 0.0,
-                    "suggested_shares": 0,
-                    "reason": f"历史数据不可用：{exc}",
-                }
-            )
-    return pd.DataFrame(rows, columns=columns)
 
 
 def _pool_name_map(pool: pd.DataFrame) -> dict[str, str]:
@@ -2488,24 +2150,8 @@ def _breakout_high(frame: pd.DataFrame, window: int) -> float:
     return float(frame["high"].iloc[-window - 1 : -1].max())
 
 
-def _unit_shares(equity: float, n_value: float, config: TurtleConfig) -> int:
-    if not _is_number(equity) or not _is_number(n_value) or n_value <= 0:
-        return 0
-    raw = float(equity) * config.risk_pct / float(n_value)
-    return max(int(raw // config.lot_size) * config.lot_size, 0)
 
 
-def _no_signal_reason(close: float, s1_high: float, s2_high: float, config: TurtleConfig) -> str:
-    parts: list[str] = []
-    if _is_number(s1_high):
-        parts.append(f"收盘价 {close:.2f} 未突破 S1 {config.s1_entry}日高点 {s1_high:.2f}")
-    else:
-        parts.append(f"S1 {config.s1_entry}日突破历史数据不足")
-    if _is_number(s2_high):
-        parts.append(f"未突破 S2 {config.s2_entry}日高点 {s2_high:.2f}")
-    else:
-        parts.append(f"S2 {config.s2_entry}日突破历史数据不足")
-    return "未触发买入：" + "；".join(parts)
 
 
 def _prepare_history(history: pd.DataFrame) -> pd.DataFrame:
@@ -2530,11 +2176,6 @@ def _atr(frame: pd.DataFrame, period: int) -> float:
     return float(tr.tail(period).mean())
 
 
-def _exit_price(frame: pd.DataFrame, system: str, config: TurtleConfig) -> float:
-    window = config.s1_exit if system == "S1" else config.s2_exit
-    if len(frame) < window + 1:
-        return float("nan")
-    return float(frame["low"].iloc[-window - 1 : -1].min())
 
 
 def _is_number(value: object) -> bool:
@@ -2544,169 +2185,18 @@ def _is_number(value: object) -> bool:
         return False
 
 
-def _empty_turtle_result(start_date: str, end_date: str, cash: float) -> TurtleSystemResult:
-    return TurtleSystemResult(
-        summary=pd.DataFrame(columns=TURTLE_SUMMARY_COLUMNS),
-        equity=pd.DataFrame(columns=TURTLE_EQUITY_COLUMNS),
-        trades=pd.DataFrame(columns=TURTLE_TRADE_COLUMNS),
-        positions=pd.DataFrame(columns=TURTLE_POSITION_COLUMNS),
-        drawdowns=pd.DataFrame(columns=["start_date", "trough_date", "end_date", "max_drawdown"]),
-        symbol_pnl=pd.DataFrame(columns=["symbol", "code", "name", "realized_pnl", "trades"]),
-        signals=pd.DataFrame(columns=TURTLE_SIGNAL_COLUMNS),
-        errors=pd.DataFrame(columns=["symbol", "name", "error"]),
-    )
 
 
-def _benchmark_summary(service: MarketDataService, start_date: str, end_date: str) -> dict[str, object]:
-    try:
-        frame = _prepare_history(
-            service.get_index_history(
-                "000001",
-                start_date=start_date,
-                end_date=end_date,
-            ).rename(columns={"index_code": "symbol"})
-        )
-        if frame.empty:
-            return {"benchmark_symbol": "000001.SH", "benchmark_return": pd.NA, "benchmark_error": "没有返回指数历史数据"}
-        start_close = float(frame.iloc[0]["close"])
-        end_close = float(frame.iloc[-1]["close"])
-        benchmark_return = end_close / start_close - 1 if start_close else pd.NA
-        return {"benchmark_symbol": "000001.SH", "benchmark_return": benchmark_return}
-    except Exception as exc:
-        return {"benchmark_symbol": "000001.SH", "benchmark_return": pd.NA, "benchmark_error": str(exc)}
 
 
-def _augment_backtest_summary(summary: pd.DataFrame, benchmark: dict[str, object]) -> pd.DataFrame:
-    if summary is None or summary.empty:
-        summary = pd.DataFrame([{"strategy": "turtle_system"}])
-    data = summary.copy()
-    benchmark_return = benchmark.get("benchmark_return", pd.NA)
-    data["benchmark_symbol"] = benchmark.get("benchmark_symbol", "000001.SH")
-    data["benchmark_return"] = benchmark_return
-    total_return = pd.to_numeric(data.get("total_return"), errors="coerce")
-    if pd.notna(benchmark_return):
-        data["excess_return"] = total_return - float(benchmark_return)
-    else:
-        data["excess_return"] = pd.NA
-    if "benchmark_error" in benchmark:
-        data["benchmark_error"] = benchmark["benchmark_error"]
-    if "trade_count" in data:
-        data["trade_note"] = data["trade_count"].map(lambda value: "未触发交易" if _safe_int(value) == 0 else "")
-    return data
 
 
-def _period_returns(equity: pd.DataFrame, frequency: str) -> pd.DataFrame:
-    columns = ["period", "start_value", "end_value", "return", "max_drawdown", "position_utilization"]
-    if equity is None or equity.empty:
-        return pd.DataFrame(columns=columns)
-    data = equity.copy()
-    data["date"] = pd.to_datetime(data["date"], errors="coerce")
-    data["total_value"] = pd.to_numeric(data["total_value"], errors="coerce")
-    data["drawdown"] = pd.to_numeric(data.get("drawdown"), errors="coerce")
-    data["position_value"] = pd.to_numeric(data.get("position_value"), errors="coerce").fillna(0.0)
-    data = data.dropna(subset=["date", "total_value"])
-    if data.empty:
-        return pd.DataFrame(columns=columns)
-    data["period"] = data["date"].dt.to_period(frequency).astype(str)
-    rows: list[dict[str, object]] = []
-    for period, group in data.groupby("period", sort=True):
-        start_value = float(group.iloc[0]["total_value"])
-        end_value = float(group.iloc[-1]["total_value"])
-        rows.append(
-            {
-                "period": period,
-                "start_value": start_value,
-                "end_value": end_value,
-                "return": end_value / start_value - 1 if start_value else 0.0,
-                "max_drawdown": float(group["drawdown"].min()) if group["drawdown"].notna().any() else 0.0,
-                "position_utilization": float((group["position_value"] > 0).mean()),
-            }
-        )
-    return pd.DataFrame(rows, columns=columns)
 
 
-def _monthly_return_matrix(monthly: pd.DataFrame) -> pd.DataFrame:
-    if monthly is None or monthly.empty or "period" not in monthly or "return" not in monthly:
-        return pd.DataFrame(columns=["year"])
-    data = monthly.copy()
-    period = pd.PeriodIndex(data["period"].astype(str), freq="M")
-    data["year"] = period.year
-    data["month"] = period.month
-    pivot = data.pivot(index="year", columns="month", values="return").reset_index()
-    pivot.columns = [str(column) for column in pivot.columns]
-    return pivot
 
 
-def _trade_quality(trades: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "trade_count",
-        "buy_count",
-        "sell_count",
-        "profit_count",
-        "loss_count",
-        "zero_count",
-        "win_rate",
-        "avg_profit",
-        "avg_loss",
-        "profit_loss_ratio",
-        "expectancy",
-    ]
-    if trades is None or trades.empty:
-        return pd.DataFrame([{column: 0 for column in columns}], columns=columns)
-    sells = trades[trades["action"] == "sell"].copy()
-    pnl = (
-        pd.to_numeric(sells["realized_pnl"], errors="coerce").dropna()
-        if not sells.empty and "realized_pnl" in sells
-        else pd.Series(dtype=float)
-    )
-    profits = pnl[pnl > 0]
-    losses = pnl[pnl < 0]
-    zeros = pnl[pnl == 0]
-    avg_profit = float(profits.mean()) if len(profits) else 0.0
-    avg_loss = float(losses.mean()) if len(losses) else 0.0
-    closed = len(profits) + len(losses) + len(zeros)
-    return pd.DataFrame(
-        [
-            {
-                "trade_count": len(trades),
-                "buy_count": int((trades["action"].isin(["buy", "add"])).sum()) if "action" in trades else 0,
-                "sell_count": len(sells),
-                "profit_count": len(profits),
-                "loss_count": len(losses),
-                "zero_count": len(zeros),
-                "win_rate": len(profits) / closed if closed else 0.0,
-                "avg_profit": avg_profit,
-                "avg_loss": avg_loss,
-                "profit_loss_ratio": abs(avg_profit / avg_loss) if avg_loss else 0.0,
-                "expectancy": float(pnl.mean()) if len(pnl) else 0.0,
-            }
-        ],
-        columns=columns,
-    )
 
 
-def _holding_distribution(trades: pd.DataFrame) -> pd.DataFrame:
-    columns = ["bucket", "trade_count", "average_holding_days"]
-    days = _closed_holding_days(trades)
-    if not days:
-        return pd.DataFrame(columns=columns)
-    buckets = [
-        ("0-5天", lambda value: value <= 5),
-        ("6-20天", lambda value: 6 <= value <= 20),
-        ("21-60天", lambda value: 21 <= value <= 60),
-        ("60天以上", lambda value: value > 60),
-    ]
-    rows = []
-    for label, matcher in buckets:
-        matched = [value for value in days if matcher(value)]
-        rows.append(
-            {
-                "bucket": label,
-                "trade_count": len(matched),
-                "average_holding_days": sum(matched) / len(matched) if matched else 0.0,
-            }
-        )
-    return pd.DataFrame(rows, columns=columns)
 
 
 def _closed_holding_days(trades: pd.DataFrame) -> list[int]:
@@ -2727,31 +2217,6 @@ def _closed_holding_days(trades: pd.DataFrame) -> list[int]:
     return days
 
 
-def _backtest_candidate_difference(pool: pd.DataFrame, trades: pd.DataFrame) -> pd.DataFrame:
-    columns = ["symbol", "code", "name", "source", "rank", "net_buy", "traded", "buy_count", "sell_count", "realized_pnl", "reason"]
-    if pool is None or pool.empty:
-        return pd.DataFrame(columns=columns)
-    data = pool.copy()
-    if trades is None or trades.empty:
-        data["traded"] = "no"
-        data["buy_count"] = 0
-        data["sell_count"] = 0
-        data["realized_pnl"] = 0.0
-        data["reason"] = "未触发任何成交"
-        return data.reindex(columns=columns)
-    trades = trades.copy()
-    grouped = trades.groupby("symbol", as_index=False).agg(
-        buy_count=("action", lambda values: int(values.isin(["buy", "add"]).sum())),
-        sell_count=("action", lambda values: int((values == "sell").sum())),
-        realized_pnl=("realized_pnl", lambda values: float(pd.to_numeric(values, errors="coerce").fillna(0.0).sum())),
-    )
-    data = data.merge(grouped, how="left", on="symbol")
-    data["buy_count"] = data["buy_count"].fillna(0).astype(int)
-    data["sell_count"] = data["sell_count"].fillna(0).astype(int)
-    data["realized_pnl"] = data["realized_pnl"].fillna(0.0)
-    data["traded"] = data["buy_count"].map(lambda value: "yes" if value else "no")
-    data["reason"] = data["buy_count"].map(lambda value: "已触发成交" if value else "未触发买入或资金不足")
-    return data.reindex(columns=columns)
 
 
 def _safe_int(value: object) -> int:
@@ -2889,17 +2354,6 @@ def _first_name(frame: pd.DataFrame) -> str:
     return ""
 
 
-def _turtle_config(form: dict[str, str]) -> TurtleConfig:
-    return TurtleConfig(
-        s1_entry=_int(form, "s1_entry", 20),
-        s1_exit=_int(form, "s1_exit", 10),
-        s2_entry=_int(form, "s2_entry", 55),
-        s2_exit=_int(form, "s2_exit", 20),
-        atr_period=_int(form, "atr_period", 20),
-        risk_pct=_float(form, "risk_pct", 0.01),
-        max_units=_int(form, "max_units", 4),
-        slippage_rate=_float(form, "slippage_rate", 0.0),
-    )
 
 
 def _symbols(form: dict[str, str]) -> list[str]:
