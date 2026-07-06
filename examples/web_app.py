@@ -99,6 +99,7 @@ PROGRESS_STAGE_LABELS = {
     "initialize_task": "正在初始化任务",
     "load_market_history": "正在加载市场历史",
     "load_candidate_history": "正在加载候选股历史",
+    "run_backtest": "正在运行恒温器回测",
     "classify_market": "正在生成市场状态",
     "evaluate_candidates": "正在评估候选股",
     "evaluate_holdings": "正在评估持仓",
@@ -417,6 +418,14 @@ OPTION_LABELS = {
         "1y": "最近 1 年",
         "custom": "自定义",
     },
+    "backtest_date_range": {
+        "1m": "最近 1 个月",
+        "3m": "最近 3 个月",
+        "5m": "最近 5 个月",
+        "half_year": "最近半年",
+        "1y": "最近 1 年",
+        "custom": "自定义",
+    },
     "source": {"": "自动", "baostock": "BaoStock", "akshare": "AkShare", "joinquant": "JoinQuant"},
     "stock_source": {"": "自动", "baostock": "BaoStock", "akshare": "AkShare", "joinquant": "JoinQuant"},
     "realtime_source": {"sina": "新浪", "akshare": "AkShare"},
@@ -584,6 +593,9 @@ class WebAppHandler(BaseHTTPRequestHandler):
             elif path == "/thermostat-backtest":
                 page = "backtest"
                 result = handle_thermostat_backtest(form)
+            elif path == "/thermostat-backtest-job":
+                page = "backtest"
+                result = handle_thermostat_backtest_job(form)
             elif path == "/portfolio-init":
                 page = "portfolio"
                 result = handle_portfolio_init(form)
@@ -746,6 +758,15 @@ def handle_thermostat_job(form: dict[str, str]) -> RenderResult:
     )
 
 
+def handle_thermostat_backtest_job(form: dict[str, str]) -> RenderResult:
+    job = start_thermostat_backtest_job(form)
+    return RenderResult(
+        "恒温器回测任务已开始",
+        summaries=[{"job_id": job.job_id, "stage": job.stage, "node": job.node, "message": job.message}],
+        extra_html=render_job_progress(job.job_id),
+    )
+
+
 def _lhb_dates_from_form(form: dict[str, str]) -> tuple[str, str]:
     range_key = _value(form, "lhb_range", "1w")
     return lhb_range_dates(
@@ -886,10 +907,31 @@ def start_thermostat_job(form: dict[str, str]) -> ThermostatJob:
     return job
 
 
+def start_thermostat_backtest_job(form: dict[str, str]) -> ThermostatJob:
+    job_id = uuid.uuid4().hex
+    job = ThermostatJob(job_id, form)
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    thread = threading.Thread(target=_run_thermostat_backtest_job, args=(job_id,), daemon=True)
+    thread.start()
+    return job
+
+
 def _run_thermostat_job(job_id: str) -> None:
     job = JOBS[job_id]
     try:
         result = handle_thermostat(job.form, progress_callback=job.update)
+        job.complete(result)
+    except Exception as exc:  # pragma: no cover - defensive live-web path
+        job.fail(exc)
+
+
+def _run_thermostat_backtest_job(job_id: str) -> None:
+    job = JOBS[job_id]
+    try:
+        job.update({"stage": "run_backtest", "completed": 0, "total": 1, "node": "正在运行恒温器回测"})
+        result = handle_thermostat_backtest(job.form)
+        job.update({"stage": "run_backtest", "completed": 1, "total": 1, "node": "正在整理回测结果"})
         job.complete(result)
     except Exception as exc:  # pragma: no cover - defensive live-web path
         job.fail(exc)
@@ -1065,13 +1107,20 @@ def _first_record(frame: pd.DataFrame) -> dict[str, object]:
 
 
 def handle_thermostat_backtest(form: dict[str, str]) -> RenderResult:
-    symbols = [normalize_symbol(symbol) for symbol in _require_symbols(form)]
-    start = _value(form, "start")
-    end = _value(form, "end", _today_yyyymmdd())
+    source = _value(form, "stock_pool_source", "manual")
+    if source not in {"manual", "watchlist", "market_range", "lhb"}:
+        label = OPTION_LABELS["stock_pool_source"].get(source, source)
+        return _stock_pool_error_result(_stock_pool_error(source, label, f"回测暂不支持股票池来源：{label}"))
+    service = _service(form)
+    pool = _resolve_thermostat_stock_pool(form, service)
+    if pool.errors or not pool.symbols:
+        return _stock_pool_error_result(pool)
+    symbols = [normalize_symbol(symbol) for symbol in pool.symbols]
+    start, end = _backtest_range_dates(form)
     if not start or not end:
         raise ValueError("恒温器回测需要开始日期和结束日期。")
     result = backtest_thermostat_strategy(
-        service=_service(form),
+        service=service,
         symbols=symbols,
         start_date=start,
         end_date=end,
@@ -1081,7 +1130,11 @@ def handle_thermostat_backtest(form: dict[str, str]) -> RenderResult:
         title="恒温器回测诊断",
         summaries=[
             _first_record(result.summary),
-            _request_summary({**form, "end": end}, ["symbols", "start", "end", "cash", "source", "refresh"]),
+            _pool_summary_dict(pool),
+            _request_summary(
+                {**form, "start": start, "end": end},
+                ["stock_pool_source", "watchlist_name", "market_range", "backtest_date_range", "start", "end", "cash", "source", "refresh"],
+            ),
         ],
         tables=[
             TableBlock("Summary", result.summary),
@@ -1260,15 +1313,16 @@ def nav_link(target: str, label: str, current: str) -> str:
 
 
 def render_source_refresh_script(page: str) -> str:
-    if page != "thermostat":
+    if page not in {"thermostat", "backtest"}:
         return ""
-    return """
+    target = f"/{page}"
+    return f"""
   <script>
-  function refreshSourceFields(select) {
+  function refreshSourceFields(select) {{
     const form = select.form;
     const params = new URLSearchParams(new FormData(form));
-    window.location.href = "/thermostat?" + params.toString();
-  }
+    window.location.href = "{target}?" + params.toString();
+  }}
   </script>
   """
 
@@ -1317,11 +1371,19 @@ def render_thermostat_section(form: dict[str, str]) -> str:
 def strategy_date_fields(form: dict[str, str]) -> str:
     current = _value(form, "strategy_date_range", "3m")
     actual_start, actual_end = _strategy_range_dates(form)
-    fields = select("strategy_date_range", ("1m", "3m", "half_year", "1y", "custom"), "3m", "策略日期范围", form)
-    fields += f'<p class="muted">实际使用日期范围：{html.escape(actual_start)} 至 {html.escape(actual_end)}</p>'
+    fields = select(
+        "strategy_date_range",
+        ("1m", "3m", "half_year", "1y", "custom"),
+        "3m",
+        "策略日期范围",
+        form,
+        attrs='onchange="refreshSourceFields(this)"',
+    )
     if current == "custom":
         fields += input_text("start", "策略开始日期", "", form)
         fields += input_text("end", "策略结束日期", _today_yyyymmdd(), form)
+    else:
+        fields += f'<p class="muted">实际使用日期范围：{html.escape(actual_start)} 至 {html.escape(actual_end)}</p>'
     return fields
 
 
@@ -1356,22 +1418,52 @@ def _strategy_range_dates(form: dict[str, str]) -> tuple[str, str]:
     return start, end
 
 
+def _backtest_range_dates(form: dict[str, str]) -> tuple[str, str]:
+    end = _value(form, "end", _today_yyyymmdd())
+    if "backtest_date_range" not in form and _optional(form, "start"):
+        return _value(form, "start"), end
+    range_key = _value(form, "backtest_date_range", "3m")
+    if range_key == "custom":
+        start = _optional(form, "start") or (pd.to_datetime(end) - pd.Timedelta(days=90)).strftime("%Y%m%d")
+        return start, end
+    offsets = {"1m": 30, "3m": 90, "5m": 150, "half_year": 182, "1y": 365}
+    start = (pd.to_datetime(end) - pd.Timedelta(days=offsets.get(range_key, 90))).strftime("%Y%m%d")
+    return start, end
+
+
 def render_thermostat_backtest_section(form: dict[str, str]) -> str:
     today = _today_yyyymmdd()
+    actual_start, actual_end = _backtest_range_dates(form)
+    date_fields = select(
+        "backtest_date_range",
+        ("1m", "3m", "5m", "half_year", "1y", "custom"),
+        "3m",
+        "回测日期范围",
+        form,
+        attrs='onchange="refreshSourceFields(this)"',
+    )
+    if _value(form, "backtest_date_range", "3m") == "custom":
+        date_fields += input_text("start", "开始日期", "", form)
+        date_fields += input_text("end", "结束日期", today, form)
+    else:
+        date_fields += f'<p class="muted">实际回测日期范围：{html.escape(actual_start)} 至 {html.escape(actual_end)}</p>'
     return f"""
     <section id="backtest" class="workspace-section">
       <div class="page-head">
         <h2>恒温器回测诊断</h2>
         <p class="status">页面状态：工作区用于正式事件驱动回测，旧简化回测仅作为明确标记的辅助诊断。</p>
       </div>
-      <form method="post" action="/thermostat-backtest">
+      <form method="post" action="/thermostat-backtest-job">
         <h3>数据缓存区</h3>
         <p class="muted">正式回测会校验本地缓存；缺少涨跌停、停牌或执行时间点状态时会给出数据质量提示。</p>
         <h3>回测参数区</h3>
+        <h4>股票池来源</h4>
+        {stock_pool_fields(form)}
+        <h4>回测日期范围</h4>
         <div class="grid">
-          {input_text("symbols", "股票池", "", form)}
-          {input_text("start", "开始日期", "", form)}
-          {input_text("end", "结束日期", today, form)}
+          {date_fields}
+        </div>
+        <div class="grid">
           {input_number("cash", "初始资金", "100000", form)}
           {source_fields(form)}
         </div>
@@ -1957,14 +2049,37 @@ def _display_form_for_page(page: str, form: dict[str, str]) -> dict[str, str]:
             display["account_path"] = _value(form, "account_path")
         return display
     if page == "backtest":
-        return _copy_existing(form, ["symbols", "start", "end", "cash", "source", "stock_source", "realtime_source", "refresh"])
+        display = _copy_existing(
+            form,
+            [
+                "stock_pool_source",
+                "symbols",
+                "watchlist_name",
+                "market_range",
+                "lhb_range",
+                "lhb_confirmed_top",
+                "lhb_start",
+                "lhb_end",
+                "backtest_date_range",
+                "start",
+                "end",
+                "cash",
+                "source",
+                "stock_source",
+                "realtime_source",
+                "refresh",
+            ],
+        )
+        if _optional(form, "account_path") is not None:
+            display["account_path"] = _value(form, "account_path")
+        return display
     return {}
 
 
 def _display_form_after_success(path: str, form: dict[str, str]) -> dict[str, str]:
     if path == "/thermostat-job":
         return _display_form_for_page("thermostat", form)
-    if path == "/thermostat-backtest":
+    if path in {"/thermostat-backtest", "/thermostat-backtest-job"}:
         return _display_form_for_page("backtest", form)
     if path == "/portfolio-init":
         return {"path": _account_path_for_form(form, page="portfolio")}
@@ -2400,7 +2515,7 @@ def _page_for_path(path: str) -> str:
         "/watchlist-delete",
     }:
         return "portfolio" if path.startswith("/portfolio") else "thermostat"
-    if path == "/thermostat-backtest":
+    if path in {"/thermostat-backtest", "/thermostat-backtest-job"}:
         return "backtest"
     return "thermostat"
 

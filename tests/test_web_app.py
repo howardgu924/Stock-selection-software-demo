@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -53,6 +54,20 @@ class FakeWebService:
 
     def get_index_history(self, index_code: str, start_date: str, end_date: str, period: str = "daily") -> pd.DataFrame:
         return _history("000001.SH", [3000 + i * 10 for i in range(40)])
+
+
+def _minimal_backtest_result() -> SimpleNamespace:
+    return SimpleNamespace(
+        summary=pd.DataFrame([{"backtest_type": "event_driven"}]),
+        regime_performance=pd.DataFrame(),
+        diagnostics=pd.DataFrame(),
+        daily_portfolio=pd.DataFrame(),
+        trades=pd.DataFrame(),
+        positions=pd.DataFrame(),
+        symbol_performance=pd.DataFrame(),
+        data_quality=pd.DataFrame(),
+        parameters=pd.DataFrame(),
+    )
 
 
 def test_web_app_parses_symbols_and_marks() -> None:
@@ -228,6 +243,24 @@ def test_web_thermostat_uses_date_range_account_cash_and_advanced_settings(tmp_p
     assert 'name="cash"' in simulated_html
     assert "高级设置" in initialized_html
     assert "数据与执行设置" in initialized_html
+
+
+def test_thermostat_strategy_custom_date_range_refreshes_without_actual_range() -> None:
+    default_html = web_app.render_page(page="thermostat", form={"strategy_date_range": "3m"})
+    custom_html = web_app.render_page(
+        page="thermostat",
+        form={"strategy_date_range": "custom", "start": "20240101", "end": "20260706"},
+    )
+
+    assert 'name="strategy_date_range"' in default_html
+    assert '<select name="strategy_date_range" onchange="refreshSourceFields(this)">' in default_html
+    assert 'window.location.href = "/thermostat?"' in default_html
+    assert "实际使用日期范围" in default_html
+    assert "实际使用日期范围" not in custom_html
+    assert 'name="start"' in custom_html
+    assert 'name="end"' in custom_html
+    assert 'value="20240101"' in custom_html
+    assert 'value="20260706"' in custom_html
 
 
 def test_web_can_save_manual_input_as_watchlist(tmp_path) -> None:
@@ -779,6 +812,313 @@ def test_backtest_page_shows_cache_parameters_results_and_download_sections() ->
     assert "报告下载区" in html
 
 
+def test_backtest_page_uses_stock_pool_source_selector_for_manual_input() -> None:
+    html = web_app.render_thermostat_backtest_section({"stock_pool_source": "manual", "symbols": "600519 000001"})
+
+    assert 'name="stock_pool_source"' in html
+    assert "编辑手动股票池" in html
+    assert "手动股票池" in html
+    assert "已识别股票数量" in html
+    assert 'name="symbols"' in html
+
+
+def test_backtest_page_uses_watchlist_dropdown_when_watchlists_exist(tmp_path) -> None:
+    store = WatchlistStore(tmp_path / "account")
+    store.create("观察")
+    store.add_symbols("观察", ["600519"])
+
+    html = web_app.render_thermostat_backtest_section(
+        {"account_path": str(tmp_path / "account"), "stock_pool_source": "watchlist"}
+    )
+
+    assert "自选股组合" in html
+    assert 'name="watchlist_name"' in html
+    assert "观察" in html
+    assert "手动股票池" not in html
+
+
+def test_backtest_page_shows_empty_watchlist_state(tmp_path) -> None:
+    html = web_app.render_thermostat_backtest_section(
+        {"account_path": str(tmp_path / "empty"), "stock_pool_source": "watchlist"}
+    )
+
+    assert "暂无自选组合，请到账户页创建" in html
+    assert "手动股票池" not in html
+
+
+def test_backtest_page_uses_market_range_controls() -> None:
+    html = web_app.render_thermostat_backtest_section({"stock_pool_source": "market_range"})
+
+    assert "市场范围" in html
+    assert "沪深 A 股" in html
+    assert "创业板" in html
+    assert "科创板" in html
+    assert 'type="checkbox" name="market_range"' in html
+
+
+def test_backtest_page_does_not_duplicate_lhb_candidate_sources() -> None:
+    html = web_app.render_thermostat_backtest_section({"stock_pool_source": "lhb", "lhb_range": "1w"})
+
+    assert "龙虎榜" in html
+    assert "同花顺龙虎榜" not in html
+
+
+def test_backtest_page_includes_date_range_presets() -> None:
+    html = web_app.render_thermostat_backtest_section({"backtest_date_range": "5m", "end": "20260702"})
+
+    assert 'name="backtest_date_range"' in html
+    assert "最近 1 个月" in html
+    assert "最近 3 个月" in html
+    assert "最近 5 个月" in html
+    assert "最近半年" in html
+    assert "最近 1 年" in html
+    assert "自定义" in html
+
+
+def test_backtest_page_refreshes_conditional_controls_without_running() -> None:
+    html = web_app.render_page(page="backtest", form={"stock_pool_source": "manual", "backtest_date_range": "3m"})
+
+    assert "refreshSourceFields" in html
+    assert 'data-source-selector="stock_pool_source"' in html
+    assert 'name="backtest_date_range"' in html
+    assert 'onchange="refreshSourceFields(this)"' in html
+    assert 'window.location.href = "/backtest?"' in html
+
+
+def test_backtest_form_submits_to_job_progress_endpoint() -> None:
+    html = web_app.render_thermostat_backtest_section({"stock_pool_source": "watchlist", "backtest_date_range": "3m"})
+
+    assert 'action="/thermostat-backtest-job"' in html
+    assert 'action="/thermostat-backtest"' not in html
+
+
+def test_backtest_job_start_renders_progress(monkeypatch) -> None:
+    started: dict[str, object] = {}
+
+    class FakeJob:
+        job_id = "backtest-job-1"
+        stage = "queued"
+        node = "排队"
+        message = "任务已创建，等待开始。"
+
+    def fake_start(form):
+        started.update(form)
+        return FakeJob()
+
+    monkeypatch.setattr(web_app, "start_thermostat_backtest_job", fake_start)
+
+    result = web_app.handle_thermostat_backtest_job(
+        {"stock_pool_source": "watchlist", "watchlist_name": "观察", "backtest_date_range": "3m"}
+    )
+
+    assert started["stock_pool_source"] == "watchlist"
+    assert result.title == "恒温器回测任务已开始"
+    assert 'data-job-id="backtest-job-1"' in result.extra_html
+    assert "<progress" in result.extra_html
+
+
+def test_backtest_page_preset_dates_show_summary_without_raw_date_inputs() -> None:
+    html = web_app.render_thermostat_backtest_section(
+        {"backtest_date_range": "5m", "start": "19990101", "end": "20260702"}
+    )
+
+    assert "实际回测日期范围" in html
+    assert "20260202 至 20260702" in html
+    assert 'name="start"' not in html
+    assert 'name="end"' not in html
+
+
+def test_backtest_page_custom_dates_show_editable_inputs() -> None:
+    html = web_app.render_thermostat_backtest_section(
+        {"backtest_date_range": "custom", "start": "20260101", "end": "20260702"}
+    )
+
+    assert "实际回测日期范围" not in html
+    assert 'name="start"' in html
+    assert 'name="end"' in html
+    assert 'value="20260101"' in html
+    assert 'value="20260702"' in html
+
+
+def test_backtest_five_month_range_resolves_from_selected_end_date() -> None:
+    assert web_app._backtest_range_dates({"backtest_date_range": "5m", "end": "20260702"}) == (
+        "20260202",
+        "20260702",
+    )
+
+
+def test_backtest_preset_ignores_stale_custom_dates() -> None:
+    assert web_app._backtest_range_dates(
+        {"backtest_date_range": "3m", "start": "19990101", "end": "20260702"}
+    ) == ("20260403", "20260702")
+
+
+def test_backtest_handler_resolves_watchlist_symbols_before_running(monkeypatch, tmp_path) -> None:
+    store = WatchlistStore(tmp_path / "account")
+    store.create("观察")
+    store.add_symbols("观察", ["600519"])
+    captured: dict[str, object] = {}
+
+    def fake_backtest(**kwargs):
+        captured.update(kwargs)
+        return _minimal_backtest_result()
+
+    monkeypatch.setattr(web_app, "backtest_thermostat_strategy", fake_backtest)
+    monkeypatch.setattr(web_app, "_service", lambda form: FakeWebService())
+
+    result = web_app.handle_thermostat_backtest(
+        {
+            "account_path": str(tmp_path / "account"),
+            "stock_pool_source": "watchlist",
+            "watchlist_name": "观察",
+            "symbols": "000001",
+            "backtest_date_range": "5m",
+            "end": "20260702",
+            "cash": "100000",
+        }
+    )
+
+    assert captured["symbols"] == ["600519.SH"]
+    assert captured["start_date"] == "20260202"
+    assert captured["end_date"] == "20260702"
+    assert result.summaries[0]["backtest_type"] == "event_driven"
+
+
+def test_backtest_handler_blocks_empty_watchlist_without_running(monkeypatch, tmp_path) -> None:
+    store = WatchlistStore(tmp_path / "account")
+    store.create("空组合")
+    called = False
+
+    def fake_backtest(**kwargs):
+        nonlocal called
+        called = True
+        return _minimal_backtest_result()
+
+    monkeypatch.setattr(web_app, "backtest_thermostat_strategy", fake_backtest)
+
+    result = web_app.handle_thermostat_backtest(
+        {
+            "account_path": str(tmp_path / "account"),
+            "stock_pool_source": "watchlist",
+            "watchlist_name": "空组合",
+            "backtest_date_range": "3m",
+            "end": "20260702",
+        }
+    )
+
+    assert result.title == "股票池错误"
+    assert called is False
+    assert "空组合" in result.summaries[0]["errors"]
+
+
+def test_backtest_handler_ignores_inactive_manual_symbols(monkeypatch, tmp_path) -> None:
+    store = WatchlistStore(tmp_path / "account")
+    store.create("观察")
+    store.add_symbols("观察", ["600519"])
+    captured: dict[str, object] = {}
+
+    def fake_backtest(**kwargs):
+        captured.update(kwargs)
+        return _minimal_backtest_result()
+
+    monkeypatch.setattr(web_app, "backtest_thermostat_strategy", fake_backtest)
+    monkeypatch.setattr(web_app, "_service", lambda form: FakeWebService())
+
+    web_app.handle_thermostat_backtest(
+        {
+            "account_path": str(tmp_path / "account"),
+            "stock_pool_source": "watchlist",
+            "watchlist_name": "观察",
+            "symbols": "000001",
+            "backtest_date_range": "3m",
+            "end": "20260702",
+        }
+    )
+
+    assert captured["symbols"] == ["600519.SH"]
+
+
+def test_backtest_result_summary_uses_active_source_and_resolved_dates(monkeypatch, tmp_path) -> None:
+    store = WatchlistStore(tmp_path / "account")
+    store.create("观察")
+    store.add_symbols("观察", ["600519"])
+
+    monkeypatch.setattr(web_app, "backtest_thermostat_strategy", lambda **kwargs: _minimal_backtest_result())
+    monkeypatch.setattr(web_app, "_service", lambda form: FakeWebService())
+
+    result = web_app.handle_thermostat_backtest(
+        {
+            "account_path": str(tmp_path / "account"),
+            "stock_pool_source": "watchlist",
+            "watchlist_name": "观察",
+            "backtest_date_range": "5m",
+            "end": "20260702",
+        }
+    )
+
+    merged = {key: value for summary in result.summaries for key, value in summary.items()}
+    assert merged["stock_pool_source"] == "watchlist"
+    assert merged["name"] == "观察"
+    assert merged["filtered_count"] == 1
+    assert merged["backtest_date_range"] == "5m"
+    assert merged["start"] == "20260202"
+    assert merged["end"] == "20260702"
+
+
+def test_backtest_handler_rejects_unsupported_candidate_source_without_fallback(monkeypatch) -> None:
+    called = False
+
+    def fake_backtest(**kwargs):
+        nonlocal called
+        called = True
+        return _minimal_backtest_result()
+
+    monkeypatch.setattr(web_app, "backtest_thermostat_strategy", fake_backtest)
+
+    result = web_app.handle_thermostat_backtest(
+        {
+            "stock_pool_source": "ths_lhb",
+            "symbols": "600519",
+            "backtest_date_range": "3m",
+            "end": "20260702",
+        }
+    )
+
+    assert result.title == "股票池错误"
+    assert called is False
+    assert "不支持" in result.summaries[0]["errors"]
+
+
+def test_thermostat_page_keeps_existing_stock_pool_workflow(tmp_path) -> None:
+    store = WatchlistStore(tmp_path / "account")
+    store.create("观察")
+    store.add_symbols("观察", ["600519"])
+
+    html = web_app.render_page(
+        page="thermostat",
+        form={"account_path": str(tmp_path / "account"), "stock_pool_source": "watchlist"},
+    )
+
+    assert 'action="/thermostat-job"' in html
+    assert 'name="stock_pool_source"' in html
+    assert 'data-source-selector="stock_pool_source"' in html
+    assert 'name="watchlist_name"' in html
+    assert "观察" in html
+    assert 'action="/thermostat-backtest"' not in html
+
+
+def test_account_page_keeps_watchlist_management_workflow(tmp_path) -> None:
+    html = web_app.render_page(page="portfolio", form={"path": str(tmp_path / "account")})
+
+    assert "自选组合" in html
+    assert 'action="/watchlist-create"' in html
+    assert 'action="/watchlist-add-symbol"' in html
+    assert 'action="/watchlist-remove-symbol"' in html
+    assert 'action="/watchlist-rename"' in html
+    assert 'action="/watchlist-delete"' in html
+    assert 'name="stock_pool_source"' not in html
+
+
 def test_portfolio_trade_form_is_cleared_after_record() -> None:
     cleaned = web_app._clear_trade_form(
         {
@@ -862,6 +1202,7 @@ def test_web_page_form_state_is_isolated_by_page() -> None:
         "watchlist_name": "观察",
         "stock_pool_source": "watchlist",
         "strategy_date_range": "3m",
+        "backtest_date_range": "3m",
         "cash": "100000",
         "start": "20260101",
         "end": "20260201",
@@ -878,7 +1219,9 @@ def test_web_page_form_state_is_isolated_by_page() -> None:
     assert portfolio["path"] == "data/user/default"
     assert "stock_pool_source" not in portfolio
     assert backtest["symbols"] == "000001"
-    assert "watchlist_name" not in backtest
+    assert backtest["stock_pool_source"] == "watchlist"
+    assert backtest["watchlist_name"] == "观察"
+    assert backtest["backtest_date_range"] == "3m"
 
 
 def test_web_account_path_normalization_prefers_account_path_for_thermostat() -> None:
