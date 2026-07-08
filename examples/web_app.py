@@ -48,14 +48,12 @@ TITLE_LABELS = {
     "Results": "策略结果",
     "Signals": "信号",
     "Errors": "错误",
-    "Full Turtle System": "完整海龟系统",
     "Final Pool": "最终股票池",
     "LHB Ranking": "龙虎榜排名",
     "Holding Advice": "持仓建议",
     "New Buy Signals": "新买入信号",
     "Execution Plan": "手工执行计划",
     "Candidate Evaluation": "候选评估",
-    "Turtle Backtest": "海龟回测",
     "Summary": "摘要",
     "Market Overview": "市场概览",
     "New Buy Candidates": "新买候选",
@@ -578,12 +576,10 @@ OPTION_LABELS = {
     "stage": PROGRESS_STAGE_LABELS,
     "side": {"buy": "买入", "sell": "卖出", "adjust_cost": "调整成本"},
     "strategy": {
-        "ma_cross": "双均线",
-        "turtle": "海龟",
-        "turtle_system": "完整海龟系统",
-        "small_cap": "小市值",
-        "undervalued": "低估价值",
-        "bank_rotation": "银行轮动",
+        "thermostat": "恒温器",
+        "trend_following": "趋势跟随",
+        "grid": "网格策略",
+        "manual": "手动记录",
     },
     "refresh": {"yes": "是", "no": "否", "on": "是"},
     "sync_holdings": {"yes": "是", "no": "否", "on": "是"},
@@ -645,7 +641,7 @@ OPTION_LABELS.update(
 
 
 class WebAppHandler(BaseHTTPRequestHandler):
-    server_version = "StockPickerWeb/1.1.8"
+    server_version = "StockPickerWeb/1.1.9"
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -1394,12 +1390,12 @@ def render_page(
   <header>
     <div>
       <h1>{APP_NAME}</h1>
-      <p>本地海龟系统、回测和手动账户工作台</p>
+      <p>本地恒温器策略、回测和手动账户工作台</p>
     </div>
     <div class="status">本地运行 · {html.escape(datetime.now().strftime("%Y-%m-%d %H:%M"))}</div>
   </header>
   <nav>
-    {nav_link("turtle", "海龟系统", page)}
+    {nav_link("thermostat", "恒温器策略", page)}
     {nav_link("backtest", "回测", page)}
     {nav_link("portfolio", "账户", page)}
   </nav>
@@ -2155,8 +2151,8 @@ def trade_fields(side: str, form: dict[str, str] | None = None) -> str:
             else ""
         )
         + '<details><summary>高级信息</summary><div class="grid">'
-        + input_text("strategy_meta", "策略", "turtle_system", form)
-        + input_text("system", "系统", "S1", form)
+        + input_text("strategy_meta", "策略", "thermostat", form)
+        + input_text("system", "系统", "trend_following", form)
         + input_text(reason, "原因", "", form)
         + input_text("signal_date", "信号日", "", form)
         + input_text("execution_date", "执行日", "", form)
@@ -2319,7 +2315,7 @@ def _resolve_pool_universe(
                 }
             )
     else:
-        raise ValueError(f"未知的海龟股票池模式：{pool_mode}")
+        raise ValueError(f"未知的股票池模式：{pool_mode}")
 
     portfolio = _load_portfolio(_value(form, "account_path", DEFAULT_USER_PATH)) if include_portfolio else None
     if portfolio is not None and not portfolio.positions.empty:

@@ -17,9 +17,9 @@ def test_manual_portfolio_records_buy_sell_and_win_rate(tmp_path) -> None:
         fees=5.0,
         target_sell_price=12.0,
         timestamp="2026-05-28T13:00:00",
-        strategy="turtle_system",
-        system="S1",
-        entry_reason="S1 breakout",
+        strategy="thermostat",
+        system="trend_following",
+        entry_reason="thermostat signal",
         signal_date="2026-05-28",
         execution_date="2026-05-28",
     )
@@ -44,8 +44,8 @@ def test_manual_portfolio_records_buy_sell_and_win_rate(tmp_path) -> None:
     assert summary["win_rate"] == pytest.approx(1.0)
     assert summary["average_holding_days"] == pytest.approx(1.0)
     assert summary["realized_pnl"] > 0
-    assert portfolio.trades.loc[0, "strategy"] == "turtle_system"
-    assert portfolio.trades.loc[1, "system"] == "S1"
+    assert portfolio.trades.loc[0, "strategy"] == "thermostat"
+    assert portfolio.trades.loc[1, "system"] == "trend_following"
     assert portfolio.trades.loc[1, "exit_reason"] == "manual partial take profit"
 
 

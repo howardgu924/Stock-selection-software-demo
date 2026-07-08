@@ -9,7 +9,7 @@ def test_execution_plan_marks_limit_up_and_suggests_alternative() -> None:
     signals = pd.DataFrame(
         [
             {
-                "strategy": "turtle",
+                "strategy": "thermostat",
                 "symbol": "600001.SH",
                 "name": "A",
                 "action": "buy",
@@ -17,7 +17,7 @@ def test_execution_plan_marks_limit_up_and_suggests_alternative() -> None:
                 "rank": 1,
             },
             {
-                "strategy": "turtle",
+                "strategy": "thermostat",
                 "symbol": "600002.SH",
                 "name": "B",
                 "action": "buy",
@@ -65,11 +65,11 @@ def test_limit_pct_uses_board_rules() -> None:
     assert limit_up_price(10.0, 0.10) == 11.0
 
 
-def test_execution_plan_carries_turtle_risk_prices() -> None:
+def test_execution_plan_carries_strategy_risk_prices() -> None:
     signals = pd.DataFrame(
         [
             {
-                "strategy": "turtle_system",
+                "strategy": "thermostat",
                 "symbol": "600001.SH",
                 "name": "A",
                 "action": "buy",
@@ -93,17 +93,17 @@ def test_execution_plan_carries_turtle_risk_prices() -> None:
     assert plan.loc[0, "exit_price"] == 8.5
 
 
-def test_execution_plan_skips_when_turtle_unit_exceeds_cash() -> None:
+def test_execution_plan_skips_when_strategy_size_exceeds_cash() -> None:
     signals = pd.DataFrame(
         [
             {
-                "strategy": "turtle_system",
+                "strategy": "thermostat",
                 "symbol": "600001.SH",
                 "name": "A",
                 "action": "buy",
                 "score": 0.1,
                 "rank": 1,
-                "system": "S1",
+                "system": "trend_following",
                 "suggested_shares": 1000,
             }
         ]
@@ -115,7 +115,7 @@ def test_execution_plan_skips_when_turtle_unit_exceeds_cash() -> None:
     plan = build_execution_plan(signals, quotes, cash=5000.0)
 
     assert plan.loc[0, "recommended_action"] == "skip_insufficient_cash"
-    assert plan.loc[0, "system"] == "S1"
+    assert plan.loc[0, "system"] == "trend_following"
 
 
 def test_execution_plan_accepts_thermostat_buy_and_add_actions() -> None:

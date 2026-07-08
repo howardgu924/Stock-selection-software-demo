@@ -169,7 +169,7 @@ def _plan_row(
         fallback = None
         executable = False
         status = "limit_up" if limit else "normal"
-        reason = "buy signal but cash is insufficient for one lot or requested turtle unit"
+        reason = "buy signal but cash is insufficient for one lot or requested strategy size"
     elif limit:
         recommended = "queue_limit_up"
         fallback = "buy_next_day_below_limit"

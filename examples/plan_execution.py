@@ -13,8 +13,8 @@ from stock_picker.execution import build_execution_plan
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a manual execution plan from strategy signals.")
-    parser.add_argument("--signals", required=True, help="CSV from examples/run_strategy.py")
+    parser = argparse.ArgumentParser(description="Build a manual execution plan from thermostat signals.")
+    parser.add_argument("--signals", required=True, help="CSV exported from thermostat candidate or advice results")
     parser.add_argument("--cash", type=float, required=True, help="Available cash")
     parser.add_argument("--lot-size", type=int, default=100, help="A-share lot size")
     parser.add_argument("--max-positions", type=int, default=1, help="Cash allocation slots")

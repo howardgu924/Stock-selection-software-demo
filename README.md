@@ -55,7 +55,6 @@ The maintained base capabilities are:
   JoinQuant/JQData
 - Select data sources by workflow and configure explicit fallback sources
 - Add local MA5, MA10, MA30, and MACD columns to historical data
-- Screen A-share stocks with configurable technical rules and sorting
 - Normalize output fields
 - Cache stock symbols and historical data in local SQLite
 - Update only missing historical trading dates when local data is partial
@@ -161,194 +160,20 @@ first failure.
 ## 历史兼容
 
 The old CLI strategy commands, old screening engine, and Turtle strategy modules
-are kept for compatibility and reference. The legacy text files that previously
-lived under `strategy/` have been removed from the normal project surface. These
-features are no longer the recommended normal workflow and are not exposed by the
-web app's normal user path.
+have been removed. The legacy text files that previously lived under
+`strategy/` were already removed from the normal project surface.
 
-## Screen Stocks
+## Removed Legacy Strategies
 
-The default stock screen now matches this workflow:
+The old stock-picking paths have been removed from the supported codebase:
+ordinary technical screening, simple moving-average crossover, lightweight
+Turtle breakout, small-cap selection, undervalued value selection, bank
+rotation, and the complete Turtle state machine.
 
-- all A-share stocks with `--all`
-- recent 20-day uptrend
-- close above MA30
-- expanded volume
-- MACD golden cross
-- exclude ST stocks
-- sort by score, percentage change, amount, or volume
-
-List available rules:
-
-```powershell
-.\.venv\Scripts\python.exe examples\screen_stocks.py --list-rules
-```
-
-Test a small batch first:
-
-```powershell
-.\.venv\Scripts\python.exe examples\screen_stocks.py --all --start 20250527 --end 20260527 --limit 100 --top 20 --sort-by pct_chg
-```
-
-Run the full market and export matches:
-
-```powershell
-.\.venv\Scripts\python.exe examples\screen_stocks.py --all --start 20250527 --end 20260527 --sort-by pct_chg --top 50 --output data\screen_uptrend_ma30_volume_macd.csv
-```
-
-Sort by trading amount instead:
-
-```powershell
-.\.venv\Scripts\python.exe examples\screen_stocks.py --all --start 20250527 --end 20260527 --sort-by amount --top 50 --output data\screen_by_amount.csv
-```
-
-Find stocks whose close reached a one-year high in the latest three sessions
-and whose volume stayed elevated for those three sessions:
-
-```powershell
-.\.venv\Scripts\python.exe examples\screen_stocks.py --all --start 20250527 --end 20260527 --rules "close_3d_252d_high,volume_up_3d,exclude_st" --sort-by pct_chg --top 50 --output data\screen_3d_year_high_volume.csv
-```
-
-Use the latest completed trading day for `--end` if the current day's daily bar is not available yet. Keep JQData optional because account permissions may not cover the requested date range.
-
-## Legacy CLI Strategy Lists
-
-The legacy CLI strategy commands are selection or rotation lists, not automatic
-orders or full portfolio backtests. Output columns are:
-
-```text
-strategy, symbol, code, name, date, action, score, rank, weight, reason
-```
-
-Run the turtle breakout strategy for one stock:
-
-```powershell
-.\.venv\Scripts\python.exe examples\run_strategy.py --strategy turtle --symbol 600519 --start 20250527 --end 20260527
-```
-
-Run the small-cap strategy from historical valuation data for a test universe:
-
-```powershell
-.\.venv\Scripts\python.exe examples\run_strategy.py --strategy small_cap --symbols "600519,000001" --as-of 20260527 --top 3 --output data\strategy_small_cap.csv
-```
-
-Available strategies are `ma_cross`, `turtle`, `small_cap`, `undervalued`, and
-`bank_rotation`. The `Dual_Thrust` futures strategy is intentionally not wired
-into this first stock-selection workflow.
-
-`small_cap` and `undervalued` need an explicit stock universe through
-`--symbol`, `--symbols`, or `--all`; they use historical valuation/financial
-data rather than realtime quotes. Start with a small `--symbols` list or
-`--all --limit` before scanning the full market.
-
-Run bank rotation against an explicit bank universe:
-
-```powershell
-.\.venv\Scripts\python.exe examples\run_strategy.py --strategy bank_rotation --symbols "600036,601288,601166,601398,601939,600000,601988,000001,601328,601229,002966" --as-of 20260527 --output data\strategy_bank_rotation.csv
-```
-
-## Backtest Strategies
-
-Backtesting currently supports history-price strategies: `ma_cross` and
-`turtle`, plus `bank_rotation` for an explicit bank universe. It uses daily
-historical bars and historical valuation data, not realtime quotes.
-
-```powershell
-.\.venv\Scripts\python.exe examples\backtest_strategy.py --strategy turtle --symbol 600519 --start 20250527 --end 20260527 --cash 100000 --output data\backtest_turtle_summary.csv --equity-output data\backtest_turtle_equity.csv --trades-output data\backtest_turtle_trades.csv
-```
-
-If cached historical rows exist locally and the online trade calendar is
-temporarily unavailable, the backtest uses the cached rows instead of failing.
-
-Run bank rotation backtests:
-
-```powershell
-.\.venv\Scripts\python.exe examples\backtest_strategy.py --strategy bank_rotation --symbols "600036,601288,601166,601398,601939,600000,601988,000001,601328,601229,002966" --start 20260215 --end 20260527 --cash 100000 --output data\bank_rotation_20260215_20260527_summary.csv --equity-output data\bank_rotation_20260215_20260527_equity.csv --trades-output data\bank_rotation_20260215_20260527_trades.csv
-
-.\.venv\Scripts\python.exe examples\backtest_strategy.py --strategy bank_rotation --symbols "600036,601288,601166,601398,601939,600000,601988,000001,601328,601229,002966" --start 20250613 --end 20250926 --cash 100000 --output data\bank_rotation_20250613_20250926_summary.csv --equity-output data\bank_rotation_20250613_20250926_equity.csv --trades-output data\bank_rotation_20250613_20250926_trades.csv
-```
-
-Run turtle as a portfolio strategy over a stock universe. The backtest checks
-each stock daily, sells positions that break the 10-day exit low, then buys the
-strongest 20-day breakouts up to `--max-positions`.
-
-```powershell
-.\.venv\Scripts\python.exe examples\backtest_strategy.py --strategy turtle --symbols "600519,000001,600036" --start 20250613 --end 20250926 --cash 100000 --max-positions 3 --output data\turtle_portfolio_summary.csv --equity-output data\turtle_portfolio_equity.csv --trades-output data\turtle_portfolio_trades.csv
-```
-
-The default execution timing is conservative for daily-bar strategies:
-
-```text
---execution-timing next_open
-```
-
-This means a signal is generated after the current daily close and executed at
-the next trading day's open. For intraday turtle experiments, use midday
-signals and afternoon open execution:
-
-```powershell
-.\.venv\Scripts\python.exe examples\backtest_strategy.py --strategy turtle --symbols "600519,000001,600036" --start 20260520 --end 20260527 --cash 100000 --max-positions 3 --execution-timing same_day_pm_open --minute-source akshare --warmup-days 60 --output data\turtle_midday_summary.csv --equity-output data\turtle_midday_equity.csv --trades-output data\turtle_midday_trades.csv
-```
-
-`same_day_pm_open` uses morning minute bars through 11:30 to synthesize the
-signal bar, then executes at the first available afternoon minute-bar open.
-`--warmup-days` reads earlier daily bars only for channel/indicator state; the
-equity curve and performance summary still start at `--start`.
-
-## Full Turtle System
-
-`examples/run_strategy.py --strategy turtle` remains a lightweight 20-day
-breakout signal list. For the complete Turtle Trading state machine, use
-`examples/run_turtle_system.py` and `examples/backtest_turtle_system.py`.
-
-The full turtle system supports S1 `20/10` and S2 `55/20`, ATR/N based unit
-sizing, A-share 100-share lots, `0.5N` pyramiding up to four units, `2N` hard
-stops, channel exits, and the S1 profitable-exit skip rule. It is long-only
-and designed for manual A-share execution assistance.
-
-Run current/as-of signals and an execution plan:
-
-```powershell
-.\.venv\Scripts\python.exe examples\run_turtle_system.py --symbols "600519,000001,600036" --cash 5000 --as-of 20260528 --signals-output data\turtle_system_signals.csv --plan-output data\turtle_system_plan.csv
-```
-
-Run a state-machine backtest:
-
-```powershell
-.\.venv\Scripts\python.exe examples\backtest_turtle_system.py --symbols "600519,000001,600036" --start 20260228 --end 20260527 --cash 100000 --output data\turtle_system_summary.csv --equity-output data\turtle_system_equity.csv --trades-output data\turtle_system_trades.csv --positions-output data\turtle_system_positions.csv --drawdowns-output data\turtle_system_drawdowns.csv --symbol-pnl-output data\turtle_system_symbol_pnl.csv
-```
-
-Run a simple robustness sweep:
-
-```powershell
-.\.venv\Scripts\python.exe examples\backtest_turtle_system.py --symbols "600519,000001,600036" --start 20260228 --end 20260527 --cash 100000 --sweep-risk-pct "0.005,0.01,0.02" --sweep-slippage-rate "0,0.002" --sweep-s1-entry "20,25" --sweep-output data\turtle_system_sweep.csv
-```
-
-## Plan Manual Execution
-
-Strategy signals are not always executable. For example, a stock can break out
-and close at its limit-up price, but a manual trader may not be able to buy it.
-Use the execution planner to combine strategy output with realtime quotes:
-
-```powershell
-.\.venv\Scripts\python.exe examples\plan_execution.py --signals data\strategy_turtle.csv --cash 5000 --next-day-premium 0.02 --output data\execution_plan.csv
-```
-
-The planner identifies limit-up buy signals and returns multiple options:
-
-- `buy_now`: executable under the current quote, cash, volume limit, and lot
-  rules.
-- `queue_limit_up`: buy signal exists but the stock is at limit-up; queue only
-  if you accept uncertain fill.
-- `buy_next_day_below_limit`: fallback plan for a limit-up signal; buy next day
-  only below the generated `next_day_max_price`.
-- `switch_alternative`: fallback to the best executable alternative signal.
-- `skip_insufficient_cash`: signal exists but cash is not enough for one lot.
-- `skip_volume_limit`: suggested shares exceed the configured quote-volume
-  participation cap.
-
-Limit-up rules are approximate and board-aware: main board `10%`, STAR/ChiNext
-`20%`, Beijing-style codes `30%`, and ST names `5%`.
+Use the local web app's thermostat strategy and thermostat backtest workflow for
+normal stock-pool evaluation. Market data fetching, realtime quotes, account
+management, watchlists, Longhu Bang pools, and report downloads remain
+supported.
 
 ## Manual Portfolio Journal
 
@@ -366,14 +191,14 @@ Initialize an account:
 Record a buy:
 
 ```powershell
-.\.venv\Scripts\python.exe examples\portfolio_journal.py buy --symbol 600172 --name "Huanghe Xuanfeng" --price 14.60 --shares 300 --target-sell-price 16.00 --strategy turtle_system --system S1 --entry-reason "20-day breakout" --signal-date 2026-05-28 --execution-date 2026-05-28
+.\.venv\Scripts\python.exe examples\portfolio_journal.py buy --symbol 600172 --name "Huanghe Xuanfeng" --price 14.60 --shares 300 --target-sell-price 16.00 --strategy thermostat --system trend_following --entry-reason "thermostat signal" --signal-date 2026-05-28 --execution-date 2026-05-28
 ```
 
 Record a buy from an execution plan while still confirming actual price and
 shares manually:
 
 ```powershell
-.\.venv\Scripts\python.exe examples\portfolio_journal.py buy --from-plan data\turtle_system_plan.csv --symbol 600172 --price 14.60 --shares 300
+.\.venv\Scripts\python.exe examples\portfolio_journal.py buy --symbol 600172 --price 14.60 --shares 300 --strategy thermostat
 ```
 
 Record a sell:
@@ -420,10 +245,10 @@ Then open:
 http://127.0.0.1:8765
 ```
 
-The web app wraps the existing Python modules. It can run strategy lists, run
-the full Turtle system and execution plan, run Turtle state-machine backtests,
-and record manual portfolio buys/sells. It is local-only; account files still
-live under `data/user/default` unless you choose another path in the page.
+The web app wraps the existing Python modules. It can run the thermostat
+strategy, run thermostat backtests, manage watchlists, and record manual
+portfolio buys/sells. It is local-only; account files still live under
+`data/user/default` unless you choose another path in the page.
 
 ## Check Realtime Quotes
 
