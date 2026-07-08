@@ -380,6 +380,105 @@ INTEGER_DISPLAY_COLUMNS = {
     "max_drawdown_days",
 }
 
+MONEY_DISPLAY_COLUMNS = {
+    "account_cash",
+    "avg_cost",
+    "cash",
+    "cash_after",
+    "cash_before",
+    "cash_end",
+    "cash_start",
+    "close",
+    "end_value",
+    "entry_price",
+    "estimated_cost",
+    "execution_price",
+    "exit_price",
+    "fees",
+    "final_value",
+    "gross_amount",
+    "initial_cash",
+    "last_entry_price",
+    "limit_up_price",
+    "mark_price",
+    "market_value",
+    "min_commission",
+    "net_amount",
+    "next_add_price",
+    "next_day_max_price",
+    "position_value",
+    "position_value_end",
+    "position_value_start",
+    "prev_close",
+    "price",
+    "principal",
+    "realized_pnl",
+    "reference_price",
+    "s1_breakout_price",
+    "s2_breakout_price",
+    "start_value",
+    "stop_price",
+    "suggested_price",
+    "target_price",
+    "target_sell_price",
+    "tax",
+    "total_asset",
+    "total_commission",
+    "total_pnl",
+    "total_slippage_cost",
+    "total_value",
+    "total_value_end",
+    "total_value_start",
+    "unrealized_pnl",
+}
+
+PERCENT_DISPLAY_COLUMNS = {
+    "annualized_return",
+    "annualized_excess_return",
+    "annualized_volatility",
+    "benchmark_return",
+    "cash_ratio",
+    "daily_return",
+    "drawdown",
+    "excess_return",
+    "limit_pct",
+    "position_utilization",
+    "realized_pnl_pct",
+    "return",
+    "risk_pct",
+    "slippage_rate",
+    "suggested_position_pct",
+    "total_return",
+    "volume_limit_pct",
+    "weight",
+    "win_rate",
+}
+
+DEFAULT_HIDDEN_COLUMNS = {
+    "signal_time",
+    "order_status",
+    "slippage_cost",
+    "shares_after",
+}
+
+TABLE_HIDDEN_COLUMNS = {
+    "Trades": DEFAULT_HIDDEN_COLUMNS | {"execution_status"},
+    "交易流水": DEFAULT_HIDDEN_COLUMNS | {"execution_status"},
+}
+
+STOCK_LEVEL_TABLES = {
+    "Trades",
+    "Positions",
+    "Symbol Performance",
+    "Data Quality",
+    "New Buy Candidates",
+    "Holding Advice",
+    "Grid Advice",
+    "Trend Advice",
+    "Backtest Pool",
+    "Backtest Candidate Difference",
+}
+
 OPTION_LABELS = {
     "pool_mode": {
         "manual": "手动输入",
@@ -546,7 +645,7 @@ OPTION_LABELS.update(
 
 
 class WebAppHandler(BaseHTTPRequestHandler):
-    server_version = "StockPickerWeb/1.1.6"
+    server_version = "StockPickerWeb/1.1.8"
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -929,9 +1028,14 @@ def _run_thermostat_job(job_id: str) -> None:
 def _run_thermostat_backtest_job(job_id: str) -> None:
     job = JOBS[job_id]
     try:
-        job.update({"stage": "run_backtest", "completed": 0, "total": 1, "node": "正在运行恒温器回测"})
+        symbols = _symbols(job.form)
+        total_symbols = max(len(symbols), 1)
+        job.update({"stage": "prepare_backtest", "completed": 0, "total": total_symbols, "node": "准备回测参数"})
+        job.update({"stage": "load_backtest_data", "completed": total_symbols, "total": total_symbols, "node": "加载回测数据"})
+        job.update({"stage": "simulate_trades", "completed": 0, "total": total_symbols, "node": "模拟交易"})
         result = handle_thermostat_backtest(job.form)
-        job.update({"stage": "run_backtest", "completed": 1, "total": 1, "node": "正在整理回测结果"})
+        job.update({"stage": "prepare_result_tables", "completed": total_symbols, "total": total_symbols, "node": "整理回测结果表"})
+        job.update({"stage": "prepare_report", "completed": total_symbols, "total": total_symbols, "node": "准备报告下载"})
         job.complete(result)
     except Exception as exc:  # pragma: no cover - defensive live-web path
         job.fail(exc)
@@ -1552,13 +1656,37 @@ def render_message(result: RenderResult | None, error: str | None) -> str:
         return f'<section class="message error"><strong>错误</strong><p>{html.escape(_translate_text(error))}</p></section>'
     if result is None:
         return ""
-    parts = [f'<section class="message"><h2>{html.escape(_display_title(result.title))}</h2>']
+    display_title = _display_title(result.title)
+    is_backtest = "回测" in display_title
+    parts = [f'<section class="message"><h2>{html.escape(display_title)}</h2>']
     for summary in result.summaries:
-        parts.append(render_summary(summary))
+        summary_html = render_summary(summary)
+        if is_backtest:
+            parts.append(f'<section class="result-section result-section-summary"><h3>回测摘要</h3>{summary_html}</section>')
+        else:
+            parts.append(summary_html)
     for table in result.tables:
-        parts.append(render_table(table.title, table.frame))
+        if is_backtest:
+            title = _display_title(table.title)
+            row_count = 0 if table.frame is None else len(table.frame)
+            body = render_table(table.title, table.frame, include_title=False)
+            open_attr = " open" if table.title in {"Summary", "Trades", "Positions"} else ""
+            parts.append(
+                f'<details class="result-section result-section-table"{open_attr}>'
+                f"<summary>{html.escape(title)} <span>{row_count} 行</span></summary>{body}</details>"
+            )
+        else:
+            parts.append(render_table(table.title, table.frame))
     if result.extra_html:
-        parts.append(result.extra_html)
+        if is_backtest:
+            parts.append(
+                '<section class="result-section result-section-report">'
+                '<h3>报告下载</h3>'
+                f'<div class="report-entry report-entry-available">{result.extra_html}</div>'
+                "</section>"
+            )
+        else:
+            parts.append(result.extra_html)
     parts.append("</section>")
     return "\n".join(parts)
 
@@ -1571,18 +1699,26 @@ def render_summary(values: dict[str, object]) -> str:
     return f'<dl class="summary">{"".join(rows)}</dl>'
 
 
-def render_table(title: str, frame: pd.DataFrame) -> str:
+def render_table(title: str, frame: pd.DataFrame, *, include_title: bool = True) -> str:
+    display_title = _display_title(title)
     if frame is None or frame.empty:
-        return f"<h3>{html.escape(_display_title(title))}</h3><p class=\"muted\">暂无数据。</p>"
+        heading = f"<h3>{html.escape(display_title)}</h3>" if include_title else ""
+        return f'{heading}<p class="muted">暂无数据。</p>'
     data = frame.copy()
     if len(data) > 200:
         data = data.tail(200)
     data = data.replace({pd.NA: ""}).fillna("")
-    data = _localize_frame(data)
-    table = data.to_html(index=False, escape=True, classes="data-table", border=0)
+    data = _localize_frame(data, title=title)
+    if data.empty or not list(data.columns):
+        heading = f"<h3>{html.escape(display_title)}</h3>" if include_title else ""
+        return f'{heading}<p class="muted">暂无数据。</p>'
+    table = data.to_html(index=False, escape=True, classes="data-table sticky-table", border=0)
+    table = table.replace('class="dataframe data-table sticky-table"', 'class="data-table sticky-table"')
+    wrap_class = "table-wrap table-wrap-scroll" if len(frame) >= 50 or len(data.columns) >= 8 else "table-wrap"
+    heading = f"<h3>{html.escape(display_title)} <span>{len(frame)} 行</span></h3>" if include_title else ""
     return (
-        f"<h3>{html.escape(_display_title(title))} <span>{len(frame)} 行</span></h3>"
-        f'<div class="table-wrap">{table}</div>'
+        f"{heading}"
+        f'<div class="{wrap_class}">{table}</div>'
     )
 
 
@@ -1675,7 +1811,7 @@ def render_valuation_refresher(form: dict[str, str]) -> str:
 
 def _format_metric(value: object) -> str:
     if isinstance(value, float):
-        return f"{value:.4f}"
+        return f"{value:.2f}"
     return str(value)
 
 
@@ -1687,7 +1823,7 @@ def _display_title(title: str) -> str:
         return f"策略运行：{_display_value('strategy', strategy)}"
     if _contains_cjk(title):
         return title
-    return f"未翻译字段：{title}"
+    return "结果"
 
 
 def _display_label(key: str) -> str:
@@ -1707,15 +1843,25 @@ def _contains_cjk(text: str) -> bool:
 def _display_value(key: str, value: object) -> str:
     if value is None or pd.isna(value):
         return ""
+    if isinstance(value, bool):
+        return "是" if value else "否"
     if key in INTEGER_DISPLAY_COLUMNS:
         try:
             return str(int(float(value)))
         except (TypeError, ValueError):
             return str(value)
+    if key in MONEY_DISPLAY_COLUMNS:
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return str(value)
+    if key in PERCENT_DISPLAY_COLUMNS:
+        try:
+            return f"{float(value):.2%}"
+        except (TypeError, ValueError):
+            return str(value)
     if isinstance(value, float):
         return f"{value:.6f}"
-    if isinstance(value, bool):
-        return "是" if value else "否"
     text = str(value)
     if key in OPTION_LABELS and text in OPTION_LABELS[key]:
         return OPTION_LABELS[key][text]
@@ -1726,11 +1872,37 @@ def _display_value(key: str, value: object) -> str:
     return text
 
 
-def _localize_frame(frame: pd.DataFrame) -> pd.DataFrame:
+def _localize_frame(frame: pd.DataFrame, *, title: str = "") -> pd.DataFrame:
     data = frame.copy()
+    data = _with_stock_name_column(data, title)
+    visible = [column for column in data.columns if _is_display_column_visible(str(column), title)]
+    data = data[visible]
     for column in list(data.columns):
         data[column] = data[column].map(lambda value, key=column: _display_value(key, value))
     return data.rename(columns={column: _display_label(str(column)) for column in data.columns})
+
+
+def _with_stock_name_column(frame: pd.DataFrame, title: str) -> pd.DataFrame:
+    if title not in STOCK_LEVEL_TABLES or "name" in frame.columns:
+        return frame
+    symbol_column = "symbol" if "symbol" in frame.columns else "code" if "code" in frame.columns else ""
+    if not symbol_column:
+        return frame
+    data = frame.copy()
+    insert_at = list(data.columns).index(symbol_column) + 1
+    data.insert(insert_at, "name", "未知")
+    return data
+
+
+def _is_display_column_visible(column: str, title: str) -> bool:
+    hidden = TABLE_HIDDEN_COLUMNS.get(title, DEFAULT_HIDDEN_COLUMNS)
+    if column in hidden:
+        return False
+    if column in COLUMN_LABELS:
+        return True
+    if column.isdigit() or _contains_cjk(column):
+        return True
+    return False
 
 
 def _translate_text(text: str) -> str:
@@ -2921,6 +3093,10 @@ button {
   border: 1px solid var(--line);
   border-radius: 6px;
 }
+.table-wrap-scroll {
+  max-height: 520px;
+  overflow: auto;
+}
 .data-table {
   width: 100%;
   min-width: max-content;
@@ -2935,6 +3111,9 @@ button {
   white-space: nowrap;
 }
 .data-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   background: #f2f5f8;
 }
 h3 span { color: var(--muted); font-weight: 400; }

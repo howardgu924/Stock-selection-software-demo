@@ -17,6 +17,11 @@ def _assert_no_mojibake(text: str, *, context: str) -> None:
     assert not found, f"{context} contains mojibake markers: {found}"
 
 
+def _assert_no_raw_internal_fields(text: str, fields: tuple[str, ...]) -> None:
+    leaked = [field for field in fields if field in text]
+    assert not leaked, f"rendered output leaked internal fields: {leaked}"
+
+
 def _history(symbol: str, closes: list[float]) -> pd.DataFrame:
     dates = pd.date_range("2026-04-01", periods=len(closes), freq="D")
     return pd.DataFrame(
@@ -67,6 +72,61 @@ def _minimal_backtest_result() -> SimpleNamespace:
         symbol_performance=pd.DataFrame(),
         data_quality=pd.DataFrame(),
         parameters=pd.DataFrame(),
+    )
+
+
+def _readability_backtest_result() -> web_app.RenderResult:
+    return web_app.RenderResult(
+        "恒温器回测诊断",
+        summaries=[
+            {
+                "backtest_type": "event_driven",
+                "initial_cash": 100000.0,
+                "final_value": 100234.567,
+                "total_return": 0.012345,
+            }
+        ],
+        tables=[
+            web_app.TableBlock(
+                "Trades",
+                pd.DataFrame(
+                    [
+                        {
+                            "symbol": "600519.SH",
+                            "name": "贵州茅台",
+                            "date": "2026-07-01",
+                            "signal_time": "09:30",
+                            "order_status": "filled",
+                            "slippage_cost": 1.234,
+                            "shares_after": 100,
+                            "position_after": 100,
+                            "price": 123.456,
+                            "net_amount": 12345.678,
+                        }
+                    ]
+                ),
+            ),
+            web_app.TableBlock(
+                "Daily Portfolio",
+                pd.DataFrame(
+                    [
+                        {
+                            "date": "2026-07-01",
+                            "total_value": 100234.567,
+                            "cash": 87654.321,
+                            "shares": 100,
+                            "daily_return": 0.012345,
+                        }
+                    ]
+                    * 55
+                ),
+            ),
+            web_app.TableBlock(
+                "Data Quality",
+                pd.DataFrame(),
+            ),
+        ],
+        extra_html='<a href="/reports/demo.xlsx">下载 Excel 报告</a>',
     )
 
 
@@ -701,12 +761,103 @@ def test_web_result_rendering_localizes_titles_columns_and_values() -> None:
         assert forbidden not in html
 
 
-def test_web_rendering_marks_unknown_user_visible_fields() -> None:
+def test_web_rendering_hides_unknown_user_visible_fields() -> None:
     html = web_app.render_table("Unknown Result", pd.DataFrame([{"unmapped_field": "abc"}]))
 
-    assert "未翻译字段：Unknown Result" in html
-    assert "未翻译字段：unmapped_field" in html
-    assert ">unmapped_field<" not in html
+    assert "未翻译字段" not in html
+    assert "unmapped_field" not in html
+    assert "abc" not in html
+
+
+def test_backtest_result_rendering_groups_sections_and_report_entry() -> None:
+    html = web_app.render_message(_readability_backtest_result(), None)
+
+    assert 'class="result-section result-section-summary"' in html
+    assert 'class="result-section result-section-table"' in html
+    assert 'class="report-entry report-entry-available"' in html
+    assert "<summary>交易流水" in html
+    assert "<summary>每日账户" in html
+    assert "暂无数据。" in html
+    assert "下载 Excel 报告" in html
+
+
+def test_backtest_transaction_flow_hides_internal_fields_and_shows_stock_name() -> None:
+    html = web_app.render_table("Trades", _readability_backtest_result().tables[0].frame)
+
+    assert "股票" in html
+    assert "名称" in html
+    assert "贵州茅台" in html
+    _assert_no_raw_internal_fields(html, ("signal_time", "order_status", "slippage_cost", "shares_after"))
+    assert "filled" not in html
+    assert "09:30" not in html
+
+
+def test_backtest_result_money_values_use_two_decimals_without_mutating_other_types() -> None:
+    html = web_app.render_message(_readability_backtest_result(), None)
+
+    assert "100000.00" in html
+    assert "100234.57" in html
+    assert "123.46" in html
+    assert "12345.68" in html
+    assert "87,654.32" not in html
+    assert "123.456000" not in html
+    assert "2026-07-01" in html
+    assert ">100<" in html
+    assert "600519.SH" in html
+
+
+def test_backtest_result_tables_keep_headers_visible_for_large_outputs() -> None:
+    html = web_app.render_table("Daily Portfolio", _readability_backtest_result().tables[1].frame)
+
+    assert 'class="table-wrap table-wrap-scroll"' in html
+    assert 'class="data-table sticky-table"' in html
+    assert "position: sticky" in web_app.CSS
+
+
+def test_backtest_job_runner_emits_non_binary_progress_stages(monkeypatch) -> None:
+    events: list[dict[str, object]] = []
+
+    class FakeJob:
+        form = {"symbols": "600001,600002", "start": "20260701", "end": "20260703"}
+
+        def update(self, event: dict[str, object]) -> None:
+            events.append(event)
+
+        def complete(self, result: web_app.RenderResult) -> None:
+            events.append({"stage": "done"})
+
+        def fail(self, exc: Exception) -> None:
+            raise exc
+
+    monkeypatch.setitem(web_app.JOBS, "backtest-progress", FakeJob())
+    monkeypatch.setattr(web_app, "handle_thermostat_backtest", lambda form: _readability_backtest_result())
+
+    web_app._run_thermostat_backtest_job("backtest-progress")
+
+    stages = [event.get("stage") for event in events]
+    assert stages[:5] == [
+        "prepare_backtest",
+        "load_backtest_data",
+        "simulate_trades",
+        "prepare_result_tables",
+        "prepare_report",
+    ]
+    assert all(event.get("total", 0) != 1 for event in events if event.get("stage") != "done")
+    assert any(event.get("completed") == 2 and event.get("total") == 2 for event in events)
+
+
+def test_backtest_result_display_formatting_does_not_mutate_raw_values() -> None:
+    result = _readability_backtest_result()
+    raw_summary_value = result.summaries[0]["final_value"]
+    raw_trade_price = result.tables[0].frame.loc[0, "price"]
+    raw_daily_value = result.tables[1].frame.loc[0, "total_value"]
+
+    html = web_app.render_message(result, None)
+
+    assert "100234.57" in html
+    assert result.summaries[0]["final_value"] == raw_summary_value
+    assert result.tables[0].frame.loc[0, "price"] == raw_trade_price
+    assert result.tables[1].frame.loc[0, "total_value"] == raw_daily_value
 
 
 def test_web_cash_shortfall_wording_distinguishes_suggested_position_from_account_cash() -> None:
