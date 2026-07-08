@@ -11,13 +11,6 @@ def _assert_no_mojibake(text: str, *, context: str) -> None:
     assert not found, f"{context} contains mojibake markers: {found}"
 
 
-def test_spec_plan_tasks_are_readable_chinese() -> None:
-    for path in [Path("spec.md"), Path("plan.md"), Path("tasks.md")]:
-        text = path.read_text(encoding="utf-8")
-        _assert_no_mojibake(text, context=str(path))
-        assert "恒温器" in text
-
-
 def test_readme_recommends_thermostat_as_normal_path() -> None:
     text = Path("README.md").read_text(encoding="utf-8")
     normal = text.split("## 历史兼容", 1)[0]

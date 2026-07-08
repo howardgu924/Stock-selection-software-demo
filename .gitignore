@@ -11,3 +11,12 @@ data/*.csv
 data/*.txt
 data/user/
 .tools/
+
+# Local Codex / Spec Kit planning artifacts.
+.agents/
+.specify/
+specs/
+AGENTS.md
+/spec.md
+/plan.md
+/tasks.md
