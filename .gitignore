@@ -13,6 +13,7 @@ data/*.txt
 data/reports/
 data/user/
 .tools/
+.worktrees/
 
 # Local Codex / Spec Kit planning artifacts.
 .agents/
