@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest_tmp/
 .test_tmp/
 .tmp/
 .venv/
@@ -9,6 +10,7 @@ data/*.sqlite3
 data/*.db
 data/*.csv
 data/*.txt
+data/reports/
 data/user/
 .tools/
 

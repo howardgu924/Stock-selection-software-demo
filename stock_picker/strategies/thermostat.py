@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import sqrt
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 
@@ -23,7 +23,50 @@ DEFAULT_MARKET_BENCHMARKS = [
 RISK_ANCHOR_INDEX = "000300.SH"
 RISK_ANCHOR_COMPONENTS = ["000300.SH", "000852.SH", "399006.SZ"]
 
-REQUIRED_ADVICE_COLUMNS = [
+STOCK_MODES = ("trend", "range", "downtrend", "chaotic", "insufficient_data")
+MARKET_POSITION_DISCOUNTS = {
+    "strong": 1.0,
+    "normal": 0.9,
+    "weak": 0.7,
+    "extreme_weak": 0.5,
+}
+PENDING_SELL_LEVELS = ("", "pending_reduce", "pending_exit", "pending_emergency_exit")
+TRIGGER_TYPES = (
+    "trend_buy",
+    "trend_reduce",
+    "trend_exit",
+    "grid_buy",
+    "grid_sell",
+    "risk_control_sell",
+)
+REQUIRED_TRIGGER_PLAN_COLUMNS = [
+    "stock_mode",
+    "market_regime_normalized",
+    "market_position_discount",
+    "boll_upper",
+    "boll_mid",
+    "boll_lower",
+    "atr20",
+    "trend_buy_trigger",
+    "trend_reduce_trigger",
+    "trend_exit_trigger",
+    "trend_batches",
+    "grid_buy_levels",
+    "grid_sell_levels",
+    "grid_total_max_position_pct",
+    "target_position_pct",
+    "max_position_pct",
+    "available_shares",
+    "today_bought_shares",
+    "total_shares",
+    "share_split_source",
+    "pending_sell_level",
+    "trigger_status",
+    "filled_status",
+    "failed_reason",
+]
+
+LEGACY_ADVICE_COLUMNS = [
     "symbol",
     "code",
     "name",
@@ -53,25 +96,68 @@ REQUIRED_ADVICE_COLUMNS = [
     "executable",
     "data_sufficient",
 ]
+REQUIRED_ADVICE_COLUMNS = LEGACY_ADVICE_COLUMNS + [
+    column for column in REQUIRED_TRIGGER_PLAN_COLUMNS if column not in LEGACY_ADVICE_COLUMNS
+]
+TRIGGER_PLAN_OUTPUT_COLUMNS = [
+    "symbol",
+    "code",
+    "name",
+    "date",
+    "market_regime",
+    "market_regime_normalized",
+    "market_position_discount",
+    "stock_regime",
+    "stock_mode",
+    "reference_price",
+    "boll_upper",
+    "boll_mid",
+    "boll_lower",
+    "atr20",
+    "trend_buy_trigger",
+    "trend_reduce_trigger",
+    "trend_exit_trigger",
+    "trend_batches",
+    "grid_lower",
+    "grid_mid",
+    "grid_upper",
+    "grid_max_layers",
+    "grid_buy_levels",
+    "grid_sell_levels",
+    "grid_total_max_position_pct",
+    "target_position_pct",
+    "max_position_pct",
+    "available_shares",
+    "today_bought_shares",
+    "total_shares",
+    "share_split_source",
+    "pending_sell_level",
+    "trigger_status",
+    "filled_status",
+    "failed_reason",
+    "risk_note",
+    "reason",
+    "data_sufficient",
+]
 
 
 @dataclass
 class ThermostatResult:
     market_overview: pd.DataFrame
-    holding_advice: pd.DataFrame
-    new_candidates: pd.DataFrame
-    grid_advice: pd.DataFrame
-    trend_advice: pd.DataFrame
     errors: pd.DataFrame
+    trigger_plan: pd.DataFrame
+    # Deprecated compatibility attributes; main output is trigger_plan.
+    holding_advice: pd.DataFrame = field(default_factory=pd.DataFrame)
+    new_candidates: pd.DataFrame = field(default_factory=pd.DataFrame)
+    grid_advice: pd.DataFrame = field(default_factory=pd.DataFrame)
+    trend_advice: pd.DataFrame = field(default_factory=pd.DataFrame)
+    _deprecated_signal_rows: pd.DataFrame = field(default_factory=pd.DataFrame, repr=False)
 
     @property
     def tables(self) -> dict[str, pd.DataFrame]:
         return {
             "market_overview": self.market_overview,
-            "holding_advice": self.holding_advice,
-            "new_candidates": self.new_candidates,
-            "grid_advice": self.grid_advice,
-            "trend_advice": self.trend_advice,
+            "trigger_plan": self.trigger_plan,
             "errors": self.errors,
         }
 
@@ -317,17 +403,12 @@ def evaluate_thermostat(
     all_rows = _apply_grid_limits(candidate_rows + holding_rows, market_regime, market)
     candidate_rows = [row for row in all_rows if row["symbol"] not in holding_symbols]
     holding_rows = [row for row in all_rows if row["symbol"] in holding_symbols]
-    holding_advice = _advice_frame(holding_rows)
-    new_candidates = _advice_frame([row for row in candidate_rows if row["action"] in {"buy", "add", "observe", "wait_confirm", "blocked"}])
-    grid_advice = _advice_frame([row for row in all_rows if row["strategy_family"] == "grid"])
-    trend_advice = _advice_frame([row for row in all_rows if row["strategy_family"] == "trend_following"])
+    trigger_plan = _trigger_plan_frame(all_rows)
     return ThermostatResult(
         market_overview=overview,
-        holding_advice=holding_advice,
-        new_candidates=new_candidates,
-        grid_advice=grid_advice,
-        trend_advice=trend_advice,
         errors=pd.DataFrame(columns=["symbol", "error"]),
+        trigger_plan=trigger_plan,
+        _deprecated_signal_rows=_advice_frame(all_rows),
     )
 
 
@@ -409,11 +490,8 @@ def backtest_thermostat_strategy(
             cash=context.cash,
             as_of=context.date,
         )
-        rows = []
-        for frame in [thermostat.new_candidates, thermostat.grid_advice, thermostat.trend_advice]:
-            if frame is None or frame.empty:
-                continue
-            rows.extend(frame.to_dict("records"))
+        signal_frame = getattr(thermostat, "_deprecated_signal_rows", pd.DataFrame())
+        rows = [] if signal_frame is None or signal_frame.empty else signal_frame.to_dict("records")
         signals: list[Signal] = []
         seen: set[tuple[str, str]] = set()
         for row in rows:
@@ -606,6 +684,7 @@ def _advice_row(
         "executable": False,
         "data_sufficient": data_sufficient,
     }
+    row.update(_trigger_plan_fields(item, prepared, stock_regime, market_regime, date, is_holding, last))
     if not data_sufficient:
         row.update(
             {
@@ -628,6 +707,8 @@ def _advice_row(
                 "executable": is_holding,
             }
         )
+        if int(row.get("today_bought_shares") or 0) > 0 and int(row.get("available_shares") or 0) <= 0:
+            row["pending_sell_level"] = "pending_exit"
         return row
     if stock_regime == "range":
         grid = _grid_prices(prepared)
@@ -740,6 +821,392 @@ def _advice_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=REQUIRED_ADVICE_COLUMNS)
     return pd.DataFrame(rows).reindex(columns=REQUIRED_ADVICE_COLUMNS)
+
+
+def _trigger_plan_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=TRIGGER_PLAN_OUTPUT_COLUMNS)
+    frame = pd.DataFrame(rows)
+    if "stock_mode" in frame and "grid_max_layers" in frame:
+        range_mask = frame["stock_mode"] == "range"
+        frame.loc[range_mask, "grid_max_layers"] = 3
+    return frame.reindex(columns=TRIGGER_PLAN_OUTPUT_COLUMNS)
+
+
+def _trigger_plan_fields(
+    item: dict[str, object],
+    history: pd.DataFrame,
+    stock_regime: str,
+    market_regime: str,
+    date: str,
+    is_holding: bool,
+    last: float | None,
+) -> dict[str, object]:
+    stock_mode = _stock_mode(stock_regime)
+    market_bucket = _market_bucket(market_regime)
+    discount = MARKET_POSITION_DISCOUNTS[market_bucket]
+    available, today_bought, total, split_source = _share_split(item, date, is_holding)
+    fields: dict[str, object] = {
+        "stock_mode": stock_mode,
+        "market_regime_normalized": market_bucket,
+        "market_position_discount": discount,
+        "boll_upper": None,
+        "boll_mid": None,
+        "boll_lower": None,
+        "atr20": None,
+        "trend_buy_trigger": "",
+        "trend_reduce_trigger": "",
+        "trend_exit_trigger": "",
+        "trend_batches": "",
+        "grid_buy_levels": "",
+        "grid_sell_levels": "",
+        "grid_total_max_position_pct": 0.0,
+        "target_position_pct": 0.0,
+        "max_position_pct": 0.0,
+        "available_shares": available,
+        "today_bought_shares": today_bought,
+        "total_shares": total,
+        "share_split_source": split_source,
+        "pending_sell_level": "",
+        "trigger_status": "not_applicable",
+        "filled_status": "not_checked",
+        "failed_reason": "",
+    }
+    if stock_mode == "insufficient_data":
+        fields["filled_status"] = "not_applicable"
+        return fields
+    indicators = _trigger_indicators(history)
+    fields.update(
+        {
+            "boll_upper": indicators["boll_upper"],
+            "boll_mid": indicators["boll_mid"],
+            "boll_lower": indicators["boll_lower"],
+            "atr20": indicators["atr20"],
+        }
+    )
+    if stock_mode == "trend":
+        upper = indicators["boll_upper"]
+        mid = indicators["boll_mid"]
+        lower = indicators["boll_lower"]
+        atr20 = indicators["atr20"]
+        close = last or indicators["close"]
+        buffer = _trend_breakout_buffer(atr20, close)
+        target_pct = round(0.20 * discount, 6)
+        fields.update(
+            {
+                "trend_buy_trigger": _round_price((upper + buffer) if upper is not None and buffer is not None else None),
+                "trend_reduce_trigger": mid,
+                "trend_exit_trigger": _trend_exit_trigger(lower, atr20, close),
+                "trend_batches": "40%,35%,25%",
+                "target_position_pct": target_pct,
+                "max_position_pct": target_pct,
+                "trigger_status": "planned",
+            }
+        )
+    elif stock_mode == "range":
+        grid = _grid_trigger_levels(indicators)
+        target_pct = round(0.15 * discount, 6)
+        fields.update(
+            {
+                "grid_buy_levels": _format_levels(grid["buy"]),
+                "grid_sell_levels": _format_levels(grid["sell"]),
+                "grid_total_max_position_pct": 0.40,
+                "target_position_pct": target_pct,
+                "max_position_pct": target_pct,
+                "trigger_status": "planned",
+            }
+        )
+    elif stock_mode == "downtrend":
+        fields["pending_sell_level"] = "pending_exit" if today_bought > 0 and available <= 0 else ""
+        fields["trigger_status"] = "not_applicable"
+    else:
+        fields["trigger_status"] = "not_applicable"
+    return fields
+
+
+def _stock_mode(stock_regime: str) -> str:
+    if stock_regime in {"strong_uptrend", "uptrend"}:
+        return "trend"
+    if stock_regime == "range":
+        return "range"
+    if stock_regime == "downtrend":
+        return "downtrend"
+    if stock_regime == "insufficient_data":
+        return "insufficient_data"
+    return "chaotic"
+
+
+def _market_bucket(market_regime: str) -> str:
+    if market_regime == "market_uptrend":
+        return "strong"
+    if market_regime == "market_range":
+        return "normal"
+    if market_regime == "market_transition":
+        return "weak"
+    return "extreme_weak"
+
+
+def _trigger_indicators(history: pd.DataFrame) -> dict[str, float | None]:
+    prepared = _prepare_history(history)
+    closes = pd.to_numeric(prepared.get("close"), errors="coerce").dropna()
+    if len(closes) >= 20:
+        recent = closes.tail(20)
+        mid = float(recent.mean())
+        std = float(recent.std(ddof=0))
+        upper = mid + 2 * std
+        lower = mid - 2 * std
+    elif not closes.empty:
+        mid = float(closes.mean())
+        upper = float(closes.max())
+        lower = float(closes.min())
+    else:
+        mid = upper = lower = None
+    return {
+        "close": _round_price(float(closes.iloc[-1])) if not closes.empty else None,
+        "boll_upper": _round_price(upper),
+        "boll_mid": _round_price(mid),
+        "boll_lower": _round_price(lower),
+        "atr20": _round_price(_atr20(prepared)),
+        "vol20": float(closes.pct_change().dropna().tail(20).std()) if len(closes) >= 3 else 0.0,
+    }
+
+
+def _trend_breakout_buffer(atr20: float | None, close: float | None) -> float | None:
+    if close is None:
+        return None
+    if atr20 is None:
+        return close * 0.005
+    return min(0.2 * atr20, close * 0.005)
+
+
+def _trend_exit_trigger(lower: float | None, atr20: float | None, close: float | None) -> float | None:
+    if lower is None:
+        return None
+    if atr20 is None or close is None:
+        return lower
+    return _round_price(min(lower, close - 2 * atr20))
+
+
+def _grid_trigger_levels(indicators: dict[str, float | None]) -> dict[str, list[float]]:
+    mid = indicators.get("boll_mid")
+    upper = indicators.get("boll_upper")
+    lower = indicators.get("boll_lower")
+    if mid is None or upper is None or lower is None:
+        return {"buy": [], "sell": []}
+    unit = _grid_unit_pct(float(indicators.get("vol20") or 0.0))
+    buy_levels = [_round_price(float(mid) * (1 - unit * layer)) for layer in range(1, 4)]
+    sell_levels = [_round_price(float(mid) * (1 + unit * layer)) for layer in range(1, 4)]
+    buy_levels = [max(float(lower), float(level)) for level in buy_levels if level is not None]
+    sell_levels = [min(float(upper), float(level)) for level in sell_levels if level is not None]
+    return {"buy": [_round_price(level) for level in buy_levels], "sell": [_round_price(level) for level in sell_levels]}
+
+
+def _grid_unit_pct(vol20: float) -> float:
+    if vol20 <= 0.015:
+        return 0.035
+    if vol20 <= 0.03:
+        return 0.055
+    return 0.075
+
+
+def _format_levels(levels: list[float | None]) -> str:
+    return "|".join(f"{float(level):.2f}" for level in levels if level is not None)
+
+
+def _share_split(item: dict[str, object], date: str, is_holding: bool) -> tuple[int, int, int, str]:
+    if not is_holding:
+        return 0, 0, 0, "candidate"
+    explicit_available = _int_value(item.get("available_shares"))
+    explicit_today = _int_value(item.get("today_bought_shares"))
+    explicit_total = _int_value(item.get("total_shares"))
+    shares = explicit_total or _int_value(item.get("shares")) or _int_value(item.get("quantity"))
+    if explicit_available or explicit_today:
+        total = explicit_total or explicit_available + explicit_today
+        return explicit_available, explicit_today, total, "portfolio_split"
+    if shares <= 0:
+        return 0, 0, 0, "portfolio"
+    trade_date = item.get("execution_date") or item.get("buy_date") or item.get("signal_date")
+    if trade_date is not None and _same_date(trade_date, date):
+        return 0, shares, shares, "execution_date"
+    return shares, 0, shares, "portfolio"
+
+
+def _int_value(value: object) -> int:
+    try:
+        if value is None or pd.isna(value):
+            return 0
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _same_date(left: object, right: object) -> bool:
+    left_date = pd.to_datetime(left, errors="coerce")
+    right_date = pd.to_datetime(right, errors="coerce")
+    if pd.isna(left_date) or pd.isna(right_date):
+        return False
+    return left_date.date() == right_date.date()
+
+
+def is_one_word_limit_up(row: dict[str, object] | pd.Series, limit_up_price: float | None = None) -> bool:
+    values = _row_values(row)
+    if limit_up_price is None:
+        limit_up_price = _float_value(values.get("limit_up_price"))
+    if limit_up_price is None:
+        return False
+    prices = [_float_value(values.get(column)) for column in ("open", "high", "low", "close")]
+    return all(price is not None and abs(price - limit_up_price) < 0.001 for price in prices)
+
+
+def is_fake_breakout(row: dict[str, object] | pd.Series, indicators: dict[str, object]) -> bool:
+    values = _row_values(row)
+    close = _float_value(values.get("close"))
+    high = _float_value(values.get("high"))
+    boll_upper = _float_value(indicators.get("boll_upper"))
+    if boll_upper is None:
+        boll_upper = _float_value(indicators.get("upper"))
+    volume = _float_value(values.get("volume"))
+    volume_ma20 = _float_value(indicators.get("volume_ma20"))
+    if close is None or high is None or boll_upper is None:
+        return False
+    price_reversal = high > boll_upper and close <= boll_upper
+    weak_volume = volume is not None and volume_ma20 is not None and volume < volume_ma20 * 1.1
+    return bool(price_reversal or weak_volume)
+
+
+def check_plan_with_daily_bar(
+    plan: dict[str, object],
+    daily_bar: dict[str, object] | pd.Series,
+    available_shares: int | None = None,
+    today_bought_shares: int | None = None,
+    limit_up_price: float | None = None,
+    is_limit_down: bool | None = None,
+    is_suspended: bool | None = None,
+) -> list[dict[str, object]]:
+    mode = str(plan.get("stock_mode") or "")
+    bar = _row_values(daily_bar)
+    if limit_up_price is not None:
+        bar["limit_up_price"] = limit_up_price
+    if is_limit_down is not None:
+        bar["is_limit_down"] = is_limit_down
+    if is_suspended is not None:
+        bar["is_suspended"] = is_suspended
+    available = _int_value(available_shares if available_shares is not None else plan.get("available_shares"))
+    today_bought = _int_value(today_bought_shares if today_bought_shares is not None else plan.get("today_bought_shares"))
+    if bool(bar.get("is_suspended")):
+        return [_execution_event(plan, "risk_control_sell", "failed", available, today_bought, "suspension", "pending_exit")]
+    if mode == "trend":
+        return _check_trend_plan(plan, bar, available, today_bought)
+    if mode == "range":
+        return _check_grid_plan(plan, bar, available, today_bought)
+    if mode == "downtrend":
+        return [_sell_event(plan, "risk_control_sell", available, today_bought, bar, "pending_exit")]
+    return []
+
+
+def _check_trend_plan(
+    plan: dict[str, object],
+    bar: dict[str, object],
+    available: int,
+    today_bought: int,
+) -> list[dict[str, object]]:
+    low = _float_value(bar.get("low"))
+    high = _float_value(bar.get("high"))
+    exit_trigger = _float_value(plan.get("trend_exit_trigger"))
+    reduce_trigger = _float_value(plan.get("trend_reduce_trigger"))
+    buy_trigger = _float_value(plan.get("trend_buy_trigger"))
+    if low is not None and exit_trigger is not None and low <= exit_trigger:
+        return [_sell_event(plan, "trend_exit", available, today_bought, bar, "pending_exit")]
+    if low is not None and reduce_trigger is not None and low <= reduce_trigger:
+        return [_sell_event(plan, "trend_reduce", available, today_bought, bar, "pending_reduce")]
+    if high is not None and buy_trigger is not None and high >= buy_trigger:
+        failed = "limit_up_buy_failed" if is_one_word_limit_up(bar, _float_value(bar.get("limit_up_price"))) else ""
+        status = "failed" if failed else "filled"
+        return [_execution_event(plan, "trend_buy", status, available, today_bought, failed, "")]
+    return []
+
+
+def _check_grid_plan(
+    plan: dict[str, object],
+    bar: dict[str, object],
+    available: int,
+    today_bought: int,
+) -> list[dict[str, object]]:
+    low = _float_value(bar.get("low"))
+    high = _float_value(bar.get("high"))
+    buy_levels = _parse_levels(plan.get("grid_buy_levels"))
+    sell_levels = _parse_levels(plan.get("grid_sell_levels"))
+    if low is not None and buy_levels and low <= min(buy_levels):
+        return [_execution_event(plan, "grid_buy", "filled", available, today_bought, "", "")]
+    if high is not None and sell_levels and high >= max(sell_levels):
+        return [_sell_event(plan, "grid_sell", available, today_bought, bar, "pending_reduce")]
+    return []
+
+
+def _sell_event(
+    plan: dict[str, object],
+    trigger_type: str,
+    available: int,
+    today_bought: int,
+    bar: dict[str, object],
+    pending_level: str,
+) -> dict[str, object]:
+    if bool(bar.get("is_limit_down")):
+        return _execution_event(plan, trigger_type, "failed", available, today_bought, "limit_down_sell_failed", pending_level)
+    if available > 0:
+        return _execution_event(plan, trigger_type, "filled", available, today_bought, "", "")
+    if today_bought > 0:
+        return _execution_event(plan, trigger_type, "pending", available, today_bought, "", pending_level)
+    return _execution_event(plan, trigger_type, "failed", available, today_bought, "no_available_shares", "")
+
+
+def _execution_event(
+    plan: dict[str, object],
+    trigger_type: str,
+    filled_status: str,
+    available: int,
+    today_bought: int,
+    failed_reason: str,
+    pending_level: str,
+) -> dict[str, object]:
+    return {
+        "symbol": plan.get("symbol"),
+        "date": plan.get("date"),
+        "stock_mode": plan.get("stock_mode"),
+        "trigger_type": trigger_type,
+        "trigger_status": "triggered",
+        "filled_status": filled_status,
+        "failed_reason": failed_reason,
+        "pending_sell_level": pending_level if filled_status in {"pending", "failed"} else "",
+        "available_shares": available,
+        "today_bought_shares": today_bought,
+    }
+
+
+def _parse_levels(value: object) -> list[float]:
+    if value is None or pd.isna(value):
+        return []
+    levels = []
+    for part in str(value).split("|"):
+        price = _float_value(part)
+        if price is not None:
+            levels.append(price)
+    return levels
+
+
+def _row_values(row: dict[str, object] | pd.Series) -> dict[str, object]:
+    if isinstance(row, pd.Series):
+        return row.to_dict()
+    return dict(row)
+
+
+def _float_value(value: object) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _records(frame: pd.DataFrame | None) -> list[dict[str, object]]:

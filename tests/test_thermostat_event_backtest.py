@@ -54,6 +54,25 @@ def test_default_thermostat_backtest_is_event_driven() -> None:
     assert "simplified_backtest" not in result.summary.to_string()
 
 
+def test_t1_phase_one_does_not_replace_event_backtest_contract() -> None:
+    result = backtest_thermostat_strategy(
+        FakeService(
+            {
+                "600001.SH": _history([10 + i * 0.1 for i in range(80)], "600001.SH"),
+                "000001.SH": _history([3000 + i * 5 for i in range(80)], "000001.SH"),
+            }
+        ),
+        symbols=["600001.SH"],
+        start_date="20260101",
+        end_date="20260320",
+        initial_cash=100000,
+    )
+
+    assert result.summary.loc[0, "backtest_type"] == "event_driven"
+    assert {"summary", "trades", "daily_portfolio", "positions"}.issubset(result.__dict__)
+    assert "pending_sell_level" not in result.trades.columns
+
+
 def test_simplified_backtest_is_explicitly_marked() -> None:
     result = simplified_backtest_thermostat_strategy(
         FakeService(

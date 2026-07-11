@@ -31,12 +31,18 @@ from stock_picker.strategies import (
     backtest_thermostat_strategy,
     run_thermostat_strategy,
 )
+from stock_picker.reporting.t1_thermostat_report import (
+    build_t1_thermostat_report,
+    default_t1_thermostat_report_filename,
+    export_t1_thermostat_excel,
+)
 from stock_picker.user import ManualPortfolioStore, WatchlistStore
 from examples.list_lhb_candidates import build_lhb_candidates
 
 
 DEFAULT_PORT = 8765
 DEFAULT_USER_PATH = "data/user/default"
+REPORT_DIR = Path("data/reports")
 LAST_FORM: dict[str, str] = {}
 JOBS: dict[str, "ThermostatJob"] = {}
 JOBS_LOCK = threading.Lock()
@@ -59,6 +65,7 @@ TITLE_LABELS = {
     "New Buy Candidates": "新买候选",
     "Grid Advice": "网格建议",
     "Trend Advice": "趋势建议",
+    "Trigger Plan": "Trigger Plan",
     "LHB Top 20": "龙虎榜前 20 名",
     "LHB Top 30": "龙虎榜前 30 名",
     "LHB Top 50": "龙虎榜前 50 名",
@@ -336,6 +343,35 @@ COLUMN_LABELS.update(
 
 COLUMN_LABELS.update(
     {
+        "stock_mode": "股票模式",
+        "market_regime_normalized": "市场折扣档位",
+        "market_position_discount": "仓位折扣",
+        "boll_upper": "布林上轨",
+        "boll_mid": "布林中轨",
+        "boll_lower": "布林下轨",
+        "atr20": "ATR20",
+        "trend_buy_trigger": "趋势买入触发价",
+        "trend_reduce_trigger": "趋势减仓触发价",
+        "trend_exit_trigger": "趋势退出触发价",
+        "trend_batches": "趋势分批",
+        "grid_buy_levels": "网格买入层",
+        "grid_sell_levels": "网格卖出层",
+        "grid_total_max_position_pct": "网格总仓位上限",
+        "target_position_pct": "目标仓位",
+        "max_position_pct": "单股仓位上限",
+        "available_shares": "可卖股数",
+        "today_bought_shares": "今日买入股数",
+        "total_shares": "总股数",
+        "share_split_source": "股数拆分来源",
+        "pending_sell_level": "待卖级别",
+        "trigger_status": "触发状态",
+        "filled_status": "成交状态",
+        "failed_reason": "失败原因",
+    }
+)
+
+COLUMN_LABELS.update(
+    {
         "pool_regime": "股票池强弱",
         "pool_above_ma20_ratio": "股票池高于20日均线比例",
         "pool_uptrend_count": "股票池上升数量",
@@ -376,6 +412,10 @@ INTEGER_DISPLAY_COLUMNS = {
     "zero_count",
     "holding_days",
     "max_drawdown_days",
+    "available_shares",
+    "today_bought_shares",
+    "total_shares",
+    "grid_max_layers",
 }
 
 MONEY_DISPLAY_COLUMNS = {
@@ -446,6 +486,10 @@ PERCENT_DISPLAY_COLUMNS = {
     "risk_pct",
     "slippage_rate",
     "suggested_position_pct",
+    "target_position_pct",
+    "max_position_pct",
+    "market_position_discount",
+    "grid_total_max_position_pct",
     "total_return",
     "volume_limit_pct",
     "weight",
@@ -641,7 +685,7 @@ OPTION_LABELS.update(
 
 
 class WebAppHandler(BaseHTTPRequestHandler):
-    server_version = "StockPickerWeb/1.1.9"
+    server_version = "StockPickerWeb/1.2.0"
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -652,6 +696,10 @@ class WebAppHandler(BaseHTTPRequestHandler):
         if path == "/job":
             job_id = parse_qs(parsed.query).get("id", [""])[-1]
             self._send_json(job_status_payload(job_id))
+            return
+        if path == "/thermostat-report":
+            job_id = parse_qs(parsed.query).get("id", [""])[-1]
+            self._send_thermostat_report(job_id)
             return
         if path == "/":
             self._send_page(render_page(page="thermostat", form=_display_form_for_page("thermostat", LAST_FORM)))
@@ -755,6 +803,28 @@ class WebAppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_thermostat_report(self, job_id: str) -> None:
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job is None:
+                self.send_error(HTTPStatus.NOT_FOUND, "report job not found")
+                return
+            if job.status != "done":
+                self.send_error(HTTPStatus.CONFLICT, "report is not ready")
+                return
+            report_path = Path(job.report_path) if job.report_path else None
+            filename = job.report_filename or (report_path.name if report_path is not None else "")
+        if report_path is None or not report_path.exists():
+            self.send_error(HTTPStatus.NOT_FOUND, "report file not found")
+            return
+        data = report_path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
 
 def handle_thermostat(form: dict[str, str], progress_callback=None) -> RenderResult:
     service = _service(form)
@@ -778,31 +848,11 @@ def handle_thermostat(form: dict[str, str], progress_callback=None) -> RenderRes
         refresh=_checked(form, "refresh"),
         progress_callback=progress_callback,
     )
+    trigger_plan = getattr(result, "trigger_plan", pd.DataFrame())
     tables = [
-        TableBlock("Stock Pool Summary", _pool_summary_frame(pool)),
-        TableBlock("Market Overview", result.market_overview),
-        TableBlock("Holding Advice", result.holding_advice),
-        TableBlock("New Buy Candidates", result.new_candidates),
-        TableBlock("Grid Advice", result.grid_advice),
-        TableBlock("Trend Advice", result.trend_advice),
-        TableBlock("Errors", result.errors),
+        *_thermostat_trigger_plan_tables(trigger_plan),
+        TableBlock("错误/数据质量", result.errors),
     ]
-    if _checked(form, "execution_plan") and not result.new_candidates.empty:
-        executable = result.new_candidates[result.new_candidates["action"].isin(["buy", "add"])].copy()
-        if not executable.empty:
-            if progress_callback:
-                progress_callback({"stage": "build_execution_plan", "completed": 0, "total": len(executable), "current_symbol": "", "node": "生成执行计划"})
-            quotes = service.get_realtime_quotes(executable["symbol"].dropna().astype(str).tolist())
-            plan = build_execution_plan(
-                executable,
-                quotes,
-                cash=cash,
-                next_day_premium=_float(form, "next_day_premium", 0.02),
-                volume_limit_pct=_float(form, "volume_limit_pct", 0.10),
-            )
-            if progress_callback:
-                progress_callback({"stage": "build_execution_plan", "completed": len(executable), "total": len(executable), "current_symbol": "", "node": "生成执行计划"})
-            tables.insert(5, TableBlock("Execution Plan", plan))
     return RenderResult(
         title="恒温器策略",
         summaries=[
@@ -812,7 +862,156 @@ def handle_thermostat(form: dict[str, str], progress_callback=None) -> RenderRes
             )
         ],
         tables=tables,
+        extra_html=_thermostat_trigger_plan_detail(trigger_plan),
+        metadata={"trigger_plan": trigger_plan, "errors": result.errors},
     )
+
+
+def _thermostat_trigger_plan_tables(trigger_plan: pd.DataFrame) -> list[TableBlock]:
+    frame = trigger_plan if trigger_plan is not None else pd.DataFrame()
+    pending = _filter_nonempty(frame, "pending_sell_level")
+    risk = frame
+    if not frame.empty:
+        failed = _nonempty_mask(frame, "failed_reason")
+        risk_note = _nonempty_mask(frame, "risk_note")
+        risk = frame[failed | risk_note].copy()
+    return [
+        TableBlock(
+            "市场状态与仓位折扣",
+            _select_columns(
+                frame.drop_duplicates(subset=[column for column in ["date", "market_regime", "market_regime_normalized", "market_position_discount"] if column in frame])
+                if not frame.empty
+                else frame,
+                ["date", "market_regime", "market_regime_normalized", "market_position_discount"],
+            ),
+        ),
+        TableBlock(
+            "个股模式摘要",
+            _select_columns(
+                frame,
+                [
+                    "symbol",
+                    "name",
+                    "stock_mode",
+                    "target_position_pct",
+                    "max_position_pct",
+                    "total_shares",
+                    "available_shares",
+                    "today_bought_shares",
+                    "pending_sell_level",
+                ],
+            ),
+        ),
+        TableBlock(
+            "趋势触发计划",
+            _select_columns(
+                _filter_equals(frame, "stock_mode", "trend"),
+                [
+                    "symbol",
+                    "name",
+                    "reference_price",
+                    "boll_upper",
+                    "boll_mid",
+                    "boll_lower",
+                    "atr20",
+                    "trend_buy_trigger",
+                    "trend_reduce_trigger",
+                    "trend_exit_trigger",
+                    "trend_batches",
+                    "max_position_pct",
+                ],
+            ),
+        ),
+        TableBlock(
+            "网格触发计划",
+            _select_columns(
+                _filter_equals(frame, "stock_mode", "range"),
+                [
+                    "symbol",
+                    "name",
+                    "reference_price",
+                    "grid_lower",
+                    "grid_mid",
+                    "grid_upper",
+                    "grid_max_layers",
+                    "grid_buy_levels",
+                    "grid_sell_levels",
+                    "grid_total_max_position_pct",
+                    "max_position_pct",
+                ],
+            ),
+        ),
+        TableBlock(
+            "待卖记录",
+            _select_columns(
+                pending,
+                [
+                    "symbol",
+                    "name",
+                    "stock_mode",
+                    "available_shares",
+                    "today_bought_shares",
+                    "pending_sell_level",
+                    "trigger_status",
+                    "filled_status",
+                ],
+            ),
+        ),
+        TableBlock(
+            "失败原因和风险提示",
+            _select_columns(
+                risk,
+                [
+                    "symbol",
+                    "name",
+                    "stock_mode",
+                    "trigger_status",
+                    "filled_status",
+                    "failed_reason",
+                    "risk_note",
+                    "reason",
+                ],
+            ),
+        ),
+    ]
+
+
+def _thermostat_trigger_plan_detail(trigger_plan: pd.DataFrame) -> str:
+    if trigger_plan is None or trigger_plan.empty:
+        return ""
+    fields = ", ".join(str(column) for column in trigger_plan.columns)
+    return (
+        '<details class="result-section result-section-table trigger-plan-detail">'
+        "<summary>展开查看详细字段</summary>"
+        f'<p class="muted">原始字段：{html.escape(fields)}</p>'
+        f'{render_table("Trigger Plan", trigger_plan, include_title=False)}'
+        "</details>"
+    )
+
+
+def _select_columns(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=columns)
+    visible = [column for column in columns if column in frame.columns]
+    return frame.loc[:, visible].copy()
+
+
+def _filter_equals(frame: pd.DataFrame, column: str, value: str) -> pd.DataFrame:
+    if frame is None or frame.empty or column not in frame:
+        return pd.DataFrame()
+    return frame[frame[column].fillna("").astype(str) == value].copy()
+
+
+def _filter_nonempty(frame: pd.DataFrame, column: str) -> pd.DataFrame:
+    if frame is None or frame.empty or column not in frame:
+        return pd.DataFrame()
+    return frame[_nonempty_mask(frame, column)].copy()
+
+
+def _nonempty_mask(frame: pd.DataFrame, column: str) -> pd.Series:
+    if frame is None or frame.empty or column not in frame:
+        return pd.Series(False, index=frame.index if frame is not None else None)
+    return frame[column].fillna("").astype(str).str.strip().ne("")
 
 
 def handle_thermostat_lhb_preview(form: dict[str, str]) -> RenderResult:
@@ -962,6 +1161,9 @@ class ThermostatJob:
         self.percent = 0
         self.error = ""
         self.result_html = ""
+        self.report_path = ""
+        self.report_filename = ""
+        self.report_error = ""
 
     def update(self, event: dict[str, object]) -> None:
         with JOBS_LOCK:
@@ -981,7 +1183,7 @@ class ThermostatJob:
             self.node = "完成"
             self.percent = 100
             self.message = "恒温器评估完成。"
-            self.result_html = render_message(result, None)
+            self.result_html = render_message(result, None) + _thermostat_report_entry(self)
 
     def fail(self, exc: Exception) -> None:
         with JOBS_LOCK:
@@ -1016,6 +1218,7 @@ def _run_thermostat_job(job_id: str) -> None:
     job = JOBS[job_id]
     try:
         result = handle_thermostat(job.form, progress_callback=job.update)
+        _prepare_t1_thermostat_report(job, result)
         job.complete(result)
     except Exception as exc:  # pragma: no cover - defensive live-web path
         job.fail(exc)
@@ -1055,6 +1258,45 @@ def job_status_payload(job_id: str) -> dict[str, object]:
             "error": job.error,
             "result_html": job.result_html,
         }
+
+
+def _prepare_t1_thermostat_report(job: ThermostatJob, result: RenderResult) -> None:
+    try:
+        trigger_plan = result.metadata.get("trigger_plan")
+        errors = result.metadata.get("errors")
+        report = build_t1_thermostat_report(
+            trigger_plan if isinstance(trigger_plan, pd.DataFrame) else pd.DataFrame(),
+            errors if isinstance(errors, pd.DataFrame) else pd.DataFrame(),
+        )
+        filename = default_t1_thermostat_report_filename(report)
+        output = REPORT_DIR / filename
+        export_t1_thermostat_excel(report, output)
+        job.report_path = str(output)
+        job.report_filename = filename
+        job.report_error = ""
+    except Exception as exc:  # pragma: no cover - defensive live-web path
+        job.report_path = ""
+        job.report_filename = ""
+        job.report_error = str(exc)
+
+
+def _thermostat_report_entry(job: ThermostatJob) -> str:
+    if job.report_error:
+        return (
+            '<section class="result-section result-section-report">'
+            '<h3>报告下载</h3>'
+            f'<p class="message error">报告导出失败：{html.escape(job.report_error)}</p>'
+            "</section>"
+        )
+    if job.report_path and job.report_filename:
+        href = f"/thermostat-report?id={html.escape(job.job_id)}"
+        return (
+            '<section class="result-section result-section-report">'
+            '<h3>报告下载</h3>'
+            f'<a class="button" href="{href}">下载新版 T+1 恒温器报告</a>'
+            "</section>"
+        )
+    return ""
 
 
 def render_job_progress(job_id: str) -> str:
@@ -2868,11 +3110,13 @@ class RenderResult:
         tables: list[TableBlock] | None = None,
         summaries: list[dict[str, object]] | None = None,
         extra_html: str = "",
+        metadata: dict[str, object] | None = None,
     ) -> None:
         self.title = title
         self.tables = tables or []
         self.summaries = summaries or []
         self.extra_html = extra_html
+        self.metadata = metadata or {}
 
 
 CSS = """

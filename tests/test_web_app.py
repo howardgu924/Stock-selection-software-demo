@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import threading
+from pathlib import Path
 from types import SimpleNamespace
+from urllib.request import Request, urlopen
 
 import pandas as pd
+from openpyxl import load_workbook
 
 from examples import web_app
+from stock_picker.reporting.t1_thermostat_report import build_t1_thermostat_report, export_t1_thermostat_excel
 from stock_picker.user import ManualPortfolioStore, WatchlistStore
 
 
@@ -72,6 +77,75 @@ def _minimal_backtest_result() -> SimpleNamespace:
         symbol_performance=pd.DataFrame(),
         data_quality=pd.DataFrame(),
         parameters=pd.DataFrame(),
+    )
+
+
+def _sample_trigger_plan() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "date": "2026-07-08",
+                "symbol": "600001.SH",
+                "name": "Trend",
+                "stock_mode": "trend",
+                "market_regime": "market_uptrend",
+                "market_regime_normalized": "strong",
+                "market_position_discount": 1.0,
+                "target_position_pct": 0.2,
+                "max_position_pct": 0.2,
+                "total_shares": 100,
+                "available_shares": 0,
+                "today_bought_shares": 100,
+                "pending_sell_level": "pending_exit",
+                "boll_upper": 12.8,
+                "boll_mid": 11.5,
+                "boll_lower": 10.2,
+                "atr20": 0.42,
+                "trend_buy_trigger": 12.9,
+                "trend_reduce_trigger": 11.5,
+                "trend_exit_trigger": 10.0,
+                "trend_batches": "40%,35%,25%",
+                "grid_lower": "",
+                "grid_mid": "",
+                "grid_upper": "",
+                "grid_max_layers": "",
+                "grid_buy_levels": "",
+                "grid_sell_levels": "",
+                "grid_total_max_position_pct": 0.0,
+                "trigger_status": "triggered",
+                "filled_status": "pending",
+                "failed_reason": "",
+                "risk_note": "今日买入不可卖",
+                "reason": "趋势计划",
+            },
+            {
+                "date": "2026-07-08",
+                "symbol": "600002.SH",
+                "name": "Range",
+                "stock_mode": "range",
+                "market_regime": "market_range",
+                "market_regime_normalized": "normal",
+                "market_position_discount": 0.9,
+                "target_position_pct": 0.135,
+                "max_position_pct": 0.135,
+                "total_shares": 0,
+                "available_shares": 0,
+                "today_bought_shares": 0,
+                "pending_sell_level": "",
+                "grid_lower": 9.1,
+                "grid_mid": 10.0,
+                "grid_upper": 10.9,
+                "grid_max_layers": 3,
+                "grid_buy_levels": "9.65|9.30|9.10",
+                "grid_sell_levels": "10.35|10.70|10.90",
+                "grid_total_max_position_pct": 0.4,
+                "trigger_status": "planned",
+                "filled_status": "failed",
+                "failed_reason": "limit_up_buy_failed",
+                "risk_note": "",
+                "reason": "网格计划",
+            },
+        ]
     )
 
 
@@ -484,7 +558,7 @@ def test_web_job_progress_messages_are_readable() -> None:
     assert "已完成 3 / 5" in job.message
 
 
-def test_web_thermostat_result_contains_market_holdings_and_candidates(tmp_path, monkeypatch) -> None:
+def test_web_thermostat_result_uses_trigger_plan_sections_without_legacy_advice(tmp_path, monkeypatch) -> None:
     store = ManualPortfolioStore(tmp_path / "account")
     store.initialize(principal=100000, cash=80000)
     store.buy("600001", name="Held", price=18.0, shares=100, fees=0.0, strategy="thermostat", system="risk_control")
@@ -512,13 +586,239 @@ def test_web_thermostat_result_contains_market_holdings_and_candidates(tmp_path,
     )
 
     titles = [table.title for table in result.tables]
-    assert titles[:4] == ["Stock Pool Summary", "Market Overview", "Holding Advice", "New Buy Candidates"]
-    pool_summary = next(table.frame for table in result.tables if table.title == "Stock Pool Summary")
-    assert int(pool_summary.loc[0, "filtered_count"]) == 1
-    holding = next(table.frame for table in result.tables if table.title == "Holding Advice")
-    candidates = next(table.frame for table in result.tables if table.title == "New Buy Candidates")
-    assert holding.loc[0, "symbol"] == "600001.SH"
-    assert candidates.loc[0, "symbol"] == "600002.SH"
+    assert titles == [
+        "市场状态与仓位折扣",
+        "个股模式摘要",
+        "趋势触发计划",
+        "网格触发计划",
+        "待卖记录",
+        "失败原因和风险提示",
+        "错误/数据质量",
+    ]
+    for old_title in ["Holding Advice", "New Buy Candidates", "Grid Advice", "Trend Advice", "Execution Plan", "持仓建议", "新买候选", "网格建议", "趋势建议"]:
+        assert old_title not in titles
+    summary = next(table.frame for table in result.tables if table.title == "个股模式摘要")
+    assert {"600001.SH", "600002.SH"}.issubset(set(summary["symbol"]))
+
+
+def test_web_thermostat_result_renders_t1_trigger_plan_sections(tmp_path, monkeypatch) -> None:
+    account_path = tmp_path / "account"
+    ManualPortfolioStore(account_path).initialize(principal=100000, cash=90000)
+    fake = FakeWebService({})
+    monkeypatch.setattr(web_app, "_service", lambda form: fake)
+
+    trigger_plan = pd.DataFrame(
+        [
+            {
+                "symbol": "600001.SH",
+                "name": "Trend",
+                "date": "2025-05-20",
+                "market_regime": "market_uptrend",
+                "market_regime_normalized": "strong",
+                "market_position_discount": 1.0,
+                "stock_mode": "trend",
+                "reference_price": 12.0,
+                "boll_upper": 12.8,
+                "boll_mid": 11.5,
+                "boll_lower": 10.2,
+                "atr20": 0.42,
+                "trend_buy_trigger": 12.9,
+                "trend_reduce_trigger": 11.5,
+                "trend_exit_trigger": 10.0,
+                "trend_batches": "40%,35%,25%",
+                "target_position_pct": 0.2,
+                "max_position_pct": 0.2,
+                "total_shares": 100,
+                "available_shares": 0,
+                "today_bought_shares": 100,
+                "pending_sell_level": "pending_exit",
+                "trigger_status": "triggered",
+                "filled_status": "pending",
+                "failed_reason": "",
+                "risk_note": "今日买入不可卖",
+                "reason": "趋势计划",
+            },
+            {
+                "symbol": "600002.SH",
+                "name": "Range",
+                "date": "2025-05-20",
+                "market_regime": "market_range",
+                "market_regime_normalized": "normal",
+                "market_position_discount": 0.9,
+                "stock_mode": "range",
+                "reference_price": 9.8,
+                "grid_lower": 9.1,
+                "grid_mid": 10.0,
+                "grid_upper": 10.9,
+                "grid_max_layers": 3,
+                "grid_buy_levels": "9.65|9.30|9.10",
+                "grid_sell_levels": "10.35|10.70|10.90",
+                "grid_total_max_position_pct": 0.4,
+                "target_position_pct": 0.135,
+                "max_position_pct": 0.135,
+                "total_shares": 0,
+                "available_shares": 0,
+                "today_bought_shares": 0,
+                "pending_sell_level": "",
+                "trigger_status": "planned",
+                "filled_status": "failed",
+                "failed_reason": "limit_up_buy_failed",
+                "risk_note": "",
+                "reason": "网格计划",
+            },
+        ]
+    )
+
+    def fake_run_thermostat_strategy(**kwargs):
+        return type(
+            "FakeThermostatResult",
+            (),
+            {
+                "market_overview": pd.DataFrame([{"market_regime": "market_uptrend"}]),
+                "holding_advice": pd.DataFrame(),
+                "new_candidates": pd.DataFrame(),
+                "grid_advice": pd.DataFrame(),
+                "trend_advice": pd.DataFrame(),
+                "errors": pd.DataFrame(),
+                "trigger_plan": trigger_plan,
+            },
+        )()
+
+    monkeypatch.setattr(web_app, "run_thermostat_strategy", fake_run_thermostat_strategy)
+
+    result = web_app.handle_thermostat(
+        {
+            "symbols": "600001,600002",
+            "start": "20250101",
+            "end": "20250520",
+            "account_path": str(account_path),
+        }
+    )
+    html = web_app.render_message(result, None)
+    titles = [table.title for table in result.tables]
+
+    for title in ["市场状态与仓位折扣", "个股模式摘要", "趋势触发计划", "网格触发计划", "待卖记录", "失败原因和风险提示", "错误/数据质量"]:
+        assert title in titles
+        assert title in html
+    for old_title in ["Holding Advice", "New Buy Candidates", "Grid Advice", "Trend Advice", "Execution Plan", "持仓建议", "新买候选", "网格建议", "趋势建议", "手工执行计划"]:
+        assert old_title not in titles
+        assert old_title not in html
+    assert "展开查看详细字段" in html
+    assert "<details" in html
+    assert "stock_mode" in html
+    assert "trend_buy_trigger" in html
+    assert "股票模式" in html
+    assert "趋势买入触发价" in html
+    assert "今日买入股数" in html
+
+    trend_table = next(table.frame for table in result.tables if table.title == "趋势触发计划")
+    grid_table = next(table.frame for table in result.tables if table.title == "网格触发计划")
+    pending_table = next(table.frame for table in result.tables if table.title == "待卖记录")
+    risk_table = next(table.frame for table in result.tables if table.title == "失败原因和风险提示")
+    assert trend_table["symbol"].tolist() == ["600001.SH"]
+    assert grid_table["symbol"].tolist() == ["600002.SH"]
+    assert pending_table["symbol"].tolist() == ["600001.SH"]
+    assert set(risk_table["symbol"]) == {"600001.SH", "600002.SH"}
+    assert html.count("<th>stock_mode</th>") == 0
+
+
+def test_web_thermostat_form_does_not_add_duplicate_account_inputs() -> None:
+    html = web_app.render_page(page="thermostat", form={"account_path": "data/user/default"})
+
+    assert html.count('name="account_path"') == 1
+    assert 'name="available_shares"' not in html
+    assert 'name="today_bought_shares"' not in html
+    assert 'name="total_shares"' not in html
+    assert 'name="commission_rate"' not in html
+    assert 'name="stamp_tax_rate"' not in html
+
+
+def test_web_thermostat_job_result_shows_t1_report_download_only_after_completion(tmp_path) -> None:
+    initial_html = web_app.render_page(page="thermostat", form={})
+    assert "下载新版 T+1 恒温器报告" not in initial_html
+
+    job = web_app.ThermostatJob("report-job", {"symbols": "600001"})
+    job.report_path = str(tmp_path / "t1_thermostat_report_20260708.xlsx")
+    job.report_filename = "t1_thermostat_report_20260708.xlsx"
+    result = web_app.RenderResult("恒温器策略", tables=[], summaries=[])
+
+    job.complete(result)
+
+    assert "下载新版 T+1 恒温器报告" in job.result_html
+    assert "/thermostat-report?id=report-job" in job.result_html
+    for old_title in ["Holding Advice", "New Buy Candidates", "Grid Advice", "Trend Advice", "持仓建议", "新买候选", "网格建议", "趋势建议"]:
+        assert old_title not in job.result_html
+
+
+def test_web_thermostat_job_result_shows_report_export_failure() -> None:
+    job = web_app.ThermostatJob("failed-report-job", {"symbols": "600001"})
+    job.report_error = "disk full"
+
+    job.complete(web_app.RenderResult("恒温器策略", tables=[], summaries=[]))
+
+    assert "报告导出失败" in job.result_html
+    assert "disk full" in job.result_html
+    assert "下载新版 T+1 恒温器报告" not in job.result_html
+
+
+def test_web_thermostat_report_route_downloads_current_t1_excel(tmp_path) -> None:
+    report = build_t1_thermostat_report(_sample_trigger_plan(), pd.DataFrame())
+    output = tmp_path / "t1_thermostat_report_20260708.xlsx"
+    export_t1_thermostat_excel(report, output)
+    job = web_app.ThermostatJob("download-job", {"symbols": "600001,600002"})
+    job.status = "done"
+    job.report_path = str(output)
+    job.report_filename = output.name
+    web_app.JOBS["download-job"] = job
+    server = web_app.ThreadingHTTPServer(("127.0.0.1", 0), web_app.WebAppHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        request = Request(f"http://127.0.0.1:{port}/thermostat-report?id=download-job")
+        with urlopen(request, timeout=10) as response:
+            body = response.read()
+            content_type = response.headers["Content-Type"]
+            disposition = response.headers["Content-Disposition"]
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        web_app.JOBS.pop("download-job", None)
+
+    downloaded = tmp_path / "downloaded.xlsx"
+    downloaded.write_bytes(body)
+    book = load_workbook(downloaded)
+    assert response.status == 200
+    assert content_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    assert 'filename="t1_thermostat_report_20260708.xlsx"' in disposition
+    assert "个股模式摘要" in book.sheetnames
+    assert "详细字段" in book.sheetnames
+    assert not {"Holding Advice", "New Buy Candidates", "Grid Advice", "Trend Advice"} & set(book.sheetnames)
+
+
+def test_web_thermostat_job_runner_generates_t1_excel_report(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(web_app, "REPORT_DIR", tmp_path)
+    result = web_app.RenderResult(
+        "恒温器策略",
+        tables=[],
+        summaries=[],
+        metadata={"trigger_plan": _sample_trigger_plan(), "errors": pd.DataFrame()},
+    )
+    monkeypatch.setattr(web_app, "handle_thermostat", lambda form, progress_callback=None: result)
+    job = web_app.ThermostatJob("runner-report-job", {"symbols": "600001,600002"})
+    web_app.JOBS["runner-report-job"] = job
+
+    try:
+        web_app._run_thermostat_job("runner-report-job")
+    finally:
+        web_app.JOBS.pop("runner-report-job", None)
+
+    assert job.status == "done"
+    assert job.report_filename == "t1_thermostat_report_20260708.xlsx"
+    assert Path(job.report_path).exists()
+    assert "下载新版 T+1 恒温器报告" in job.result_html
+    book = load_workbook(job.report_path)
+    assert "详细字段" in book.sheetnames
 
 
 def test_web_lhb_preview_builds_candidates_before_running_thermostat(monkeypatch) -> None:

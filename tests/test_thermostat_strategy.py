@@ -3,12 +3,19 @@ from __future__ import annotations
 import pandas as pd
 
 from stock_picker.strategies.thermostat import (
-    REQUIRED_ADVICE_COLUMNS,
+    MARKET_POSITION_DISCOUNTS,
+    PENDING_SELL_LEVELS,
+    REQUIRED_TRIGGER_PLAN_COLUMNS,
+    STOCK_MODES,
+    TRIGGER_TYPES,
     calculate_regime_metrics,
+    check_plan_with_daily_bar,
     classify_market_regime,
     classify_regime,
     classify_stock_regime,
     evaluate_thermostat,
+    is_fake_breakout,
+    is_one_word_limit_up,
     run_thermostat_strategy,
 )
 
@@ -47,6 +54,30 @@ def _uptrend(count: int = 140) -> list[float]:
 
 def _downtrend(count: int = 140) -> list[float]:
     return _linear(14, -0.02, count)
+
+
+def _ohlcv_history(
+    closes: list[float],
+    symbol: str = "600001.SH",
+    start: str = "2025-01-01",
+    volume: int = 100000,
+) -> pd.DataFrame:
+    dates = pd.date_range(start, periods=len(closes), freq="D")
+    return pd.DataFrame(
+        {
+            "symbol": symbol,
+            "date": dates.strftime("%Y-%m-%d"),
+            "open": [round(value * 0.995, 2) for value in closes],
+            "high": [round(value * 1.02, 2) for value in closes],
+            "low": [round(value * 0.98, 2) for value in closes],
+            "close": closes,
+            "volume": [volume] * len(closes),
+        }
+    )
+
+
+def _thermostat_rows(result) -> pd.DataFrame:
+    return result.trigger_plan
 
 
 class CompositeMarketService:
@@ -130,11 +161,11 @@ def test_run_thermostat_uses_composite_market_benchmark_and_defensive_anchor() -
     assert {"000852.SH", "399006.SZ", "000688.SH", "000300.SH"}.issubset(service.requested_indexes)
     assert result.market_overview.loc[0, "data_source"] == "composite_index"
     assert result.market_overview.loc[0, "market_regime"] == "market_downtrend"
-    row = result.new_candidates.loc[0]
-    assert row["action"] in {"observe", "blocked"}
-    assert row["suggested_position_pct"] == 0
-    assert row["suggested_shares"] == 0
-    assert row["executable"] == False  # noqa: E712
+    row = result.trigger_plan.loc[0]
+    assert row["stock_mode"] == "trend"
+    assert row["market_regime_normalized"] == "extreme_weak"
+    assert row["market_position_discount"] == 0.5
+    assert float(row["max_position_pct"]) <= 0.10
 
 
 def test_composite_market_falls_back_to_candidate_aggregate_when_all_indexes_missing() -> None:
@@ -152,7 +183,7 @@ def test_composite_market_falls_back_to_candidate_aggregate_when_all_indexes_mis
     )
 
     assert result.market_overview.loc[0, "data_source"] == "candidate_aggregate"
-    assert result.new_candidates.loc[0, "symbol"] == "600001.SH"
+    assert result.trigger_plan.loc[0, "symbol"] == "600001.SH"
 
 
 def test_short_history_never_generates_buy_add_or_grid() -> None:
@@ -164,11 +195,11 @@ def test_short_history_never_generates_buy_add_or_grid() -> None:
         as_of="2026-05-10",
     )
 
-    row = result.new_candidates.loc[0]
+    row = result.trigger_plan.loc[0]
     assert row["stock_regime"] == "insufficient_data"
-    assert row["action"] in {"observe", "wait_confirm"}
-    assert row["suggested_position_pct"] == 0
-    assert row["suggested_shares"] == 0
+    assert row["stock_mode"] == "insufficient_data"
+    assert row["target_position_pct"] == 0
+    assert row["max_position_pct"] == 0
     assert row["data_sufficient"] == False  # noqa: E712
     assert "数据不足" in row["reason"] or "数据不足" in row["risk_note"]
 
@@ -187,10 +218,10 @@ def test_pool_strength_does_not_override_market_downtrend() -> None:
     )
 
     assert result.market_overview.loc[0, "pool_regime"] == "pool_strong"
-    assert not result.new_candidates.empty
-    assert set(result.new_candidates["suggested_position_pct"]) == {0.0}
-    assert set(result.new_candidates["suggested_shares"]) == {0}
-    assert set(result.new_candidates["executable"]) == {False}
+    assert not result.trigger_plan.empty
+    assert set(result.trigger_plan["market_regime_normalized"]) == {"extreme_weak"}
+    assert set(result.trigger_plan["market_position_discount"]) == {0.5}
+    assert set(result.trigger_plan["max_position_pct"]) == {0.10}
 
 
 def test_market_routing_and_cash_consistency() -> None:
@@ -200,31 +231,29 @@ def test_market_routing_and_cash_consistency() -> None:
         candidates=[{"symbol": "600001.SH", "name": "A"}],
         cash=100000,
         as_of="2026-05-20",
-    ).new_candidates.loc[0]
+    ).trigger_plan.loc[0]
     uptrend = evaluate_thermostat(
         histories={"600002.SH": _history(_uptrend(), "600002.SH")},
         market_history=_history(_linear(3000, 3.0, 140), "000852.SH"),
         candidates=[{"symbol": "600002.SH", "name": "B"}],
         cash=100000,
         as_of="2026-05-20",
-    ).new_candidates.loc[0]
+    ).trigger_plan.loc[0]
     no_cash = evaluate_thermostat(
         histories={"600003.SH": _history(_strong_uptrend(), "600003.SH")},
         market_history=_history(_linear(3000, 3.0, 140), "000852.SH"),
         candidates=[{"symbol": "600003.SH", "name": "C"}],
         cash=100,
         as_of="2026-05-20",
-    ).new_candidates.loc[0]
+    ).trigger_plan.loc[0]
 
-    assert transition["strength"] == "reduced"
-    assert 0.03 <= float(transition["suggested_position_pct"]) <= 0.05
-    assert "试探仓" in transition["reason"]
-    assert uptrend["action"] in {"buy", "add"}
-    assert 0.08 <= float(uptrend["suggested_position_pct"]) <= 0.10
-    assert int(uptrend["suggested_shares"]) > 0
-    assert no_cash["suggested_position_pct"] == 0
-    assert no_cash["suggested_shares"] == 0
-    assert "现金不足以买入一手" in no_cash["reason"] or "现金不足以买入一手" in no_cash["risk_note"]
+    assert transition["market_regime_normalized"] == "weak"
+    assert 0 < float(transition["max_position_pct"]) <= 0.14
+    assert uptrend["market_regime_normalized"] == "strong"
+    assert 0.08 <= float(uptrend["target_position_pct"]) <= 0.20
+    assert 0 < float(uptrend["max_position_pct"]) <= 0.20
+    assert no_cash["stock_mode"] == "trend"
+    assert "suggested_shares" not in no_cash.index
 
 
 def test_grid_candidates_are_scored_limited_and_keep_grid_parameters() -> None:
@@ -243,16 +272,15 @@ def test_grid_candidates_are_scored_limited_and_keep_grid_parameters() -> None:
         as_of="2026-05-20",
     )
 
-    enabled = result.grid_advice[result.grid_advice["executable"] == True]  # noqa: E712
-    disabled = result.grid_advice[result.grid_advice["executable"] == False]  # noqa: E712
-    assert len(enabled) <= 3
-    assert not disabled.empty
-    assert set(result.grid_advice["grid_unit_pct"].dropna()) == {0.08}
-    assert set(result.grid_advice["grid_max_layers"].dropna()) == {4}
-    assert disabled["reason"].str.contains("网格优先级不足").any()
+    range_rows = result.trigger_plan[result.trigger_plan["stock_mode"] == "range"]
+    assert len(range_rows) == 4
+    assert set(range_rows["grid_max_layers"].dropna()) == {3}
+    assert all(len(str(value).split("|")) == 3 for value in range_rows["grid_buy_levels"])
+    assert all(len(str(value).split("|")) == 3 for value in range_rows["grid_sell_levels"])
+    assert "grid_unit_pct" not in result.trigger_plan.columns
 
 
-def test_atr_stop_target_fallback_and_required_columns() -> None:
+def test_trigger_plan_replaces_legacy_advice_as_main_contract() -> None:
     result = evaluate_thermostat(
         histories={"600001.SH": _history(_strong_uptrend(), "600001.SH")},
         market_history=_history(_linear(3000, 3.0, 140), "000852.SH"),
@@ -261,11 +289,214 @@ def test_atr_stop_target_fallback_and_required_columns() -> None:
         as_of="2026-05-20",
     )
 
-    row = result.new_candidates.loc[0]
-    stop_pct = 1 - float(row["stop_price"]) / float(row["entry_price"])
-    target_pct = float(row["target_price"]) / float(row["entry_price"]) - 1
-    assert 0.06 <= stop_pct <= 0.12
-    assert target_pct >= stop_pct * 1.9
-    assert set(REQUIRED_ADVICE_COLUMNS).issubset(result.new_candidates.columns)
-    assert "holding_advice" in result.tables
-    assert "new_candidates" in result.tables
+    assert set(result.tables) == {"market_overview", "trigger_plan", "errors"}
+    assert result.holding_advice.empty
+    assert result.new_candidates.empty
+    assert result.grid_advice.empty
+    assert result.trend_advice.empty
+    assert not result.trigger_plan.empty
+    assert set(REQUIRED_TRIGGER_PLAN_COLUMNS).issubset(result.trigger_plan.columns)
+    assert {"symbol", "date", "market_regime", "stock_regime", "reason", "risk_note"}.issubset(result.trigger_plan.columns)
+    assert {
+        "action",
+        "suggested_shares",
+        "suggested_position_pct",
+        "strategy_family",
+        "grid_unit_pct",
+        "executable",
+    }.isdisjoint(result.trigger_plan.columns)
+
+
+def test_t1_thermostat_vocabularies_and_contract_columns_are_defined() -> None:
+    assert set(STOCK_MODES) == {"trend", "range", "downtrend", "chaotic", "insufficient_data"}
+    assert {"strong", "normal", "weak", "extreme_weak"}.issubset(MARKET_POSITION_DISCOUNTS)
+    assert set(PENDING_SELL_LEVELS) == {"", "pending_reduce", "pending_exit", "pending_emergency_exit"}
+    assert {"trend_buy", "trend_reduce", "trend_exit", "grid_buy", "grid_sell"}.issubset(TRIGGER_TYPES)
+    assert {"stock_mode", "trend_buy_trigger", "pending_sell_level"}.issubset(REQUIRED_TRIGGER_PLAN_COLUMNS)
+
+
+def test_t1_trigger_plan_rows_expose_required_contract_fields() -> None:
+    result = evaluate_thermostat(
+        histories={"600001.SH": _ohlcv_history(_uptrend(140), "600001.SH")},
+        market_history=_ohlcv_history(_linear(3000, 3.0, 140), "000852.SH"),
+        candidates=[{"symbol": "600001.SH", "name": "A"}],
+        cash=100000,
+        as_of="2025-05-20",
+    )
+
+    row = result.trigger_plan.loc[0]
+    assert set(REQUIRED_TRIGGER_PLAN_COLUMNS).issubset(result.trigger_plan.columns)
+    assert row["stock_mode"] in STOCK_MODES
+    assert row["market_position_discount"] > 0
+    assert row["available_shares"] == 0
+    assert row["today_bought_shares"] == 0
+    assert row["total_shares"] == 0
+
+
+def test_t1_each_stock_gets_exactly_one_mode_and_market_discount_does_not_override_it() -> None:
+    histories = {
+        "600001.SH": _ohlcv_history(_uptrend(140), "600001.SH"),
+        "600002.SH": _ohlcv_history(_flat_wave(10, 143, 0.45), "600002.SH"),
+        "600003.SH": _ohlcv_history(_downtrend(140), "600003.SH"),
+        "600004.SH": _ohlcv_history([10, 14, 8, 15, 7, 16] * 25, "600004.SH"),
+    }
+    result = evaluate_thermostat(
+        histories=histories,
+        market_history=_ohlcv_history(_downtrend(140), "000852.SH"),
+        candidates=[{"symbol": symbol, "name": symbol} for symbol in histories],
+        cash=100000,
+        as_of="2025-05-20",
+    )
+
+    rows = _thermostat_rows(result).drop_duplicates("symbol")
+    assert set(rows["symbol"]) == set(histories)
+    assert rows["stock_mode"].isin(STOCK_MODES).all()
+    assert rows.loc[rows["symbol"] == "600001.SH", "stock_mode"].iloc[0] == "trend"
+    assert rows.loc[rows["symbol"] == "600003.SH", "stock_mode"].iloc[0] == "downtrend"
+    assert set(rows["market_regime_normalized"]) == {"extreme_weak"}
+    assert set(rows["market_position_discount"]) == {0.5}
+
+
+def test_t1_insufficient_data_uses_prior_complete_daily_bars_and_blocks_normal_buy() -> None:
+    result = evaluate_thermostat(
+        histories={"600001.SH": _ohlcv_history(_linear(10, 0.2, 40), "600001.SH")},
+        market_history=_ohlcv_history(_linear(3000, 3.0, 140), "000852.SH"),
+        candidates=[{"symbol": "600001.SH", "name": "A"}],
+        cash=100000,
+        as_of="2025-02-10",
+    )
+
+    row = result.trigger_plan.loc[0]
+    assert row["stock_mode"] == "insufficient_data"
+    assert row["trigger_status"] == "not_applicable"
+    assert row["trend_buy_trigger"] == ""
+    assert row["grid_buy_levels"] == ""
+
+
+def test_t1_trend_outputs_bollinger_atr_triggers_and_batches() -> None:
+    result = evaluate_thermostat(
+        histories={"600001.SH": _ohlcv_history(_uptrend(140), "600001.SH")},
+        market_history=_ohlcv_history(_linear(3000, 3.0, 140), "000852.SH"),
+        candidates=[{"symbol": "600001.SH", "name": "A"}],
+        cash=100000,
+        as_of="2025-05-20",
+    )
+
+    row = result.trigger_plan.loc[0]
+    assert row["stock_mode"] == "trend"
+    assert row["boll_upper"] > row["boll_mid"] > row["boll_lower"]
+    assert row["atr20"] > 0
+    expected_buffer = min(0.2 * float(row["atr20"]), float(row["reference_price"]) * 0.005)
+    assert row["trend_buy_trigger"] == round(float(row["boll_upper"]) + expected_buffer, 2)
+    assert row["trend_reduce_trigger"] == row["boll_mid"]
+    assert row["trend_exit_trigger"] <= row["boll_lower"]
+    assert row["trend_batches"] == "40%,35%,25%"
+    assert 0 < float(row["max_position_pct"]) <= 0.20
+
+
+def test_t1_range_outputs_three_layer_grid_and_position_caps() -> None:
+    result = evaluate_thermostat(
+        histories={"600001.SH": _ohlcv_history(_flat_wave(10, 143, 0.45), "600001.SH")},
+        market_history=_ohlcv_history(_flat_wave(3000, 140, 15), "000852.SH"),
+        candidates=[{"symbol": "600001.SH", "name": "A"}],
+        cash=100000,
+        as_of="2025-05-20",
+    )
+
+    row = result.trigger_plan.loc[0]
+    assert row["stock_mode"] == "range"
+    assert row["grid_upper"] > row["grid_mid"] > row["grid_lower"]
+    assert len(str(row["grid_buy_levels"]).split("|")) == 3
+    assert len(str(row["grid_sell_levels"]).split("|")) == 3
+    assert 0 < float(row["max_position_pct"]) <= 0.15
+    assert float(row["grid_total_max_position_pct"]) == 0.40
+
+    assert int(row["grid_max_layers"]) == 3
+
+
+def test_t1_downtrend_and_chaotic_do_not_emit_normal_new_buy_plans() -> None:
+    result = evaluate_thermostat(
+        histories={
+            "600001.SH": _ohlcv_history(_downtrend(140), "600001.SH"),
+            "600002.SH": _ohlcv_history([10, 14, 8, 15, 7, 16] * 25, "600002.SH"),
+        },
+        market_history=_ohlcv_history(_linear(3000, 3.0, 140), "000852.SH"),
+        candidates=[{"symbol": "600001.SH", "name": "A"}, {"symbol": "600002.SH", "name": "B"}],
+        cash=100000,
+        as_of="2025-05-20",
+    )
+
+    rows = result.trigger_plan.set_index("symbol")
+    assert rows.loc["600001.SH", "stock_mode"] == "downtrend"
+    assert rows.loc["600002.SH", "stock_mode"] == "chaotic"
+    assert set(rows["trigger_status"]) == {"not_applicable"}
+    assert set(rows["max_position_pct"]) == {0.0}
+
+
+def test_t1_holding_share_split_and_pending_sell_levels() -> None:
+    holdings = pd.DataFrame(
+        [
+            {"symbol": "600001.SH", "name": "A", "shares": 300, "execution_date": "2025-05-20"},
+            {"symbol": "600002.SH", "name": "B", "shares": 200, "execution_date": "2025-05-19"},
+        ]
+    )
+    result = evaluate_thermostat(
+        histories={
+            "600001.SH": _ohlcv_history(_uptrend(140), "600001.SH"),
+            "600002.SH": _ohlcv_history(_uptrend(140), "600002.SH"),
+        },
+        market_history=_ohlcv_history(_linear(3000, 3.0, 140), "000852.SH"),
+        holdings=holdings,
+        cash=100000,
+        as_of="2025-05-20",
+    )
+
+    rows = result.trigger_plan.set_index("symbol")
+    assert rows.loc["600001.SH", "today_bought_shares"] == 300
+    assert rows.loc["600001.SH", "available_shares"] == 0
+    assert rows.loc["600001.SH", "total_shares"] == 300
+    assert rows.loc["600001.SH", "share_split_source"] == "execution_date"
+    assert rows.loc["600002.SH", "available_shares"] == 200
+    assert rows.loc["600002.SH", "today_bought_shares"] == 0
+
+    plan = rows.loc["600001.SH"].to_dict()
+    plan["trend_reduce_trigger"] = 10.0
+    plan["trend_exit_trigger"] = 9.0
+    result_rows = check_plan_with_daily_bar(plan, {"high": 11.0, "low": 8.5}, is_limit_down=False, is_suspended=False)
+    assert result_rows[0]["filled_status"] == "pending"
+    assert result_rows[0]["pending_sell_level"] == "pending_exit"
+
+
+def test_t1_limit_failure_fake_breakout_and_conservative_trigger_priority() -> None:
+    assert is_one_word_limit_up({"open": 11.0, "high": 11.0, "low": 11.0, "close": 11.0}, 11.0)
+
+    assert is_fake_breakout(
+        {"high": 12.0, "low": 10.0, "close": 10.8, "volume": 300000},
+        {"boll_upper": 11.0, "volume_ma20": 100000},
+    )
+
+    plan = {
+        "symbol": "600001.SH",
+        "date": "2025-05-20",
+        "stock_mode": "trend",
+        "trend_buy_trigger": 11.0,
+        "trend_reduce_trigger": 10.0,
+        "trend_exit_trigger": 9.0,
+        "available_shares": 100,
+        "today_bought_shares": 0,
+    }
+    rows = check_plan_with_daily_bar(
+        plan,
+        {"open": 11.0, "high": 11.0, "low": 11.0, "close": 11.0},
+        limit_up_price=11.0,
+        is_limit_down=False,
+        is_suspended=False,
+    )
+    assert rows[0]["trigger_type"] == "trend_buy"
+    assert rows[0]["filled_status"] == "failed"
+    assert rows[0]["failed_reason"] == "limit_up_buy_failed"
+
+    rows = check_plan_with_daily_bar(plan, {"high": 11.5, "low": 8.5}, is_limit_down=True, is_suspended=False)
+    assert rows[0]["trigger_type"] == "trend_exit"
+    assert rows[0]["filled_status"] == "failed"
+    assert rows[0]["failed_reason"] == "limit_down_sell_failed"
