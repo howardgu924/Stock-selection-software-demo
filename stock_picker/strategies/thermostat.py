@@ -975,7 +975,11 @@ def _market_bucket(market_regime: str) -> str:
 def _trigger_indicators(history: pd.DataFrame) -> dict[str, float | None]:
     prepared = _prepare_history(history)
     closes = pd.to_numeric(prepared.get("close"), errors="coerce").dropna()
-    volumes = pd.to_numeric(prepared.get("volume"), errors="coerce").dropna()
+    volumes = (
+        pd.to_numeric(prepared["volume"], errors="coerce").dropna()
+        if "volume" in prepared
+        else pd.Series(dtype="float64")
+    )
     if len(closes) >= 20:
         recent = closes.tail(20)
         mid = float(recent.mean())

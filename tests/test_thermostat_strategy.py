@@ -10,6 +10,7 @@ from stock_picker.strategies.thermostat import (
     STOCK_MODES,
     TRIGGER_TYPES,
     _grid_trigger_levels,
+    _trigger_indicators,
     calculate_regime_metrics,
     check_plan_with_daily_bar,
     classify_market_regime,
@@ -406,6 +407,13 @@ def test_t1_trend_outputs_bollinger_atr_triggers_and_batches() -> None:
     assert row["volume_ma20"] == 100000
     assert row["trend_batches"] == "40%,35%,25%"
     assert 0 < float(row["max_position_pct"]) <= 0.20
+
+
+def test_t1_trigger_indicators_allow_close_only_history_without_volume() -> None:
+    indicators = _trigger_indicators(pd.DataFrame({"close": _uptrend(20)}))
+
+    assert indicators["close"] is not None
+    assert indicators["volume_ma20"] is None
 
 
 def test_t1_range_outputs_three_layer_grid_and_position_caps() -> None:
