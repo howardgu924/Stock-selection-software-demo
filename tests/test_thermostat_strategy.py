@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from stock_picker.strategies.thermostat import (
     MARKET_POSITION_DISCOUNTS,
@@ -8,6 +9,7 @@ from stock_picker.strategies.thermostat import (
     REQUIRED_TRIGGER_PLAN_COLUMNS,
     STOCK_MODES,
     TRIGGER_TYPES,
+    _grid_trigger_levels,
     calculate_regime_metrics,
     check_plan_with_daily_bar,
     classify_market_regime,
@@ -275,8 +277,14 @@ def test_grid_candidates_are_scored_limited_and_keep_grid_parameters() -> None:
     range_rows = result.trigger_plan[result.trigger_plan["stock_mode"] == "range"]
     assert len(range_rows) == 4
     assert set(range_rows["grid_max_layers"].dropna()) == {3}
-    assert all(len(str(value).split("|")) == 3 for value in range_rows["grid_buy_levels"])
-    assert all(len(str(value).split("|")) == 3 for value in range_rows["grid_sell_levels"])
+    assert set(range_rows["configured_grid_layers"]) == {3}
+    for _, row in range_rows.iterrows():
+        buy_levels = [float(value) for value in str(row["grid_buy_levels"]).split("|")]
+        sell_levels = [float(value) for value in str(row["grid_sell_levels"]).split("|")]
+        assert len(buy_levels) == len(set(buy_levels)) == int(row["effective_grid_layers"])
+        assert len(sell_levels) == len(set(sell_levels)) == int(row["effective_grid_layers"])
+        assert buy_levels == sorted(buy_levels, reverse=True)
+        assert sell_levels == sorted(sell_levels)
     assert "grid_unit_pct" not in result.trigger_plan.columns
 
 
@@ -389,7 +397,13 @@ def test_t1_trend_outputs_bollinger_atr_triggers_and_batches() -> None:
     expected_buffer = min(0.2 * float(row["atr20"]), float(row["reference_price"]) * 0.005)
     assert row["trend_buy_trigger"] == round(float(row["boll_upper"]) + expected_buffer, 2)
     assert row["trend_reduce_trigger"] == row["boll_mid"]
-    assert row["trend_exit_trigger"] <= row["boll_lower"]
+    expected_exit = max(
+        float(row["boll_lower"]),
+        float(row["reference_price"]) - 2 * float(row["atr20"]),
+    )
+    assert row["trend_exit_trigger"] == round(expected_exit, 2)
+    assert row["effective_trend_exit_trigger"] == row["trend_exit_trigger"]
+    assert row["volume_ma20"] == 100000
     assert row["trend_batches"] == "40%,35%,25%"
     assert 0 < float(row["max_position_pct"]) <= 0.20
 
@@ -406,12 +420,59 @@ def test_t1_range_outputs_three_layer_grid_and_position_caps() -> None:
     row = result.trigger_plan.loc[0]
     assert row["stock_mode"] == "range"
     assert row["grid_upper"] > row["grid_mid"] > row["grid_lower"]
-    assert len(str(row["grid_buy_levels"]).split("|")) == 3
-    assert len(str(row["grid_sell_levels"]).split("|")) == 3
+    buy_levels = [float(value) for value in str(row["grid_buy_levels"]).split("|")]
+    sell_levels = [float(value) for value in str(row["grid_sell_levels"]).split("|")]
+    assert len(buy_levels) == len(sell_levels) == int(row["effective_grid_layers"])
+    assert buy_levels == sorted(set(buy_levels), reverse=True)
+    assert sell_levels == sorted(set(sell_levels))
     assert 0 < float(row["max_position_pct"]) <= 0.15
     assert float(row["grid_total_max_position_pct"]) == 0.40
-
     assert int(row["grid_max_layers"]) == 3
+    assert int(row["configured_grid_layers"]) == 3
+    assert 1 <= int(row["effective_grid_layers"]) <= 3
+    assert float(row["grid_layer_spacing_pct"]) in {0.035, 0.055, 0.075}
+
+
+def test_t1_grid_levels_are_deduplicated_and_ordered_after_bollinger_clipping() -> None:
+    grid = _grid_trigger_levels(
+        {
+            "boll_mid": 10.0,
+            "boll_lower": 9.3,
+            "boll_upper": 10.7,
+            "vol20": 0.015,
+        }
+    )
+
+    assert grid["buy"] == [9.65, 9.3]
+    assert grid["sell"] == [10.35, 10.7]
+    assert all(left > right for left, right in zip(grid["buy"], grid["buy"][1:]))
+    assert all(left < right for left, right in zip(grid["sell"], grid["sell"][1:]))
+    assert grid["configured_layers"] == 3
+    assert grid["effective_layers"] == 2
+    assert grid["spacing_pct"] == 0.035
+
+
+@pytest.mark.parametrize("cost_field", ["avg_cost", "average_cost", "trend_average_cost"])
+def test_t1_trend_exit_uses_holding_average_cost_and_never_decreases_previous_line(cost_field: str) -> None:
+    holding = {
+        "symbol": "600001.SH",
+        "name": "A",
+        "shares": 100,
+        cost_field: 20.0,
+        "last_effective_exit_trigger": 25.0,
+    }
+    result = evaluate_thermostat(
+        histories={"600001.SH": _ohlcv_history(_uptrend(140), "600001.SH")},
+        market_history=_ohlcv_history(_linear(3000, 3.0, 140), "000852.SH"),
+        holdings=pd.DataFrame([holding]),
+        cash=100000,
+        as_of="2025-05-20",
+    )
+
+    row = result.trigger_plan.loc[0]
+    expected_new = round(max(float(row["boll_lower"]), 20.0 - 2 * float(row["atr20"])), 2)
+    assert row["trend_exit_trigger"] == expected_new
+    assert row["effective_trend_exit_trigger"] == 25.0
 
 
 def test_t1_downtrend_and_chaotic_do_not_emit_normal_new_buy_plans() -> None:
@@ -467,11 +528,36 @@ def test_t1_holding_share_split_and_pending_sell_levels() -> None:
     assert result_rows[0]["pending_sell_level"] == "pending_exit"
 
 
+@pytest.mark.parametrize(
+    ("bar", "indicators"),
+    [
+        ({"open": 10.5, "high": 10.9, "low": 10.0, "close": 10.8, "volume": 300000}, {"boll_upper": 11.0, "volume_ma20": 100000}),
+        ({"open": 10.5, "high": 12.0, "low": 10.0, "close": 11.1, "volume": 300000}, {"boll_upper": 11.0, "volume_ma20": 100000}),
+        ({"open": 11.5, "high": 12.0, "low": 10.0, "close": 10.8, "volume": 300000}, {"boll_upper": 11.0, "volume_ma20": 100000}),
+        ({"open": 10.5, "high": 12.0, "low": 10.0, "close": 10.8, "volume": 249999}, {"boll_upper": 11.0, "volume_ma20": 100000}),
+        ({"high": 12.0, "low": 10.0, "close": 10.8, "volume": 300000}, {"boll_upper": 11.0, "volume_ma20": 100000}),
+        ({"open": 10.5, "high": 12.0, "low": 10.0, "close": 10.8}, {"boll_upper": 11.0, "volume_ma20": 100000}),
+        ({"open": 10.5, "high": 12.0, "low": 10.0, "close": 10.8, "volume": 300000}, {"boll_upper": 11.0}),
+    ],
+    ids=[
+        "high_not_above_upper",
+        "close_not_below_upper",
+        "upper_shadow_below_half",
+        "volume_ratio_below_2_5",
+        "missing_open",
+        "missing_volume",
+        "missing_volume_ma20",
+    ],
+)
+def test_t1_fake_breakout_requires_all_four_conditions(bar: dict[str, float], indicators: dict[str, float]) -> None:
+    assert is_fake_breakout(bar, indicators) is False
+
+
 def test_t1_limit_failure_fake_breakout_and_conservative_trigger_priority() -> None:
     assert is_one_word_limit_up({"open": 11.0, "high": 11.0, "low": 11.0, "close": 11.0}, 11.0)
 
     assert is_fake_breakout(
-        {"high": 12.0, "low": 10.0, "close": 10.8, "volume": 300000},
+        {"open": 10.5, "high": 12.0, "low": 10.0, "close": 10.8, "volume": 300000},
         {"boll_upper": 11.0, "volume_ma20": 100000},
     )
 

@@ -47,12 +47,17 @@ REQUIRED_TRIGGER_PLAN_COLUMNS = [
     "boll_mid",
     "boll_lower",
     "atr20",
+    "volume_ma20",
     "trend_buy_trigger",
     "trend_reduce_trigger",
     "trend_exit_trigger",
+    "effective_trend_exit_trigger",
     "trend_batches",
     "grid_buy_levels",
     "grid_sell_levels",
+    "configured_grid_layers",
+    "effective_grid_layers",
+    "grid_layer_spacing_pct",
     "grid_total_max_position_pct",
     "target_position_pct",
     "max_position_pct",
@@ -114,14 +119,19 @@ TRIGGER_PLAN_OUTPUT_COLUMNS = [
     "boll_mid",
     "boll_lower",
     "atr20",
+    "volume_ma20",
     "trend_buy_trigger",
     "trend_reduce_trigger",
     "trend_exit_trigger",
+    "effective_trend_exit_trigger",
     "trend_batches",
     "grid_lower",
     "grid_mid",
     "grid_upper",
     "grid_max_layers",
+    "configured_grid_layers",
+    "effective_grid_layers",
+    "grid_layer_spacing_pct",
     "grid_buy_levels",
     "grid_sell_levels",
     "grid_total_max_position_pct",
@@ -854,12 +864,17 @@ def _trigger_plan_fields(
         "boll_mid": None,
         "boll_lower": None,
         "atr20": None,
+        "volume_ma20": None,
         "trend_buy_trigger": "",
         "trend_reduce_trigger": "",
         "trend_exit_trigger": "",
+        "effective_trend_exit_trigger": "",
         "trend_batches": "",
         "grid_buy_levels": "",
         "grid_sell_levels": "",
+        "configured_grid_layers": 0,
+        "effective_grid_layers": 0,
+        "grid_layer_spacing_pct": None,
         "grid_total_max_position_pct": 0.0,
         "target_position_pct": 0.0,
         "max_position_pct": 0.0,
@@ -882,6 +897,7 @@ def _trigger_plan_fields(
             "boll_mid": indicators["boll_mid"],
             "boll_lower": indicators["boll_lower"],
             "atr20": indicators["atr20"],
+            "volume_ma20": indicators["volume_ma20"],
         }
     )
     if stock_mode == "trend":
@@ -890,13 +906,20 @@ def _trigger_plan_fields(
         lower = indicators["boll_lower"]
         atr20 = indicators["atr20"]
         close = last or indicators["close"]
+        trend_average_cost = _trend_average_cost(item, close, is_holding)
+        trend_exit_trigger = _trend_exit_trigger(lower, atr20, trend_average_cost)
+        effective_exit_trigger = _effective_trend_exit_trigger(
+            trend_exit_trigger,
+            item.get("last_effective_exit_trigger"),
+        )
         buffer = _trend_breakout_buffer(atr20, close)
         target_pct = round(0.20 * discount, 6)
         fields.update(
             {
                 "trend_buy_trigger": _round_price((upper + buffer) if upper is not None and buffer is not None else None),
                 "trend_reduce_trigger": mid,
-                "trend_exit_trigger": _trend_exit_trigger(lower, atr20, close),
+                "trend_exit_trigger": trend_exit_trigger,
+                "effective_trend_exit_trigger": effective_exit_trigger,
                 "trend_batches": "40%,35%,25%",
                 "target_position_pct": target_pct,
                 "max_position_pct": target_pct,
@@ -910,6 +933,9 @@ def _trigger_plan_fields(
             {
                 "grid_buy_levels": _format_levels(grid["buy"]),
                 "grid_sell_levels": _format_levels(grid["sell"]),
+                "configured_grid_layers": grid["configured_layers"],
+                "effective_grid_layers": grid["effective_layers"],
+                "grid_layer_spacing_pct": grid["spacing_pct"],
                 "grid_total_max_position_pct": 0.40,
                 "target_position_pct": target_pct,
                 "max_position_pct": target_pct,
@@ -949,6 +975,7 @@ def _market_bucket(market_regime: str) -> str:
 def _trigger_indicators(history: pd.DataFrame) -> dict[str, float | None]:
     prepared = _prepare_history(history)
     closes = pd.to_numeric(prepared.get("close"), errors="coerce").dropna()
+    volumes = pd.to_numeric(prepared.get("volume"), errors="coerce").dropna()
     if len(closes) >= 20:
         recent = closes.tail(20)
         mid = float(recent.mean())
@@ -967,6 +994,7 @@ def _trigger_indicators(history: pd.DataFrame) -> dict[str, float | None]:
         "boll_mid": _round_price(mid),
         "boll_lower": _round_price(lower),
         "atr20": _round_price(_atr20(prepared)),
+        "volume_ma20": float(volumes.tail(20).mean()) if not volumes.empty else None,
         "vol20": float(closes.pct_change().dropna().tail(20).std()) if len(closes) >= 3 else 0.0,
     }
 
@@ -979,26 +1007,61 @@ def _trend_breakout_buffer(atr20: float | None, close: float | None) -> float | 
     return min(0.2 * atr20, close * 0.005)
 
 
-def _trend_exit_trigger(lower: float | None, atr20: float | None, close: float | None) -> float | None:
+def _trend_average_cost(item: dict[str, object], close: float | None, is_holding: bool) -> float | None:
+    for field in ("avg_cost", "average_cost", "trend_average_cost"):
+        cost = _float_value(item.get(field))
+        if cost is not None:
+            return cost
+    return close if not is_holding else None
+
+
+def _trend_exit_trigger(
+    lower: float | None,
+    atr20: float | None,
+    trend_average_cost: float | None,
+) -> float | None:
     if lower is None:
         return None
-    if atr20 is None or close is None:
+    if atr20 is None or trend_average_cost is None:
         return lower
-    return _round_price(min(lower, close - 2 * atr20))
+    return _round_price(max(lower, trend_average_cost - 2 * atr20))
 
 
-def _grid_trigger_levels(indicators: dict[str, float | None]) -> dict[str, list[float]]:
+def _effective_trend_exit_trigger(new_trigger: float | None, previous_trigger: object) -> float | None:
+    previous = _float_value(previous_trigger)
+    if new_trigger is None:
+        return previous if previous is not None and previous > 0 else None
+    if previous is None or previous <= 0:
+        return new_trigger
+    return _round_price(max(previous, new_trigger))
+
+
+def _grid_trigger_levels(indicators: dict[str, float | None]) -> dict[str, object]:
     mid = indicators.get("boll_mid")
     upper = indicators.get("boll_upper")
     lower = indicators.get("boll_lower")
     if mid is None or upper is None or lower is None:
-        return {"buy": [], "sell": []}
+        return {
+            "buy": [],
+            "sell": [],
+            "configured_layers": 3,
+            "effective_layers": 0,
+            "spacing_pct": None,
+        }
     unit = _grid_unit_pct(float(indicators.get("vol20") or 0.0))
     buy_levels = [_round_price(float(mid) * (1 - unit * layer)) for layer in range(1, 4)]
     sell_levels = [_round_price(float(mid) * (1 + unit * layer)) for layer in range(1, 4)]
     buy_levels = [max(float(lower), float(level)) for level in buy_levels if level is not None]
     sell_levels = [min(float(upper), float(level)) for level in sell_levels if level is not None]
-    return {"buy": [_round_price(level) for level in buy_levels], "sell": [_round_price(level) for level in sell_levels]}
+    buy = sorted({_round_price(level) for level in buy_levels}, reverse=True)
+    sell = sorted({_round_price(level) for level in sell_levels})
+    return {
+        "buy": buy,
+        "sell": sell,
+        "configured_layers": 3,
+        "effective_layers": min(len(buy), len(sell)),
+        "spacing_pct": unit,
+    }
 
 
 def _grid_unit_pct(vol20: float) -> float:
@@ -1060,18 +1123,28 @@ def is_one_word_limit_up(row: dict[str, object] | pd.Series, limit_up_price: flo
 
 def is_fake_breakout(row: dict[str, object] | pd.Series, indicators: dict[str, object]) -> bool:
     values = _row_values(row)
+    open_price = _float_value(values.get("open"))
     close = _float_value(values.get("close"))
     high = _float_value(values.get("high"))
+    low = _float_value(values.get("low"))
     boll_upper = _float_value(indicators.get("boll_upper"))
     if boll_upper is None:
         boll_upper = _float_value(indicators.get("upper"))
     volume = _float_value(values.get("volume"))
     volume_ma20 = _float_value(indicators.get("volume_ma20"))
-    if close is None or high is None or boll_upper is None:
+    if any(value is None for value in (open_price, close, high, low, boll_upper, volume, volume_ma20)):
         return False
-    price_reversal = high > boll_upper and close <= boll_upper
-    weak_volume = volume is not None and volume_ma20 is not None and volume < volume_ma20 * 1.1
-    return bool(price_reversal or weak_volume)
+    if volume_ma20 <= 0:
+        return False
+    epsilon = 1e-12
+    upper_shadow_ratio = (high - max(open_price, close)) / max(high - low, epsilon)
+    volume_ratio = volume / volume_ma20
+    return bool(
+        high > boll_upper
+        and close < boll_upper
+        and upper_shadow_ratio >= 0.50
+        and volume_ratio >= 2.50
+    )
 
 
 def check_plan_with_daily_bar(
