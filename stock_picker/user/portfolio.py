@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 from pathlib import Path
 
 import pandas as pd
@@ -56,6 +57,14 @@ class ManualPortfolio:
     stamp_tax_rate: float
     positions: pd.DataFrame
     trades: pd.DataFrame
+    slippage_pct: float = 0.0
+    max_total_position_pct: float = 0.95
+
+    def __post_init__(self) -> None:
+        validate_account_risk_settings(
+            self.slippage_pct,
+            self.max_total_position_pct,
+        )
 
     def summary(self, marks: dict[str, float] | None = None) -> dict[str, object]:
         marks = {normalize_symbol(k): float(v) for k, v in (marks or {}).items()}
@@ -116,11 +125,14 @@ class ManualPortfolioStore:
         commission_rate: float = 0.0003,
         min_commission: float = 5.0,
         stamp_tax_rate: float = 0.001,
+        slippage_pct: float = 0.0,
+        max_total_position_pct: float = 0.95,
     ) -> ManualPortfolio:
         if principal <= 0:
             raise ValueError("principal must be greater than 0")
         if commission_rate < 0 or min_commission < 0 or stamp_tax_rate < 0:
             raise ValueError("fee rates must be greater than or equal to 0")
+        validate_account_risk_settings(slippage_pct, max_total_position_pct)
         portfolio = ManualPortfolio(
             principal=float(principal),
             cash=float(principal if cash is None else cash),
@@ -129,6 +141,8 @@ class ManualPortfolioStore:
             stamp_tax_rate=float(stamp_tax_rate),
             positions=_empty_positions(),
             trades=_empty_trades(),
+            slippage_pct=float(slippage_pct),
+            max_total_position_pct=float(max_total_position_pct),
         )
         self.save(portfolio)
         return portfolio
@@ -157,9 +171,15 @@ class ManualPortfolioStore:
             stamp_tax_rate=float(account.get("stamp_tax_rate", 0.001)),
             positions=_normalize_positions(positions),
             trades=_normalize_trades(trades),
+            slippage_pct=float(account.get("slippage_pct", 0.0)),
+            max_total_position_pct=float(account.get("max_total_position_pct", 0.95)),
         )
 
     def save(self, portfolio: ManualPortfolio) -> None:
+        validate_account_risk_settings(
+            portfolio.slippage_pct,
+            portfolio.max_total_position_pct,
+        )
         self.path.mkdir(parents=True, exist_ok=True)
         self.account_path.write_text(
             json.dumps(
@@ -169,6 +189,8 @@ class ManualPortfolioStore:
                     "commission_rate": portfolio.commission_rate,
                     "min_commission": portfolio.min_commission,
                     "stamp_tax_rate": portfolio.stamp_tax_rate,
+                    "slippage_pct": portfolio.slippage_pct,
+                    "max_total_position_pct": portfolio.max_total_position_pct,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -504,3 +526,15 @@ def _holding_days(entry_date: object, exit_date: object) -> int | None:
     except Exception:
         return None
     return max(int((exit_ - entry).days), 0)
+
+
+def validate_account_risk_settings(
+    slippage_pct: float,
+    max_total_position_pct: float,
+) -> None:
+    slippage = float(slippage_pct)
+    total_cap = float(max_total_position_pct)
+    if not isfinite(slippage) or slippage < 0:
+        raise ValueError("slippage_pct must be finite and greater than or equal to 0")
+    if not isfinite(total_cap) or not 0 < total_cap <= 1:
+        raise ValueError("max_total_position_pct must be finite and in (0, 1]")

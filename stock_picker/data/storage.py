@@ -16,9 +16,18 @@ class EventCacheValidationResult:
     warnings: list[dict[str, object]]
 
 
+@dataclass(frozen=True)
+class BacktestCacheValidationResult:
+    ok: bool
+    missing_dates: tuple[str, ...]
+    available_warmup_count: int
+
+
 class SQLiteMarketDataStore:
-    def __init__(self, db_path: str | Path = "data/market_data.sqlite3") -> None:
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: str | Path | None = None) -> None:
+        if db_path is None:
+            db_path = Path(__file__).resolve().parents[2] / "data" / "market_data.sqlite3"
+        self.db_path = Path(db_path).resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -93,6 +102,101 @@ class SQLiteMarketDataStore:
                 """,
                 rows,
             )
+
+    def save_backtest_daily_prices(self, frame: pd.DataFrame) -> None:
+        if frame.empty:
+            return
+        normalized = frame.copy()
+        for column in _BACKTEST_DAILY_PRICE_COLUMNS:
+            if column not in normalized:
+                normalized[column] = None
+        rows = normalized[_BACKTEST_DAILY_PRICE_COLUMNS].to_dict("records")
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO backtest_daily_prices (
+                    symbol, date, period, adjust_type, source, open, high, low,
+                    close, volume, amount, prev_close, limit_up_price,
+                    limit_down_price, is_suspended, limit_status, warning,
+                    updated_at
+                ) VALUES (
+                    :symbol, :date, :period, :adjust_type, :source, :open, :high,
+                    :low, :close, :volume, :amount, :prev_close, :limit_up_price,
+                    :limit_down_price, :is_suspended, :limit_status, :warning,
+                    CURRENT_TIMESTAMP
+                )
+                ON CONFLICT(symbol, date, period, adjust_type, source) DO UPDATE SET
+                    open = excluded.open,
+                    high = excluded.high,
+                    low = excluded.low,
+                    close = excluded.close,
+                    volume = excluded.volume,
+                    amount = excluded.amount,
+                    prev_close = excluded.prev_close,
+                    limit_up_price = excluded.limit_up_price,
+                    limit_down_price = excluded.limit_down_price,
+                    is_suspended = excluded.is_suspended,
+                    limit_status = excluded.limit_status,
+                    warning = excluded.warning,
+                    updated_at = excluded.updated_at
+                """,
+                rows,
+            )
+
+    def load_backtest_daily_prices(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        period: str,
+        adjust_type: str,
+        source: str,
+    ) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                f"""
+                SELECT {", ".join(_BACKTEST_DAILY_PRICE_SELECT_COLUMNS)}
+                FROM backtest_daily_prices
+                WHERE symbol = ? AND date >= ? AND date <= ?
+                  AND period = ? AND adjust_type = ? AND source = ?
+                ORDER BY date
+                """,
+                conn,
+                params=(
+                    symbol,
+                    self._date_for_query(start_date),
+                    self._date_for_query(end_date),
+                    period,
+                    adjust_type,
+                    source,
+                ),
+            )
+
+    def validate_backtest_daily_prices(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        period: str,
+        adjust_type: str,
+        source: str,
+        expected_dates: list[str] | tuple[str, ...],
+        warmup_before: str,
+        required_warmup_count: int,
+    ) -> BacktestCacheValidationResult:
+        rows = self.load_backtest_daily_prices(
+            symbol, start_date, end_date, period, adjust_type, source
+        )
+        cached_dates = set(rows["date"].astype(str)) if not rows.empty else set()
+        normalized_expected = tuple(self._date_for_query(item) for item in expected_dates)
+        missing = tuple(item for item in normalized_expected if item not in cached_dates)
+        cutoff = self._date_for_query(warmup_before)
+        warmup_count = sum(item < cutoff for item in cached_dates)
+        return BacktestCacheValidationResult(
+            ok=not missing and warmup_count >= required_warmup_count,
+            missing_dates=missing,
+            available_warmup_count=warmup_count,
+        )
 
     def save_stock_symbols(self, symbols: list[StockInfo]) -> None:
         if not symbols:
@@ -316,6 +420,31 @@ class SQLiteMarketDataStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS backtest_daily_prices (
+                    symbol TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    adjust_type TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume REAL,
+                    amount REAL,
+                    prev_close REAL,
+                    limit_up_price REAL,
+                    limit_down_price REAL,
+                    is_suspended INTEGER,
+                    limit_status TEXT,
+                    warning TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (symbol, date, period, adjust_type, source)
+                )
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
@@ -350,5 +479,30 @@ _EVENT_PRICE_COLUMNS = [
 
 _EVENT_PRICE_SELECT_COLUMNS = [
     *_EVENT_PRICE_COLUMNS,
+    "updated_at",
+]
+
+_BACKTEST_DAILY_PRICE_COLUMNS = [
+    "symbol",
+    "date",
+    "period",
+    "adjust_type",
+    "source",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "prev_close",
+    "limit_up_price",
+    "limit_down_price",
+    "is_suspended",
+    "limit_status",
+    "warning",
+]
+
+_BACKTEST_DAILY_PRICE_SELECT_COLUMNS = [
+    *_BACKTEST_DAILY_PRICE_COLUMNS,
     "updated_at",
 ]

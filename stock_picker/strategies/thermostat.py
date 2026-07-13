@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import sqrt
-from typing import Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from .thermostat_backtest import T1ThermostatBacktestRequest, T1ThermostatBacktestResult
 
 from stock_picker.data.models import normalize_symbol, symbol_code
 from stock_picker.strategies.event_backtest import (
@@ -173,7 +176,7 @@ class ThermostatResult:
 
 
 @dataclass
-class ThermostatBacktestResult:
+class LegacyThermostatBacktestResult:
     summary: pd.DataFrame
     regime_performance: pd.DataFrame
     diagnostics: pd.DataFrame
@@ -467,13 +470,23 @@ def run_thermostat_strategy(
 
 
 def backtest_thermostat_strategy(
+    request: T1ThermostatBacktestRequest,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
+) -> T1ThermostatBacktestResult:
+    """Run the public full T+1 thermostat backtest contract."""
+    from .thermostat_backtest import run_t1_thermostat_backtest
+
+    return run_t1_thermostat_backtest(request, progress_callback=progress_callback)
+
+
+def legacy_backtest_thermostat_strategy(
     service,
     symbols: list[str],
     start_date: str,
     end_date: str,
     initial_cash: float = 100000.0,
     benchmark_symbol: str = "000001.SH",
-) -> ThermostatBacktestResult:
+) -> LegacyThermostatBacktestResult:
     normalized = [normalize_symbol(symbol) for symbol in symbols]
     histories = {
         symbol: _prepare_history(service.get_history(symbol, start_date=start_date, end_date=end_date))
@@ -566,7 +579,7 @@ def backtest_thermostat_strategy(
         equity["date"] = pd.to_datetime(equity["date"], errors="coerce")
     regime_performance = _regime_performance(benchmark, equity)
     diagnostics = _diagnostics(regime_performance)
-    return ThermostatBacktestResult(
+    return LegacyThermostatBacktestResult(
         summary=summary,
         regime_performance=regime_performance,
         diagnostics=diagnostics,
@@ -588,7 +601,7 @@ def simplified_backtest_thermostat_strategy(
     end_date: str,
     initial_cash: float = 100000.0,
     benchmark_symbol: str = "000001.SH",
-) -> ThermostatBacktestResult:
+) -> LegacyThermostatBacktestResult:
     normalized = [normalize_symbol(symbol) for symbol in symbols]
     histories = {
         symbol: _prepare_history(service.get_history(symbol, start_date=start_date, end_date=end_date))
@@ -600,7 +613,7 @@ def simplified_backtest_thermostat_strategy(
     regime_performance = _regime_performance(benchmark, equity)
     diagnostics = _diagnostics(regime_performance)
     summary["backtest_type"] = "simplified_backtest"
-    return ThermostatBacktestResult(
+    return LegacyThermostatBacktestResult(
         summary=summary,
         regime_performance=regime_performance,
         diagnostics=diagnostics,

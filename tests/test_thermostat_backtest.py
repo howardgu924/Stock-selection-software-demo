@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from stock_picker.strategies.thermostat import backtest_thermostat_strategy
+from stock_picker.strategies.thermostat import legacy_backtest_thermostat_strategy
 
 
 class FakeService:
@@ -32,7 +32,7 @@ def _history(closes: list[float], symbol: str = "600001.SH") -> pd.DataFrame:
 
 
 def test_thermostat_backtest_summary_contains_required_metrics() -> None:
-    result = backtest_thermostat_strategy(
+    result = legacy_backtest_thermostat_strategy(
         FakeService(
             {
                 "600001.SH": _history([10 + i * 0.1 for i in range(80)], "600001.SH"),
@@ -62,7 +62,7 @@ def test_thermostat_backtest_summary_contains_required_metrics() -> None:
 
 
 def test_thermostat_backtest_splits_performance_by_regime() -> None:
-    result = backtest_thermostat_strategy(
+    result = legacy_backtest_thermostat_strategy(
         FakeService(
             {
                 "600001.SH": _history(([10 + i * 0.08 for i in range(40)] + [13 - i * 0.08 for i in range(40)]), "600001.SH"),
@@ -81,7 +81,7 @@ def test_thermostat_backtest_splits_performance_by_regime() -> None:
 
 
 def test_thermostat_backtest_reports_grid_and_trend_risk_counts() -> None:
-    result = backtest_thermostat_strategy(
+    result = legacy_backtest_thermostat_strategy(
         FakeService(
             {
                 "600001.SH": _history([10, 10.3, 9.8, 10.2] * 20, "600001.SH"),

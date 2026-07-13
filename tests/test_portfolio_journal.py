@@ -1,8 +1,97 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from stock_picker.user import ManualPortfolioStore
+
+
+def test_old_account_json_loads_new_risk_defaults(tmp_path) -> None:
+    account_dir = tmp_path / "account"
+    account_dir.mkdir()
+    (account_dir / "account.json").write_text(
+        json.dumps(
+            {
+                "principal": 100_000.0,
+                "cash": 80_000.0,
+                "commission_rate": 0.0003,
+                "min_commission": 5.0,
+                "stamp_tax_rate": 0.001,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    portfolio = ManualPortfolioStore(account_dir).load()
+
+    assert portfolio.slippage_pct == 0.0
+    assert portfolio.max_total_position_pct == 0.95
+
+
+def test_new_account_risk_settings_round_trip(tmp_path) -> None:
+    store = ManualPortfolioStore(tmp_path / "account")
+
+    initialized = store.initialize(
+        100_000.0,
+        slippage_pct=0.0008,
+        max_total_position_pct=0.90,
+    )
+    loaded = store.load()
+
+    assert initialized.slippage_pct == pytest.approx(0.0008)
+    assert initialized.max_total_position_pct == pytest.approx(0.90)
+    assert loaded.slippage_pct == pytest.approx(0.0008)
+    assert loaded.max_total_position_pct == pytest.approx(0.90)
+    account = json.loads(store.account_path.read_text(encoding="utf-8"))
+    assert account["slippage_pct"] == pytest.approx(0.0008)
+    assert account["max_total_position_pct"] == pytest.approx(0.90)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("slippage_pct", -0.0001),
+        ("slippage_pct", float("nan")),
+        ("slippage_pct", float("inf")),
+        ("max_total_position_pct", 0.0),
+        ("max_total_position_pct", 1.01),
+        ("max_total_position_pct", float("nan")),
+        ("max_total_position_pct", float("inf")),
+    ],
+)
+def test_account_rejects_invalid_risk_settings(tmp_path, field, value) -> None:
+    kwargs = {field: value}
+    with pytest.raises(ValueError, match=field):
+        ManualPortfolioStore(tmp_path / field).initialize(100_000.0, **kwargs)
+
+
+def test_account_load_validates_persisted_risk_settings(tmp_path) -> None:
+    account_dir = tmp_path / "account"
+    account_dir.mkdir()
+    (account_dir / "account.json").write_text(
+        json.dumps(
+            {
+                "principal": 100_000.0,
+                "cash": 100_000.0,
+                "slippage_pct": 0.0,
+                "max_total_position_pct": 2.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="max_total_position_pct"):
+        ManualPortfolioStore(account_dir).load()
+
+
+def test_account_save_revalidates_mutated_risk_settings(tmp_path) -> None:
+    store = ManualPortfolioStore(tmp_path / "account")
+    portfolio = store.initialize(100_000.0)
+    portfolio.slippage_pct = float("nan")
+
+    with pytest.raises(ValueError, match="slippage_pct"):
+        store.save(portfolio)
 
 
 def test_manual_portfolio_records_buy_sell_and_win_rate(tmp_path) -> None:

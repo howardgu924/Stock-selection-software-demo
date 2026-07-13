@@ -8,12 +8,19 @@ from stock_picker.strategies.event_backtest import (
 )
 from stock_picker.strategies.thermostat import (
     REQUIRED_ADVICE_COLUMNS,
-    ThermostatBacktestResult,
+    LegacyThermostatBacktestResult,
     ThermostatResult,
     backtest_thermostat_strategy,
     classify_regime,
     evaluate_thermostat,
+    legacy_backtest_thermostat_strategy,
     run_thermostat_strategy,
+)
+from stock_picker.strategies.thermostat_backtest import (
+    BacktestPrecision,
+    T1ThermostatBacktestRequest,
+    T1ThermostatBacktestResult,
+    run_t1_thermostat_backtest,
 )
 
 __all__ = [
@@ -24,11 +31,16 @@ __all__ = [
     "REQUIRED_ADVICE_COLUMNS",
     "ResolvedBacktestSettings",
     "Signal",
-    "ThermostatBacktestResult",
+    "BacktestPrecision",
+    "LegacyThermostatBacktestResult",
+    "T1ThermostatBacktestRequest",
+    "T1ThermostatBacktestResult",
     "ThermostatResult",
     "backtest_thermostat_strategy",
     "classify_regime",
     "evaluate_thermostat",
+    "legacy_backtest_thermostat_strategy",
     "resolve_backtest_settings",
     "run_thermostat_strategy",
+    "run_t1_thermostat_backtest",
 ]

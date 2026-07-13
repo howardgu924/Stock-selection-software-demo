@@ -7,6 +7,7 @@ import math
 import sys
 import threading
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stock_picker.data import DataSourceConfig, MarketDataService
+from stock_picker.data.backtest_data import BacktestDataRequest, load_t1_backtest_data
 from stock_picker.data.models import StockInfo, is_supported_stock_symbol, normalize_symbol, symbol_code
 from stock_picker.execution import build_execution_plan
 from stock_picker.pools import (
@@ -27,14 +29,23 @@ from stock_picker.pools import (
     resolve_market_range_pool,
     resolve_watchlist_pool,
 )
-from stock_picker.strategies import (
-    backtest_thermostat_strategy,
-    run_thermostat_strategy,
+from stock_picker.strategies import run_thermostat_strategy
+from stock_picker.strategies.backtest_params import ResolvedBacktestSettings, resolve_backtest_settings
+from stock_picker.strategies.thermostat_backtest import (
+    BacktestPrecision,
+    T1ThermostatBacktestRequest,
+    T1ThermostatBacktestResult,
+    run_t1_thermostat_backtest,
 )
 from stock_picker.reporting.t1_thermostat_report import (
     build_t1_thermostat_report,
     default_t1_thermostat_report_filename,
     export_t1_thermostat_excel,
+)
+from stock_picker.reporting.t1_thermostat_backtest_report import (
+    build_t1_thermostat_backtest_report,
+    default_t1_thermostat_backtest_report_filename,
+    export_t1_thermostat_backtest_excel,
 )
 from stock_picker.user import ManualPortfolioStore, WatchlistStore
 from examples.list_lhb_candidates import build_lhb_candidates
@@ -109,6 +120,11 @@ PROGRESS_STAGE_LABELS = {
     "evaluate_candidates": "正在评估候选股",
     "evaluate_holdings": "正在评估持仓",
     "build_execution_plan": "正在生成手工执行计划",
+    "parse_backtest_request": "解析回测请求",
+    "load_backtest_data": "加载并校验日线缓存",
+    "simulate_daily": "执行逐日 T+1 模拟",
+    "calculate_metrics": "计算回测指标",
+    "prepare_report": "准备报告下载",
     "done": "完成",
     "failed": "失败",
 }
@@ -701,6 +717,10 @@ class WebAppHandler(BaseHTTPRequestHandler):
             job_id = parse_qs(parsed.query).get("id", [""])[-1]
             self._send_thermostat_report(job_id)
             return
+        if path == "/thermostat-backtest-report":
+            job_id = parse_qs(parsed.query).get("id", [""])[-1]
+            self._send_t1_backtest_report(job_id)
+            return
         if path == "/":
             self._send_page(render_page(page="thermostat", form=_display_form_for_page("thermostat", LAST_FORM)))
             return
@@ -739,6 +759,9 @@ class WebAppHandler(BaseHTTPRequestHandler):
             elif path == "/thermostat-backtest-job":
                 page = "backtest"
                 result = handle_thermostat_backtest_job(form)
+            elif path == "/thermostat-backtest-cache-job":
+                page = "backtest"
+                result = handle_t1_backtest_cache_job(form)
             elif path == "/portfolio-init":
                 page = "portfolio"
                 result = handle_portfolio_init(form)
@@ -804,6 +827,12 @@ class WebAppHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def _send_thermostat_report(self, job_id: str) -> None:
+        self._send_xlsx_report(job_id, {"", "t1_strategy"})
+
+    def _send_t1_backtest_report(self, job_id: str) -> None:
+        self._send_xlsx_report(job_id, {"t1_backtest"})
+
+    def _send_xlsx_report(self, job_id: str, allowed_report_types: set[str]) -> None:
         with JOBS_LOCK:
             job = JOBS.get(job_id)
             if job is None:
@@ -811,6 +840,9 @@ class WebAppHandler(BaseHTTPRequestHandler):
                 return
             if job.status != "done":
                 self.send_error(HTTPStatus.CONFLICT, "report is not ready")
+                return
+            if job.report_type not in allowed_report_types:
+                self.send_error(HTTPStatus.NOT_FOUND, "report type does not match route")
                 return
             report_path = Path(job.report_path) if job.report_path else None
             filename = job.report_filename or (report_path.name if report_path is not None else "")
@@ -1061,6 +1093,15 @@ def handle_thermostat_backtest_job(form: dict[str, str]) -> RenderResult:
     )
 
 
+def handle_t1_backtest_cache_job(form: dict[str, str]) -> RenderResult:
+    job = start_t1_backtest_cache_job(form)
+    return RenderResult(
+        "T1 回测缓存任务已开始",
+        summaries=[{"job_id": job.job_id, "stage": job.stage, "node": job.node, "message": job.message}],
+        extra_html=render_job_progress(job.job_id),
+    )
+
+
 def _lhb_dates_from_form(form: dict[str, str]) -> tuple[str, str]:
     range_key = _value(form, "lhb_range", "1w")
     return lhb_range_dates(
@@ -1164,6 +1205,7 @@ class ThermostatJob:
         self.report_path = ""
         self.report_filename = ""
         self.report_error = ""
+        self.report_type = ""
 
     def update(self, event: dict[str, object]) -> None:
         with JOBS_LOCK:
@@ -1176,14 +1218,17 @@ class ThermostatJob:
             self.percent = _progress_percent(self.stage, self.completed, self.total)
             self.message = _progress_message(self.node, self.stage, self.completed, self.total, self.current_symbol)
 
-    def complete(self, result: RenderResult) -> None:
+    def complete(self, result: RenderResult, progress_callback=None) -> None:
+        _web_progress(progress_callback, "prepare_report", 0, 1)
+        result_html = render_message(result, None) + _thermostat_report_entry(self)
+        _web_progress(progress_callback, "prepare_report", 1, 1)
         with JOBS_LOCK:
             self.status = "done"
             self.stage = "done"
             self.node = "完成"
             self.percent = 100
             self.message = "恒温器评估完成。"
-            self.result_html = render_message(result, None) + _thermostat_report_entry(self)
+            self.result_html = result_html
 
     def fail(self, exc: Exception) -> None:
         with JOBS_LOCK:
@@ -1214,6 +1259,16 @@ def start_thermostat_backtest_job(form: dict[str, str]) -> ThermostatJob:
     return job
 
 
+def start_t1_backtest_cache_job(form: dict[str, str]) -> ThermostatJob:
+    job_id = uuid.uuid4().hex
+    job = ThermostatJob(job_id, form)
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    thread = threading.Thread(target=_run_t1_backtest_cache_job, args=(job_id,), daemon=True)
+    thread.start()
+    return job
+
+
 def _run_thermostat_job(job_id: str) -> None:
     job = JOBS[job_id]
     try:
@@ -1227,15 +1282,17 @@ def _run_thermostat_job(job_id: str) -> None:
 def _run_thermostat_backtest_job(job_id: str) -> None:
     job = JOBS[job_id]
     try:
-        symbols = _symbols(job.form)
-        total_symbols = max(len(symbols), 1)
-        job.update({"stage": "prepare_backtest", "completed": 0, "total": total_symbols, "node": "准备回测参数"})
-        job.update({"stage": "load_backtest_data", "completed": total_symbols, "total": total_symbols, "node": "加载回测数据"})
-        job.update({"stage": "simulate_trades", "completed": 0, "total": total_symbols, "node": "模拟交易"})
-        result = handle_thermostat_backtest(job.form)
-        job.update({"stage": "prepare_result_tables", "completed": total_symbols, "total": total_symbols, "node": "整理回测结果表"})
-        job.update({"stage": "prepare_report", "completed": total_symbols, "total": total_symbols, "node": "准备报告下载"})
-        job.complete(result)
+        result = handle_thermostat_backtest(job.form, progress_callback=job.update)
+        _prepare_t1_thermostat_backtest_report(job, result)
+        job.complete(result, progress_callback=job.update)
+    except Exception as exc:  # pragma: no cover - defensive live-web path
+        job.fail(exc)
+
+
+def _run_t1_backtest_cache_job(job_id: str) -> None:
+    job = JOBS[job_id]
+    try:
+        job.complete(handle_t1_backtest_cache(job.form, progress_callback=job.update))
     except Exception as exc:  # pragma: no cover - defensive live-web path
         job.fail(exc)
 
@@ -1261,6 +1318,7 @@ def job_status_payload(job_id: str) -> dict[str, object]:
 
 
 def _prepare_t1_thermostat_report(job: ThermostatJob, result: RenderResult) -> None:
+    job.report_type = "t1_strategy"
     try:
         trigger_plan = result.metadata.get("trigger_plan")
         errors = result.metadata.get("errors")
@@ -1280,6 +1338,28 @@ def _prepare_t1_thermostat_report(job: ThermostatJob, result: RenderResult) -> N
         job.report_error = str(exc)
 
 
+def _prepare_t1_thermostat_backtest_report(
+    job: ThermostatJob,
+    result: RenderResult,
+) -> None:
+    job.report_type = "t1_backtest"
+    try:
+        raw = result.metadata.get("backtest_result")
+        if not isinstance(raw, T1ThermostatBacktestResult):
+            raise TypeError("missing raw T1ThermostatBacktestResult")
+        report = build_t1_thermostat_backtest_report(raw)
+        filename = default_t1_thermostat_backtest_report_filename(report)
+        output = REPORT_DIR / filename
+        export_t1_thermostat_backtest_excel(report, output)
+        job.report_path = str(output)
+        job.report_filename = filename
+        job.report_error = ""
+    except Exception as exc:  # pragma: no cover - defensive live-web path
+        job.report_path = ""
+        job.report_filename = ""
+        job.report_error = str(exc)
+
+
 def _thermostat_report_entry(job: ThermostatJob) -> str:
     if job.report_error:
         return (
@@ -1289,11 +1369,23 @@ def _thermostat_report_entry(job: ThermostatJob) -> str:
             "</section>"
         )
     if job.report_path and job.report_filename:
-        href = f"/thermostat-report?id={html.escape(job.job_id)}"
+        if job.report_type == "t1_backtest":
+            href = f"/thermostat-backtest-report?id={html.escape(job.job_id)}"
+            label = "下载 T+1 恒温器回测报告"
+        else:
+            href = f"/thermostat-report?id={html.escape(job.job_id)}"
+            label = "下载新版 T+1 恒温器报告"
         return (
             '<section class="result-section result-section-report">'
             '<h3>报告下载</h3>'
-            f'<a class="button" href="{href}">下载新版 T+1 恒温器报告</a>'
+            f'<a class="button" href="{href}">{label}</a>'
+            "</section>"
+        )
+    if job.report_type == "t1_backtest":
+        return (
+            '<section class="result-section result-section-report">'
+            '<h3>报告下载</h3>'
+            '<p class="message">Excel 报告正在准备，请稍候。</p>'
             "</section>"
         )
     return ""
@@ -1349,6 +1441,11 @@ def _progress_percent(stage: str, completed: int, total: int) -> int:
         "evaluate_candidates": (60, 85),
         "evaluate_holdings": (85, 92),
         "build_execution_plan": (92, 98),
+        "parse_backtest_request": (4, 12),
+        "load_backtest_data": (12, 38),
+        "simulate_daily": (38, 78),
+        "calculate_metrics": (78, 91),
+        "prepare_report": (91, 98),
         "done": (100, 100),
     }
     start, end = ranges.get(stage, (5, 95))
@@ -1448,48 +1545,176 @@ def _first_record(frame: pd.DataFrame) -> dict[str, object]:
     return frame.iloc[0].to_dict()
 
 
-def handle_thermostat_backtest(form: dict[str, str]) -> RenderResult:
-    source = _value(form, "stock_pool_source", "manual")
-    if source not in {"manual", "watchlist", "market_range", "lhb"}:
-        label = OPTION_LABELS["stock_pool_source"].get(source, source)
-        return _stock_pool_error_result(_stock_pool_error(source, label, f"回测暂不支持股票池来源：{label}"))
+@dataclass(frozen=True)
+class ParsedT1BacktestInput:
+    service: object
+    pool: object
+    symbols: tuple[str, ...]
+    start: str
+    end: str
+    data_request: BacktestDataRequest
+    resolved_settings: ResolvedBacktestSettings
+    stock_pool_metadata: dict[str, object]
+    trend_total_max: float
+    precision: BacktestPrecision
+    runner_request: T1ThermostatBacktestRequest
+
+
+def _t1_pool_metadata(source: str) -> dict[str, object]:
+    metadata = {
+        "pool_type": source,
+        "membership": "static",
+        "generation_method": "as-submitted manual symbols",
+        "look_ahead_selection_warning": "",
+        "survivor_bias_warning": "",
+    }
+    if source == "watchlist":
+        metadata["generation_method"] = "as-saved watchlist membership"
+    elif source == "market_range":
+        metadata.update(
+            membership="static current snapshot",
+            generation_method="current market symbol range snapshot",
+            survivor_bias_warning="Survivor bias: current constituents are reused for the historical interval.",
+        )
+    elif source == "lhb":
+        metadata.update(
+            membership="untrusted/static",
+            generation_method="current aggregate LHB range selection",
+            look_ahead_selection_warning="Look-ahead bias: aggregate range membership is not historical daily membership.",
+        )
+    return metadata
+
+
+def parse_t1_backtest_input(form: dict[str, str]) -> ParsedT1BacktestInput:
+    """Parse the one canonical cache/run request without loading any bars."""
+    pool_source = _value(form, "stock_pool_source", "manual")
+    if pool_source not in {"manual", "watchlist", "market_range", "lhb"}:
+        raise ValueError(f"T1 回测不支持股票池来源：{pool_source}")
     service = _service(form)
     pool = _resolve_thermostat_stock_pool(form, service)
     if pool.errors or not pool.symbols:
-        return _stock_pool_error_result(pool)
-    symbols = [normalize_symbol(symbol) for symbol in pool.symbols]
-    start, end = _backtest_range_dates(form)
-    if not start or not end:
-        raise ValueError("恒温器回测需要开始日期和结束日期。")
-    result = backtest_thermostat_strategy(
+        raise ValueError("; ".join(pool.errors) or "T1 backtest stock pool is empty")
+    symbols = tuple(dict.fromkeys(normalize_symbol(symbol) for symbol in pool.symbols))
+    start_raw, end_raw = _backtest_range_dates(form)
+    try:
+        start_stamp = pd.Timestamp(start_raw)
+        end_stamp = pd.Timestamp(end_raw)
+    except Exception as exc:
+        raise ValueError("backtest start/end must be valid dates") from exc
+    if start_stamp > end_stamp:
+        raise ValueError("backtest start must not be after end")
+    start = start_stamp.strftime("%Y-%m-%d")
+    end = end_stamp.strftime("%Y-%m-%d")
+    account_path = _value(form, "account_path", DEFAULT_USER_PATH)
+    portfolio = _load_portfolio(account_path)
+    use_simulated_cash = _checked(form, "use_simulated_cash") or portfolio is None
+    cash_override = _float(form, "cash", 100000.0) if use_simulated_cash else None
+    resolved = resolve_backtest_settings(
+        portfolio,
+        {"initial_cash": cash_override} if cash_override is not None else None,
+    )
+    trend_total_max = _float(form, "trend_total_max", 0.65)
+    precision = BacktestPrecision.DAILY_APPROXIMATE
+    source = _value(form, "source", _value(form, "history_source", "baostock"))
+    refresh = _checked(form, "refresh")
+    benchmark = normalize_symbol(_value(form, "benchmark_symbol", "000300.SH"))
+    load_symbols = symbols + (() if benchmark in symbols else (benchmark,))
+    data_request = BacktestDataRequest(
+        symbols=load_symbols,
+        start=start,
+        end=end,
+        period="daily",
+        indicator_adjust="qfq",
+        execution_adjust="bfq",
+        source=source,
+        refresh=refresh,
+        warmup_trading_days=252,
+    )
+    metadata = _t1_pool_metadata(pool_source)
+    runner_request = T1ThermostatBacktestRequest(
         service=service,
         symbols=symbols,
-        start_date=start,
-        end_date=end,
-        initial_cash=_float(form, "cash", 100000.0),
+        start=start,
+        end=end,
+        initial_cash=cash_override,
+        resolved_account_settings=resolved,
+        source=source,
+        refresh=refresh,
+        stock_pool_metadata=metadata,
+        trend_total_base_max=trend_total_max,
+        precision=precision,
+        benchmark_symbol=benchmark,
+    )
+    return ParsedT1BacktestInput(
+        service=service,
+        pool=pool,
+        symbols=symbols,
+        start=start,
+        end=end,
+        data_request=data_request,
+        resolved_settings=resolved,
+        stock_pool_metadata=metadata,
+        trend_total_max=trend_total_max,
+        precision=precision,
+        runner_request=runner_request,
+    )
+
+
+def _web_progress(callback, stage: str, completed: int, total: int) -> None:
+    if callback is not None:
+        callback({"stage": stage, "completed": completed, "total": total})
+
+
+def handle_t1_backtest_cache(form: dict[str, str], progress_callback=None) -> RenderResult:
+    _web_progress(progress_callback, "parse_backtest_request", 0, 1)
+    parsed = parse_t1_backtest_input(form)
+    _web_progress(progress_callback, "parse_backtest_request", 1, 1)
+    _web_progress(progress_callback, "load_backtest_data", 0, 1)
+    bundle = load_t1_backtest_data(parsed.service, parsed.data_request)
+    _web_progress(progress_callback, "load_backtest_data", 1, 1)
+    _web_progress(progress_callback, "prepare_report", 0, 1)
+    issue_codes = [str(item.get("code") or item.get("issue_type") or "") for item in bundle.quality_issues]
+    summary = {
+        **bundle.load_summary,
+        "quality_issue_count": len(bundle.quality_issues),
+        "cache_gap_count": issue_codes.count("cache_gap"),
+        "insufficient_warmup_count": issue_codes.count("insufficient_data"),
+        "corporate_action_impact_count": len(bundle.corporate_action_impacts),
+        "cached_symbol_count": len(bundle.symbols),
+    }
+    result = RenderResult(
+        "T1 回测数据缓存",
+        summaries=[summary, parsed.stock_pool_metadata],
+        metadata={
+            "data_request": parsed.data_request,
+            "data_bundle": bundle,
+            "stock_pool_metadata": parsed.stock_pool_metadata,
+        },
+    )
+    _web_progress(progress_callback, "prepare_report", 1, 1)
+    return result
+
+
+def handle_thermostat_backtest(form: dict[str, str], progress_callback=None) -> RenderResult:
+    _web_progress(progress_callback, "parse_backtest_request", 0, 1)
+    try:
+        parsed = parse_t1_backtest_input(form)
+    except ValueError as exc:
+        source = _value(form, "stock_pool_source", "manual")
+        label = OPTION_LABELS["stock_pool_source"].get(source, source)
+        return _stock_pool_error_result(_stock_pool_error(source, label, str(exc)))
+    _web_progress(progress_callback, "parse_backtest_request", 1, 1)
+    result = run_t1_thermostat_backtest(
+        parsed.runner_request,
+        progress_callback=progress_callback,
     )
     return RenderResult(
-        title="恒温器回测诊断",
-        summaries=[
-            _first_record(result.summary),
-            _pool_summary_dict(pool),
-            _request_summary(
-                {**form, "start": start, "end": end},
-                ["stock_pool_source", "watchlist_name", "market_range", "backtest_date_range", "start", "end", "cash", "source", "refresh"],
-            ),
-        ],
-        tables=[
-            TableBlock("Summary", result.summary),
-            TableBlock("Regime Performance", result.regime_performance),
-            TableBlock("Diagnostics", result.diagnostics),
-            TableBlock("Daily Portfolio", result.daily_portfolio),
-            TableBlock("Trades", result.trades),
-            TableBlock("Positions", result.positions),
-            TableBlock("Symbol Performance", result.symbol_performance),
-            TableBlock("Data Quality", result.data_quality),
-            TableBlock("Parameters", result.parameters),
-        ],
-        extra_html='<p class="muted">报告下载区：事件驱动详细报告可由后续下载入口导出为 Excel。</p>',
+        title="T1 恒温器回测结果",
+        metadata={
+            "backtest_result": result,
+            "data_request": parsed.data_request,
+            "stock_pool_metadata": parsed.stock_pool_metadata,
+        },
     )
 
 
@@ -1503,6 +1728,8 @@ def handle_portfolio_init(form: dict[str, str]) -> RenderResult:
         commission_rate=_float(form, "commission_rate", 0.0003),
         min_commission=_float(form, "min_commission", 5.0),
         stamp_tax_rate=_float(form, "stamp_tax_rate", 0.001),
+        slippage_pct=_float(form, "slippage_pct", 0.0),
+        max_total_position_pct=_float(form, "max_total_position_pct", 0.95),
     )
     return RenderResult("账户已初始化", summaries=[portfolio.summary()])
 
@@ -1793,7 +2020,7 @@ def render_thermostat_backtest_section(form: dict[str, str]) -> str:
     <section id="backtest" class="workspace-section">
       <div class="page-head">
         <h2>恒温器回测诊断</h2>
-        <p class="status">页面状态：工作区用于正式事件驱动回测，旧简化回测仅作为明确标记的辅助诊断。</p>
+        <p class="status">页面状态：工作区用于 T+1 日线近似完整回测；旧事件驱动实现仅保留为显式 legacy 兼容入口。</p>
       </div>
       <form method="post" action="/thermostat-backtest-job">
         <h3>数据缓存区</h3>
@@ -1806,10 +2033,28 @@ def render_thermostat_backtest_section(form: dict[str, str]) -> str:
           {date_fields}
         </div>
         <div class="grid">
-          {input_number("cash", "初始资金", "100000", form)}
+          {input_text("account_path", "账户路径", DEFAULT_USER_PATH, form)}
+          {input_number("cash", "模拟初始资金", "100000", form)}
+          <label>趋势总仓位上限（0.60-0.70）
+            <input type="number" step="0.01" min="0.60" max="0.70" name="trend_total_max" value="{html.escape(_value(form, "trend_total_max", "0.65"))}">
+          </label>
           {source_fields(form)}
         </div>
-        {checkbox("refresh", "强制刷新历史数据", form)}
+        {checkbox("use_simulated_cash", "仅覆盖模拟初始资金（账户费用与总仓位上限保持不变）", form)}
+        <div class="grid">
+          <label>指标价格口径<input type="text" name="indicator_adjust" value="qfq" readonly></label>
+          <label>成交价格口径<input type="text" name="execution_adjust" value="bfq" readonly></label>
+        </div>
+        <label>回测精度
+          <input type="text" name="precision" value="日线近似" readonly>
+        </label>
+        <div class="precision-disclosures">
+          <p>回测精度：日线近似</p>
+          <p>分钟线：未使用</p>
+          <p>盘中触发时间：无法准确识别</p>
+          <p>同日多触发：使用保守顺序处理</p>
+        </div>
+        <button type="submit" formaction="/thermostat-backtest-cache-job">仅缓存并校验回测数据</button>
         <button type="submit">运行恒温器回测</button>
         <h3>回测结果区</h3>
         <p class="muted">运行后展示摘要、每日资产、交易明细、持仓和数据质量。</p>
@@ -1889,11 +2134,107 @@ def render_portfolio_section(form: dict[str, str]) -> str:
     """
 
 
+def render_svg_series(
+    values,
+    *,
+    title: str,
+    empty_text: str = "暂无可绘制数据",
+    width: int = 640,
+    height: int = 180,
+) -> str:
+    finite = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            finite.append(number)
+    escaped_title = html.escape(title)
+    if not finite:
+        return (
+            f'<div class="chart-empty" role="img" aria-label="{escaped_title}">'
+            f"{html.escape(empty_text)}</div>"
+        )
+    left, right, top, bottom = 36.0, width - 12.0, 16.0, height - 24.0
+    low, high = min(finite), max(finite)
+    spread = high - low
+    points = []
+    for index, value in enumerate(finite):
+        x = left if len(finite) == 1 else left + (right - left) * index / (len(finite) - 1)
+        y = (top + bottom) / 2 if spread == 0 else bottom - (value - low) * (bottom - top) / spread
+        points.append(f"{x:.2f},{y:.2f}")
+    return (
+        f'<svg class="backtest-chart" role="img" aria-label="{escaped_title}" '
+        f'viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">'
+        f"<title>{escaped_title}</title>"
+        f'<line x1="{left:.0f}" y1="{bottom:.0f}" x2="{right:.0f}" y2="{bottom:.0f}" />'
+        f'<polyline fill="none" points="{" ".join(points)}" />'
+        f'<text x="4" y="{top + 6:.0f}">{html.escape(f"{high:.4g}")}</text>'
+        f'<text x="4" y="{bottom:.0f}">{html.escape(f"{low:.4g}")}</text>'
+        "</svg>"
+    )
+
+
+def _metric_value(summary: dict[str, object], *names: str, default=0) -> object:
+    for name in names:
+        if name in summary and not pd.isna(summary[name]):
+            return summary[name]
+    return default
+
+
+def _render_t1_backtest_result(raw: T1ThermostatBacktestResult) -> str:
+    summary = _first_record(raw.summary.copy())
+    status = str(summary.get("status") or ("completed" if not raw.summary.empty else "no_trading_days"))
+    quality = {
+        "数据质量问题": len(raw.data_quality),
+        "缺失数据比例": _metric_value(summary, "missing_data_ratio"),
+        "公司行动影响": len(raw.corporate_actions),
+        "日线歧义次数": _metric_value(summary, "ambiguity_count"),
+    }
+    core = {
+        "初始资产": _metric_value(summary, "initial_asset", "initial_cash"),
+        "期末资产": _metric_value(summary, "final_asset", "final_assets"),
+        "总收益率": _metric_value(summary, "total_return"),
+        "年化收益率": _metric_value(summary, "annualized_return"),
+        "最大回撤": _metric_value(summary, "max_drawdown"),
+        "夏普比率": _metric_value(summary, "sharpe_ratio"),
+    }
+    equity_column = "total_asset" if "total_asset" in raw.equity_drawdown else "equity"
+    equity_values = raw.equity_drawdown[equity_column].tolist() if equity_column in raw.equity_drawdown else []
+    drawdown_values = raw.equity_drawdown["drawdown"].tolist() if "drawdown" in raw.equity_drawdown else []
+    family = {
+        "趋势批次": len(raw.trend_batches),
+        "网格层": len(raw.grid_layers),
+        "趋势成交批次": int((raw.trend_batches.get("status", pd.Series(dtype=str)) == "filled").sum()),
+        "网格待处理层": int((raw.grid_layers.get("status", pd.Series(dtype=str)) == "pending").sum()),
+    }
+    failures = {
+        "失败或撤单": len(raw.failed_cancelled_orders),
+        "待处理记录": len(raw.pending_history),
+        "待处理订单": _metric_value(summary, "pending_order_count", default=len(raw.pending_history)),
+    }
+    return (
+        '<section class="message t1-backtest-result"><h2>T1 恒温器回测结果</h2>'
+        f'<section class="result-section"><h3>回测状态</h3><p>{html.escape(status)}</p></section>'
+        f'<section class="result-section"><h3>数据质量</h3>{render_summary(quality)}</section>'
+        f'<section class="result-section"><h3>核心指标</h3>{render_summary(core)}</section>'
+        f'<section class="result-section"><h3>权益曲线</h3>{render_svg_series(equity_values, title="权益曲线")}</section>'
+        f'<section class="result-section"><h3>回撤曲线</h3>{render_svg_series(drawdown_values, title="回撤曲线")}</section>'
+        f'<section class="result-section"><h3>趋势 / 网格摘要</h3>{render_summary(family)}</section>'
+        f'<section class="result-section"><h3>失败 / 待处理摘要</h3>{render_summary(failures)}</section>'
+        '</section>'
+    )
+
+
 def render_message(result: RenderResult | None, error: str | None) -> str:
     if error:
         return f'<section class="message error"><strong>错误</strong><p>{html.escape(_translate_text(error))}</p></section>'
     if result is None:
         return ""
+    raw_backtest = result.metadata.get("backtest_result")
+    if isinstance(raw_backtest, T1ThermostatBacktestResult):
+        return _render_t1_backtest_result(raw_backtest)
     display_title = _display_title(result.title)
     is_backtest = "回测" in display_title
     parts = [f'<section class="message"><h2>{html.escape(display_title)}</h2>']
@@ -2025,6 +2366,8 @@ def render_account_initializer(form: dict[str, str]) -> str:
         {input_number("commission_rate", "佣金率", "0.0003", form)}
         {input_number("min_commission", "最低佣金", "5", form)}
         {input_number("stamp_tax_rate", "印花税率", "0.001", form)}
+        {input_number("slippage_pct", "滑点比例", "0.0", form)}
+        {input_number("max_total_position_pct", "账户总仓位上限", "0.95", form)}
       </div>
       <p class="muted">初始化后会更新账户概览。</p>
       <button type="submit">初始化账户</button>
@@ -2478,6 +2821,12 @@ def _display_form_for_page(page: str, form: dict[str, str]) -> dict[str, str]:
                 "stock_source",
                 "realtime_source",
                 "refresh",
+                "use_simulated_cash",
+                "trend_total_max",
+                "indicator_adjust",
+                "execution_adjust",
+                "precision",
+                "benchmark_symbol",
             ],
         )
         if _optional(form, "account_path") is not None:
@@ -2489,7 +2838,7 @@ def _display_form_for_page(page: str, form: dict[str, str]) -> dict[str, str]:
 def _display_form_after_success(path: str, form: dict[str, str]) -> dict[str, str]:
     if path == "/thermostat-job":
         return _display_form_for_page("thermostat", form)
-    if path in {"/thermostat-backtest", "/thermostat-backtest-job"}:
+    if path in {"/thermostat-backtest", "/thermostat-backtest-job", "/thermostat-backtest-cache-job"}:
         return _display_form_for_page("backtest", form)
     if path == "/portfolio-init":
         return {"path": _account_path_for_form(form, page="portfolio")}
@@ -2925,7 +3274,7 @@ def _page_for_path(path: str) -> str:
         "/watchlist-delete",
     }:
         return "portfolio" if path.startswith("/portfolio") else "thermostat"
-    if path in {"/thermostat-backtest", "/thermostat-backtest-job"}:
+    if path in {"/thermostat-backtest", "/thermostat-backtest-job", "/thermostat-backtest-cache-job"}:
         return "backtest"
     return "thermostat"
 

@@ -102,6 +102,35 @@ $env:JQDATA_PASSWORD="your_joinquant_password"
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
+## T+1 恒温器完整回测
+
+普通完整回测入口现为 `backtest_thermostat_strategy(T1ThermostatBacktestRequest(...))`，
+返回 `T1ThermostatBacktestResult`；它与 Web 的“恒温器回测”使用同一
+`run_t1_thermostat_backtest` 执行路径。旧事件驱动实现仅保留为显式
+`legacy_backtest_thermostat_strategy`，供仍依赖旧契约的兼容调用使用；通用
+`event_backtest.py` 及其他策略的期末平仓语义不受影响。
+
+完整回测是日线近似，不是分钟级或精确盘中重放。界面、报告和文档使用以下
+完全一致的披露：
+
+- 回测精度：日线近似
+- 分钟线：未使用
+- 盘中触发时间：无法准确识别
+- 同日多触发：使用保守顺序处理
+
+指标计划使用模拟日前完整的前复权（qfq）数据并要求 252 个交易日预热；触发、
+成交和收盘估值使用当日不复权（bfq）数据。默认
+`force_final_liquidation=False`，最后一日只按收盘价估值，不强制平仓；传入
+`True` 会被拒绝。`minute_5m` 只是未来扩展保留值，v1 未实现。
+
+缓存动作只补齐并校验数据，不运行交易；运行动作读取同一缓存契约后执行模拟。
+账户的手续费、最低佣金、印花税、滑点和总仓位上限沿用已保存账户设置，只有明确
+选择模拟资金时才覆盖本次初始现金，且不会写回账户。Excel 报告写入
+`data/reports/t1_thermostat_backtest_YYYYMMDD_HHMMSS.xlsx`，共 21 个固定工作表。
+
+执行、偏差、公司行为限制、报告工作表和验证命令详见
+[`docs/t1_thermostat_backtest.md`](docs/t1_thermostat_backtest.md)。
+
 ## Fetch Historical Data
 
 ```powershell

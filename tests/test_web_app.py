@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,10 @@ from openpyxl import load_workbook
 
 from examples import web_app
 from stock_picker.reporting.t1_thermostat_report import build_t1_thermostat_report, export_t1_thermostat_excel
+from stock_picker.reporting.t1_thermostat_backtest_report import (
+    EXPECTED_T1_THERMOSTAT_BACKTEST_SHEETS,
+)
+from stock_picker.strategies.thermostat_backtest import RESULT_TABLE_COLUMNS, T1ThermostatBacktestResult
 from stock_picker.user import ManualPortfolioStore, WatchlistStore
 
 
@@ -66,18 +71,10 @@ class FakeWebService:
         return _history("000001.SH", [3000 + i * 10 for i in range(40)])
 
 
-def _minimal_backtest_result() -> SimpleNamespace:
-    return SimpleNamespace(
-        summary=pd.DataFrame([{"backtest_type": "event_driven"}]),
-        regime_performance=pd.DataFrame(),
-        diagnostics=pd.DataFrame(),
-        daily_portfolio=pd.DataFrame(),
-        trades=pd.DataFrame(),
-        positions=pd.DataFrame(),
-        symbol_performance=pd.DataFrame(),
-        data_quality=pd.DataFrame(),
-        parameters=pd.DataFrame(),
-    )
+def _minimal_backtest_result() -> T1ThermostatBacktestResult:
+    frames = {name: pd.DataFrame(columns=columns) for name, columns in RESULT_TABLE_COLUMNS.items()}
+    frames["summary"] = pd.DataFrame([{"initial_asset": 100000.0, "final_asset": 100000.0, "total_return": 0.0}])
+    return T1ThermostatBacktestResult(**frames)
 
 
 def _sample_trigger_plan() -> pd.DataFrame:
@@ -821,6 +818,140 @@ def test_web_thermostat_job_runner_generates_t1_excel_report(tmp_path, monkeypat
     assert "详细字段" in book.sheetnames
 
 
+def test_web_backtest_job_builds_21_sheet_report_from_identical_raw_result(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(web_app, "REPORT_DIR", tmp_path)
+    raw = _minimal_backtest_result()
+    raw.daily_assets = pd.DataFrame(
+        [{"date": "2026-07-13", "cash": 100000.0, "total_asset": 100000.0}]
+    )
+    before = {name: frame.copy(deep=True) for name, frame in raw.tables.items()}
+    rendered = web_app.RenderResult(
+        "T1 恒温器回测",
+        metadata={"backtest_result": raw},
+    )
+    monkeypatch.setattr(
+        web_app,
+        "handle_thermostat_backtest",
+        lambda form, progress_callback=None: rendered,
+    )
+    job = web_app.ThermostatJob("backtest-report-job", {"symbols": "600001"})
+    web_app.JOBS[job.job_id] = job
+
+    try:
+        web_app._run_thermostat_backtest_job(job.job_id)
+    finally:
+        web_app.JOBS.pop(job.job_id, None)
+
+    assert job.status == "done"
+    assert job.report_type == "t1_backtest"
+    assert re.fullmatch(
+        r"t1_thermostat_backtest_\d{8}_\d{6}\.xlsx",
+        job.report_filename,
+    )
+    assert Path(job.report_path).exists()
+    assert "/thermostat-backtest-report?id=backtest-report-job" in job.result_html
+    assert "下载 T+1 恒温器回测报告" in job.result_html
+    assert load_workbook(job.report_path).sheetnames == EXPECTED_T1_THERMOSTAT_BACKTEST_SHEETS
+    for name, frame in raw.tables.items():
+        pd.testing.assert_frame_equal(frame, before[name])
+
+
+def test_web_backtest_report_failure_is_visible_and_raw_result_remains_renderable(monkeypatch) -> None:
+    raw = _minimal_backtest_result()
+    rendered = web_app.RenderResult(
+        "T1 恒温器回测",
+        metadata={"backtest_result": raw},
+    )
+    monkeypatch.setattr(
+        web_app,
+        "handle_thermostat_backtest",
+        lambda form, progress_callback=None: rendered,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "build_t1_thermostat_backtest_report",
+        lambda result: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    job = web_app.ThermostatJob("backtest-report-failed", {})
+    web_app.JOBS[job.job_id] = job
+
+    try:
+        web_app._run_thermostat_backtest_job(job.job_id)
+    finally:
+        web_app.JOBS.pop(job.job_id, None)
+
+    assert job.status == "done"
+    assert job.report_error == "disk full"
+    assert "报告导出失败" in job.result_html
+    assert "回测状态" in job.result_html
+    assert rendered.metadata["backtest_result"] is raw
+
+
+def test_completed_backtest_has_exactly_one_real_report_section_and_preparing_state(tmp_path) -> None:
+    raw = _minimal_backtest_result()
+    result = web_app.RenderResult(
+        "T1 恒温器回测",
+        metadata={"backtest_result": raw},
+    )
+    job = web_app.ThermostatJob("single-report-section", {})
+    job.report_type = "t1_backtest"
+    job.report_path = str(tmp_path / "t1_thermostat_backtest_20260713_090807.xlsx")
+    job.report_filename = Path(job.report_path).name
+
+    job.complete(result)
+
+    assert job.result_html.count('class="result-section result-section-report"') == 1
+    assert job.result_html.count("下载 T+1 恒温器回测报告") == 1
+    assert "Excel 报告将在下一阶段提供" not in job.result_html
+    assert "disabled" not in job.result_html
+
+    preparing = web_app.ThermostatJob("preparing-report", {})
+    preparing.report_type = "t1_backtest"
+    preparing_html = web_app._thermostat_report_entry(preparing)
+    assert preparing_html.count('class="result-section result-section-report"') == 1
+    assert "正在准备" in preparing_html
+    assert "disabled" not in preparing_html
+
+
+def test_web_backtest_report_route_is_type_safe_and_keeps_strategy_route(tmp_path) -> None:
+    backtest_path = tmp_path / "t1_thermostat_backtest_20260713_090807.xlsx"
+    backtest_path.write_bytes(b"backtest-xlsx")
+    strategy_path = tmp_path / "t1_thermostat_report_20260713.xlsx"
+    strategy_path.write_bytes(b"strategy-xlsx")
+    backtest_job = web_app.ThermostatJob("typed-backtest", {})
+    backtest_job.status = "done"
+    backtest_job.report_type = "t1_backtest"
+    backtest_job.report_path = str(backtest_path)
+    backtest_job.report_filename = backtest_path.name
+    strategy_job = web_app.ThermostatJob("typed-strategy", {})
+    strategy_job.status = "done"
+    strategy_job.report_type = "t1_strategy"
+    strategy_job.report_path = str(strategy_path)
+    strategy_job.report_filename = strategy_path.name
+    web_app.JOBS.update({backtest_job.job_id: backtest_job, strategy_job.job_id: strategy_job})
+    server = web_app.ThreadingHTTPServer(("127.0.0.1", 0), web_app.WebAppHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        with urlopen(
+            f"http://127.0.0.1:{port}/thermostat-backtest-report?id=typed-backtest",
+            timeout=10,
+        ) as response:
+            assert response.read() == b"backtest-xlsx"
+            assert response.headers["Content-Type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        with urlopen(
+            f"http://127.0.0.1:{port}/thermostat-report?id=typed-strategy",
+            timeout=10,
+        ) as response:
+            assert response.read() == b"strategy-xlsx"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        web_app.JOBS.pop(backtest_job.job_id, None)
+        web_app.JOBS.pop(strategy_job.job_id, None)
+
+
 def test_web_lhb_preview_builds_candidates_before_running_thermostat(monkeypatch) -> None:
     ranked = pd.DataFrame(
         [
@@ -1123,27 +1254,43 @@ def test_backtest_job_runner_emits_non_binary_progress_stages(monkeypatch) -> No
         def update(self, event: dict[str, object]) -> None:
             events.append(event)
 
-        def complete(self, result: web_app.RenderResult) -> None:
+        def complete(self, result: web_app.RenderResult, progress_callback=None) -> None:
+            progress_callback({"stage": "prepare_report", "completed": 0, "total": 1})
+            progress_callback({"stage": "prepare_report", "completed": 1, "total": 1})
             events.append({"stage": "done"})
 
         def fail(self, exc: Exception) -> None:
             raise exc
 
     monkeypatch.setitem(web_app.JOBS, "backtest-progress", FakeJob())
-    monkeypatch.setattr(web_app, "handle_thermostat_backtest", lambda form: _readability_backtest_result())
+    def fake_handle(form, progress_callback=None):
+        for stage in (
+            "parse_backtest_request",
+            "load_backtest_data",
+            "simulate_daily",
+            "calculate_metrics",
+        ):
+            progress_callback({"stage": stage, "completed": 2, "total": 2})
+        return _readability_backtest_result()
+
+    monkeypatch.setattr(web_app, "handle_thermostat_backtest", fake_handle)
 
     web_app._run_thermostat_backtest_job("backtest-progress")
 
     stages = [event.get("stage") for event in events]
-    assert stages[:5] == [
-        "prepare_backtest",
+    assert stages[:6] == [
+        "parse_backtest_request",
         "load_backtest_data",
-        "simulate_trades",
-        "prepare_result_tables",
+        "simulate_daily",
+        "calculate_metrics",
+        "prepare_report",
         "prepare_report",
     ]
-    assert all(event.get("total", 0) != 1 for event in events if event.get("stage") != "done")
-    assert any(event.get("completed") == 2 and event.get("total") == 2 for event in events)
+    assert all(event.get("total", 0) != 1 for event in events[:4])
+    assert events[4:6] == [
+        {"stage": "prepare_report", "completed": 0, "total": 1},
+        {"stage": "prepare_report", "completed": 1, "total": 1},
+    ]
 
 
 def test_backtest_result_display_formatting_does_not_mutate_raw_values() -> None:
@@ -1207,6 +1354,7 @@ def test_web_normal_results_do_not_show_untranslated_field_marker(monkeypatch) -
             pd.DataFrame([{"code": "600001", "name": "A", "net_buy": 1000, "rank": 1}]),
         ),
     )
+    monkeypatch.setattr(web_app, "run_t1_thermostat_backtest", lambda request, progress_callback=None: _minimal_backtest_result())
 
     results = [
         web_app.handle_thermostat(
@@ -1239,19 +1387,19 @@ def test_web_thermostat_rejects_invalid_and_empty_stock_pool(tmp_path) -> None:
     assert "abc" in invalid.summaries[0]["warnings"]
 
 
-def test_web_thermostat_backtest_outputs_diagnostics(monkeypatch) -> None:
+def test_web_thermostat_backtest_outputs_concise_t1_result(monkeypatch) -> None:
     fake = FakeWebService({"600001.SH": _history("600001.SH", [10 + i * 0.1 for i in range(80)])})
     monkeypatch.setattr(web_app, "_service", lambda form: fake)
+    raw = _minimal_backtest_result()
+    monkeypatch.setattr(web_app, "run_t1_thermostat_backtest", lambda request, progress_callback=None: raw)
 
     result = web_app.handle_thermostat_backtest(
         {"symbols": "600001", "start": "20260101", "end": "20260320", "cash": "100000"}
     )
 
-    titles = [table.title for table in result.tables]
-    assert titles[:3] == ["Summary", "Regime Performance", "Diagnostics"]
-    assert "Trades" in titles
-    assert "Daily Portfolio" in titles
-    assert result.summaries[0]["backtest_type"] == "event_driven"
+    assert result.tables == []
+    assert result.metadata["backtest_result"] is raw
+    assert "核心指标" in web_app.render_message(result, None)
 
 
 def test_backtest_page_shows_cache_parameters_results_and_download_sections() -> None:
@@ -1410,11 +1558,11 @@ def test_backtest_handler_resolves_watchlist_symbols_before_running(monkeypatch,
     store.add_symbols("观察", ["600519"])
     captured: dict[str, object] = {}
 
-    def fake_backtest(**kwargs):
-        captured.update(kwargs)
+    def fake_backtest(request, progress_callback=None):
+        captured["request"] = request
         return _minimal_backtest_result()
 
-    monkeypatch.setattr(web_app, "backtest_thermostat_strategy", fake_backtest)
+    monkeypatch.setattr(web_app, "run_t1_thermostat_backtest", fake_backtest)
     monkeypatch.setattr(web_app, "_service", lambda form: FakeWebService())
 
     result = web_app.handle_thermostat_backtest(
@@ -1429,10 +1577,11 @@ def test_backtest_handler_resolves_watchlist_symbols_before_running(monkeypatch,
         }
     )
 
-    assert captured["symbols"] == ["600519.SH"]
-    assert captured["start_date"] == "20260202"
-    assert captured["end_date"] == "20260702"
-    assert result.summaries[0]["backtest_type"] == "event_driven"
+    request = captured["request"]
+    assert request.symbols == ("600519.SH",)
+    assert request.start == "2026-02-02"
+    assert request.end == "2026-07-02"
+    assert result.metadata["backtest_result"] is not None
 
 
 def test_backtest_handler_blocks_empty_watchlist_without_running(monkeypatch, tmp_path) -> None:
@@ -1440,12 +1589,12 @@ def test_backtest_handler_blocks_empty_watchlist_without_running(monkeypatch, tm
     store.create("空组合")
     called = False
 
-    def fake_backtest(**kwargs):
+    def fake_backtest(request, progress_callback=None):
         nonlocal called
         called = True
         return _minimal_backtest_result()
 
-    monkeypatch.setattr(web_app, "backtest_thermostat_strategy", fake_backtest)
+    monkeypatch.setattr(web_app, "run_t1_thermostat_backtest", fake_backtest)
 
     result = web_app.handle_thermostat_backtest(
         {
@@ -1468,11 +1617,11 @@ def test_backtest_handler_ignores_inactive_manual_symbols(monkeypatch, tmp_path)
     store.add_symbols("观察", ["600519"])
     captured: dict[str, object] = {}
 
-    def fake_backtest(**kwargs):
-        captured.update(kwargs)
+    def fake_backtest(request, progress_callback=None):
+        captured["request"] = request
         return _minimal_backtest_result()
 
-    monkeypatch.setattr(web_app, "backtest_thermostat_strategy", fake_backtest)
+    monkeypatch.setattr(web_app, "run_t1_thermostat_backtest", fake_backtest)
     monkeypatch.setattr(web_app, "_service", lambda form: FakeWebService())
 
     web_app.handle_thermostat_backtest(
@@ -1486,7 +1635,7 @@ def test_backtest_handler_ignores_inactive_manual_symbols(monkeypatch, tmp_path)
         }
     )
 
-    assert captured["symbols"] == ["600519.SH"]
+    assert captured["request"].symbols == ("600519.SH",)
 
 
 def test_backtest_result_summary_uses_active_source_and_resolved_dates(monkeypatch, tmp_path) -> None:
@@ -1494,7 +1643,7 @@ def test_backtest_result_summary_uses_active_source_and_resolved_dates(monkeypat
     store.create("观察")
     store.add_symbols("观察", ["600519"])
 
-    monkeypatch.setattr(web_app, "backtest_thermostat_strategy", lambda **kwargs: _minimal_backtest_result())
+    monkeypatch.setattr(web_app, "run_t1_thermostat_backtest", lambda request, progress_callback=None: _minimal_backtest_result())
     monkeypatch.setattr(web_app, "_service", lambda form: FakeWebService())
 
     result = web_app.handle_thermostat_backtest(
@@ -1507,24 +1656,21 @@ def test_backtest_result_summary_uses_active_source_and_resolved_dates(monkeypat
         }
     )
 
-    merged = {key: value for summary in result.summaries for key, value in summary.items()}
-    assert merged["stock_pool_source"] == "watchlist"
-    assert merged["name"] == "观察"
-    assert merged["filtered_count"] == 1
-    assert merged["backtest_date_range"] == "5m"
-    assert merged["start"] == "20260202"
-    assert merged["end"] == "20260702"
+    assert result.metadata["stock_pool_metadata"]["pool_type"] == "watchlist"
+    request = result.metadata["data_request"]
+    assert request.start == "2026-02-02"
+    assert request.end == "2026-07-02"
 
 
 def test_backtest_handler_rejects_unsupported_candidate_source_without_fallback(monkeypatch) -> None:
     called = False
 
-    def fake_backtest(**kwargs):
+    def fake_backtest(request, progress_callback=None):
         nonlocal called
         called = True
         return _minimal_backtest_result()
 
-    monkeypatch.setattr(web_app, "backtest_thermostat_strategy", fake_backtest)
+    monkeypatch.setattr(web_app, "run_t1_thermostat_backtest", fake_backtest)
 
     result = web_app.handle_thermostat_backtest(
         {
