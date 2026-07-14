@@ -1,0 +1,401 @@
+T+1软适应中短期趋势系统 V1.3.5
+Phase 3成交确定性与Decimal修复补充
+版本日期：2026-07-14
+
+一、版本目的
+
+V1.3.5不改变Phase 1、Phase 2及V1.3.4的交易时点和直接成交原则。
+
+本版本只修复Phase 3审查发现的问题：
+
+1. 未来K线或无关证券不得影响当前成交；
+2. GrossAmount必须先以完整Decimal精度计算费用，不能提前量化；
+3. 费用规则不得接受float；
+4. INVALID原因不得依赖输入行号；
+5. 零成交金额不得收取最低佣金；
+6. 冻结费用快照日期、数量类型和失败结果字段契约。
+
+
+二、目标K线优先筛选
+
+execute_fill必须按以下顺序处理：
+
+1. 解析并规范化FillRequest.symbol；
+2. 确定唯一目标execution_trade_date和execution_bar_start；
+3. 从minute_bars中只筛选：
+   - 规范化证券代码等于请求证券；
+   - bar_start等于目标执行时点；
+4. 只对该目标K线组执行完整分钟契约校验；
+5. 目标组为空时返回：
+   status = FAILED
+   failure_reason = missing_execution_bar
+   retryable = true
+
+不得在筛选目标时点之前校验整个minute_bars批次。
+
+因此：
+
+- 更晚K线不得影响当前成交；
+- 更早但无关的K线不得影响当前成交；
+- 其他证券的非法K线不得影响当前成交；
+- 当前FillEngine不得读取目标执行时点之后的内容来决定目标Open是否成交。
+
+
+三、目标证券代码别名
+
+筛选目标组时，允许以下代码归一化为同一证券：
+
+600001
+600001.SH
+
+若同一目标时点存在多个别名记录：
+
+1. 所有必需字段完全一致：
+   确定性去重后使用一次。
+
+2. 任一必需字段冲突：
+   status = INVALID
+   failure_reason = conflicting_duplicate_bar:<规范化时间>
+   retryable = false
+
+无关证券代码无法解析时，不得影响目标成交。
+
+
+四、稳定INVALID原因
+
+禁止在failure_reason或INVALID原因中包含：
+
+- DataFrame行号；
+- 原始索引位置；
+- 输入遍历次序。
+
+固定原因包括但不限于：
+
+invalid_symbol
+invalid_trade_date
+invalid_bar_start
+invalid_timezone
+trade_date_bar_start_mismatch
+invalid_ohlc
+invalid_volume
+invalid_trade_status
+invalid_limit_status
+conflicting_duplicate_bar:<规范化时间>
+
+同一逻辑错误在输入行顺序改变后必须返回同一原因。
+
+
+五、Decimal输入边界
+
+1. FeeRuleSnapshot中的以下字段只接受：
+
+- Decimal；
+- 可精确解析的十进制字符串。
+
+字段：
+
+commission_rate
+minimum_commission
+buy_transfer_fee_rate
+sell_transfer_fee_rate
+buy_settlement_fee_rate
+sell_settlement_fee_rate
+stamp_tax_rate
+
+2. 明确拒绝：
+
+- float；
+- bool；
+- NaN；
+- Infinity；
+- -Infinity；
+- 无法解析字符串。
+
+非法时：
+
+status = INVALID
+failure_reason = invalid_fee_snapshot
+retryable = false
+
+3. cash_available同样只接受Decimal或十进制字符串，不接受float或bool。
+
+4. 分钟K线Open可以来自常见数值列。转换规则为：
+
+Decimal(str(open_value))
+
+但必须先通过有限正数校验。
+
+5. 所有费率必须满足：
+
+0 <= rate <= 1
+
+minimum_commission必须满足：
+
+minimum_commission >= 0
+
+否则为invalid_fee_snapshot。
+
+
+六、规则快照日期
+
+TradingRuleSnapshot和FeeRuleSnapshot均必须包含：
+
+effective_date
+
+该日期必须与execution_trade_date完全相同。
+
+原因是本系统传入的是“当日规则快照”，而不是仅含起始生效日的规则记录。
+
+日期不一致时：
+
+status = INVALID
+failure_reason = invalid_rule_snapshot
+或
+failure_reason = invalid_fee_snapshot
+
+不得使用未来快照或无法确认仍有效的陈旧快照。
+
+
+七、交易规则字段
+
+以下字段必须为正整数，且bool不视为整数：
+
+buy_lot_size
+partial_sell_lot_size
+
+price_tick必须为有限正Decimal或十进制字符串。
+
+非法时：
+
+status = INVALID
+failure_reason = invalid_rule_snapshot
+retryable = false
+
+
+八、数量字段
+
+requested_qty、position_qty、sellable_qty必须为整数且bool不合法。
+
+规则：
+
+requested_qty > 0
+position_qty >= 0
+sellable_qty >= 0
+
+非法类型、负数、小数或字符串数量：
+
+status = INVALID
+failure_reason = invalid_quantity
+retryable = false
+
+数量合法但：
+
+requested_qty > position_qty：
+status = FAILED
+failure_reason = insufficient_position
+
+requested_qty > sellable_qty：
+status = FAILED
+failure_reason = insufficient_sellable_qty
+
+
+九、GrossAmount和费用计算顺序
+
+1. 原始成交金额
+
+RawGrossAmount =
+ExecutionPrice × requested_qty
+
+RawGrossAmount在计算费用前不得量化到人民币分。
+
+2. 佣金
+
+RawCommission =
+RawGrossAmount × commission_rate
+
+Commission =
+ROUND_HALF_UP(
+max(RawCommission, minimum_commission),
+2位小数
+)
+
+3. 其他费用
+
+每项均以RawGrossAmount计算，再分别ROUND_HALF_UP到分：
+
+TransferFee =
+ROUND_HALF_UP(
+RawGrossAmount × 对应transfer_fee_rate,
+2位小数
+)
+
+SettlementFee =
+ROUND_HALF_UP(
+RawGrossAmount × 对应settlement_fee_rate,
+2位小数
+)
+
+StampTax =
+ROUND_HALF_UP(
+RawGrossAmount × stamp_tax_rate,
+2位小数
+)
+
+4. 总费用
+
+TotalFees =
+ROUND_HALF_UP(
+Commission
++ TransferFee
++ SettlementFee
++ StampTax,
+2位小数
+)
+
+买入StampTax固定为0.00。
+
+5. 展示成交金额
+
+GrossAmount =
+ROUND_HALF_UP(
+RawGrossAmount,
+2位小数
+)
+
+6. 买入现金需求
+
+CashRequired =
+ROUND_HALF_UP(
+RawGrossAmount + TotalFees,
+2位小数
+)
+
+7. 卖出净回款
+
+NetProceeds =
+ROUND_HALF_UP(
+RawGrossAmount - TotalFees,
+2位小数
+)
+
+禁止先把RawGrossAmount量化为GrossAmount后再乘费率。
+
+
+十、零成交金额
+
+公开费用函数对gross_amount的行为冻结为：
+
+1. gross_amount = 0：
+   所有费用返回0.00；
+   不收取最低佣金。
+
+2. gross_amount < 0：
+   抛出稳定领域错误或返回invalid_fee_snapshot，不得计算费用。
+
+正常FillEngine不会对0数量生成成交费用。
+
+
+十一、成交结果字段
+
+1. FILLED
+
+- filled_qty = requested_qty
+- execution_price为Open
+- 金额字段按实际结果填写
+- failure_reason为空
+- retryable = false
+
+2. FAILED或INVALID
+
+- filled_qty = 0
+- execution_price = None
+- gross_amount = 0.00
+- commission = 0.00
+- stamp_tax = 0.00
+- transfer_fee = 0.00
+- settlement_fee = 0.00
+- total_fees = 0.00
+- cash_required = 0.00
+- net_proceeds = 0.00
+- failure_reason必须非空
+
+可以保留目标execution_trade_date和execution_bar_start，用于说明失败时点；不得保留误导性的成交价格或金额。
+
+3. simplified_direct_fill始终为true。
+
+
+十二、时区补充测试要求
+
+必须补充：
+
+1. UTC时间转换到Asia/Shanghai后跨本地日期；
+2. naive与aware混合输入；
+3. trade_date与上海本地日期不一致；
+4. 周五14:55后，交易日历下一日为周二时，必须直接解析到周二09:30。
+
+
+十三、输入不可变性
+
+execute_fill和分钟契约函数不得原地修改：
+
+- 输入DataFrame；
+- FillRequest；
+- TradingRuleSnapshot；
+- FeeRuleSnapshot；
+- trading_calendar。
+
+测试前后应比较输入对象内容。
+
+
+十四、必须新增或强化的测试
+
+1. 有效10:05目标K线附带非法10:10未来K线，成交结果不变。
+2. 有效目标K线附带其他证券非法K线，成交结果不变。
+3. 目标代码600001与600001.SH相同记录去重。
+4. 目标代码别名冲突记录INVALID。
+5. INVALID原因不随输入行顺序变化。
+6. RawGrossAmount=1.005、费率0.5时佣金为0.50。
+7. GrossAmount展示为1.01，但费用仍按1.005计算。
+8. float费率被拒绝。
+9. Decimal和十进制字符串费率结果一致。
+10. 负费率、NaN、inf、负最低佣金被拒绝。
+11. rate > 1被拒绝。
+12. gross_amount=0时全部费用为0。
+13. TradingRuleSnapshot和FeeRuleSnapshot日期必须等于执行日。
+14. buy_lot_size和partial_sell_lot_size为0时INVALID。
+15. requested_qty为小数、字符串、bool时INVALID。
+16. position_qty和sellable_qty为负数时INVALID。
+17. FAILED和INVALID的全部金额字段为0.00。
+18. 输入DataFrame和模型对象不被修改。
+19. UTC跨本地日期和混合时区。
+20. 周五后周一休市、交易日历跳周二。
+21. 原有Phase 3直接成交、涨跌停方向和下一K线测试继续通过。
+22. Phase 1、Phase 2及完整项目测试继续通过。
+
+
+十五、验收标准
+
+1. 三项P0全部修复。
+2. 两项P1全部修复。
+3. 新增测试覆盖本文件第十四章。
+4. Phase 1的80项测试继续通过。
+5. Phase 2的93项测试继续通过。
+6. Phase 3全部测试通过。
+7. 完整项目无新增失败。
+8. 不修改任何禁止模块。
+9. 修复后再次进行只读审查。
+10. 只读审查通过后才允许提交Phase 3检查点。
+
+
+十六、版本结论
+
+V1.3.5不增加成交复杂度。
+
+它只确保：
+
+- 当前成交只依赖当前目标K线；
+- 费用以完整Decimal金额计算；
+- float不能污染费率；
+- 数据顺序不改变错误原因；
+- 零成交不收最低佣金；
+- 快照日期、数量和失败结果具有唯一契约。

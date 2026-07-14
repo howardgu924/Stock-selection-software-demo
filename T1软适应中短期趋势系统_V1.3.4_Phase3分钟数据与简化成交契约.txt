@@ -1,0 +1,399 @@
+T+1软适应中短期趋势系统 V1.3.4
+Phase 3分钟数据与简化成交契约
+版本日期：2026-07-14
+
+一、版本目的
+
+V1.3.4不修改Phase 1的OpportunityScore，也不修改Phase 2的MarketOverlay、背离、RiskOverlay、ExecutionGate和EmergencyMarketGate。
+
+本版本冻结：
+
+1. 5分钟K线数据契约；
+2. 指定执行时点直接成交；
+3. 买卖成交资格检查；
+4. 费用计算接口；
+5. 跨午休和跨交易日的下一执行K线；
+6. 成交成功、失败和可重试状态。
+
+本阶段不实现PositionSizing、T+1持仓状态机、ExitEngine、PendingSell状态机、数据库、网页或报告。
+
+二、建议模块
+
+新增：
+
+stock_picker/strategies/adaptive_trend_v1_3/
+- minute_contract.py
+- fill_engine.py
+- phase3_models.py
+
+允许更新新策略目录的__init__.py。
+
+禁止修改：
+
+- Phase 1与Phase 2既有公式；
+- 旧恒温器与旧事件回测；
+- 数据库与网页；
+- PositionSizing与T1Loss；
+- T+1持仓状态机；
+- ExitEngine与PendingSell；
+- 报告。
+
+三、分钟时间契约
+
+1. 所有分钟时间使用Asia/Shanghai。
+2. bar_start表示5分钟K线开始时刻。
+3. 无时区时间按Asia/Shanghai解释；混合其他时区或无法统一时返回INVALID。
+4. 合法bar_start：
+   - 09:30至11:25，每5分钟一根；
+   - 13:00至14:55，每5分钟一根；
+   - 全天共48根；
+   - 午休期间不得产生K线。
+
+四、必需字段
+
+每根K线必须包含：
+
+symbol
+trade_date
+bar_start
+open
+high
+low
+close
+volume
+trade_status
+limit_status
+
+trade_status允许：
+
+normal
+suspended
+unknown
+
+limit_status允许：
+
+normal
+limit_up
+limit_down
+unknown
+
+五、分钟K线有效性
+
+有效K线必须满足：
+
+1. symbol可规范化；
+2. trade_date与bar_start日期一致；
+3. bar_start属于合法A股5分钟时刻；
+4. open/high/low/close可转换为有限正数；
+5. high >= max(open, close, low)；
+6. low <= min(open, close, high)；
+7. volume为有限数值且volume >= 0；
+8. trade_status与limit_status属于允许枚举。
+
+不得自动填补、前向填充或使用相邻K线替代。
+
+六、重复K线
+
+同一symbol、trade_date、bar_start：
+
+- 必需字段完全一致：确定性去重；
+- 任一必需字段不同：INVALID，原因conflicting_duplicate_bar:<bar_start>；
+- 不得使用keep="last"。
+
+七、成交价格
+
+1. 所有成交价格直接使用执行K线Open。
+2. 不使用High、Low、Close、Volume、Amount、VWAP、买卖盘、滑点、成交容量、部分成交或排队。
+3. 修改执行K线High、Low、Close或Volume不得改变成交价格和成交资格。
+4. 成交必须使用原始未复权价格。
+
+八、交易规则快照
+
+FillEngine由调用方传入TradingRuleSnapshot：
+
+exchange
+board
+security_type
+effective_date
+buy_lot_size
+partial_sell_lot_size
+full_exit_odd_lot_allowed
+price_tick
+
+Phase 3不自行计算涨跌停价，直接使用limit_status。
+
+九、费用规则快照
+
+调用方传入FeeRuleSnapshot：
+
+commission_rate
+minimum_commission
+buy_transfer_fee_rate
+sell_transfer_fee_rate
+buy_settlement_fee_rate
+sell_settlement_fee_rate
+stamp_tax_rate
+
+费用公式：
+
+BuyCommission =
+max(GrossAmount × commission_rate, minimum_commission)
+
+SellCommission =
+max(GrossAmount × commission_rate, minimum_commission)
+
+BuyFees =
+BuyCommission
++ GrossAmount × buy_transfer_fee_rate
++ GrossAmount × buy_settlement_fee_rate
+
+SellFees =
+SellCommission
++ GrossAmount × sell_transfer_fee_rate
++ GrossAmount × sell_settlement_fee_rate
++ GrossAmount × stamp_tax_rate
+
+CashRequired =
+GrossAmount + BuyFees
+
+NetProceeds =
+GrossAmount - SellFees
+
+使用Decimal计算，金额ROUND_HALF_UP保留人民币分。
+
+十、买入成交
+
+1. 买入信号10:00确认。
+2. 同日10:05执行。
+3. 成交价为10:05 K线Open。
+4. requested_qty由调用方传入，FillEngine不缩量。
+
+成功条件：
+
+- 10:05 K线存在且有效；
+- trade_status = normal；
+- limit_status不是limit_up或unknown；
+- requested_qty > 0；
+- requested_qty是buy_lot_size整数倍；
+- CashAvailable >= CashRequired；
+- 规则快照有效。
+
+允许limit_down买入。
+
+失败条件：
+
+- suspended；
+- unknown状态；
+- limit_up；
+- K线缺失、冲突或Open非法；
+- 数量非法或不符合交易单位；
+- 现金不足；
+- 规则快照非法。
+
+失败时整笔不成交，不追价，不自动改到10:10。
+
+十一、卖出成交
+
+1. 按指定执行K线Open成交。
+2. requested_qty由调用方传入。
+
+成功条件：
+
+- K线存在且有效；
+- trade_status = normal；
+- limit_status不是limit_down或unknown；
+- requested_qty > 0；
+- requested_qty <= PositionQty；
+- requested_qty <= SellableQty；
+- 数量满足部分卖出或全部退出规则；
+- 规则快照有效。
+
+允许limit_up卖出。
+
+部分卖出：
+
+requested_qty < PositionQty时，必须为partial_sell_lot_size整数倍。
+
+全部退出：
+
+requested_qty = PositionQty时：
+- full_exit_odd_lot_allowed=true：允许全部零股；
+- 否则仍须满足partial_sell_lot_size。
+
+失败时整笔不成交。
+
+十二、执行类型
+
+FillRequest包含：
+
+ENTRY_BUY
+HARD_EXIT
+SOFT_EXIT
+REPLACEMENT_EXIT
+ORDINARY_REDUCTION
+
+规则：
+
+- ENTRY_BUY：固定10:05；
+- HARD_EXIT：信号K线完成后的下一根合法交易K线；
+- SOFT_EXIT、REPLACEMENT_EXIT、ORDINARY_REDUCTION：14:30判断，14:35执行。
+
+十三、下一执行K线
+
+resolve_next_execution_bar(signal_bar_start, trading_calendar)：
+
+- 普通时段：下一根5分钟K线；
+- 11:25之后：同日13:00；
+- 14:55之后：下一交易日09:30；
+- 跨日必须使用交易日历，不使用自然日加一；
+- 下一执行K线缺失：FAILED，原因missing_execution_bar；
+- 不继续寻找更晚K线；
+- 是否重试留给Phase 4。
+
+十四、成交结果
+
+FillResult至少包含：
+
+status
+side
+execution_type
+symbol
+requested_qty
+filled_qty
+execution_trade_date
+execution_bar_start
+execution_price
+gross_amount
+commission
+stamp_tax
+transfer_fee
+settlement_fee
+total_fees
+cash_required
+net_proceeds
+failure_reason
+retryable
+simplified_direct_fill
+
+status：
+
+FILLED
+FAILED
+INVALID
+
+FILLED时filled_qty=requested_qty。
+FAILED或INVALID时filled_qty=0。
+simplified_direct_fill始终为true。
+
+十五、可重试性
+
+retryable=true：
+
+suspended
+limit_down_sell
+unknown_trade_status
+unknown_limit_status
+missing_execution_bar
+
+retryable=false：
+
+limit_up_buy
+insufficient_cash
+insufficient_position
+insufficient_sellable_qty
+invalid_quantity
+invalid_lot_size
+invalid_price
+invalid_rule_snapshot
+conflicting_duplicate_bar
+invalid_bar_contract
+
+Phase 3只输出retryable，不创建PendingSell。
+
+十六、本阶段不处理
+
+- 目标仓位；
+- requested_qty生成；
+- 持仓数量变化；
+- TodayBoughtQty；
+- PendingSellQty及重试；
+- 止损触发；
+- 软减仓episode；
+- 冷却期；
+- 持仓成本和账户净值；
+- 数据库、网页和报告。
+
+十七、必须测试
+
+分钟数据：
+
+1. 48个合法时点和午休非法；
+2. 时区处理；
+3. OHLC关系、非正数、NaN、inf、负Volume；
+4. 相同重复去重、冲突重复INVALID；
+5. 输入顺序不影响结果。
+
+成交价格：
+
+6. 10:05买入使用Open；
+7. 修改High/Low/Close/Volume不改变成交；
+8. 不计算滑点和容量；
+9. 不允许部分成交。
+
+买入：
+
+10. normal成功；
+11. limit_down成功；
+12. limit_up失败；
+13. suspended和unknown失败；
+14. 手数边界；
+15. 现金恰好等于CashRequired成功；
+16. 少0.01元失败；
+17. 现金不足不自动缩量；
+18. 缺少10:05不改到10:10。
+
+卖出：
+
+19. normal成功；
+20. limit_up成功；
+21. limit_down失败且retryable；
+22. SellableQty和PositionQty不足失败；
+23. 部分卖出交易单位；
+24. 全部退出零股规则；
+25. 失败时filled_qty=0。
+
+时间：
+
+26. 普通下一根K线；
+27. 11:25到13:00；
+28. 14:55到下一交易日09:30；
+29. 周五到下周一；
+30. 缺失执行K线不向后搜索。
+
+费用：
+
+31. 佣金和最低佣金；
+32. 印花税、过户费和结算费；
+33. Decimal四舍五入到分；
+34. 买入现金边界包含全部费用；
+35. 卖出净回款扣除全部费用。
+
+结果与回归：
+
+36. FILLED/FAILED/INVALID字段完整；
+37. retryable映射；
+38. simplified_direct_fill始终为true；
+39. Phase 1的80项测试继续通过；
+40. Phase 2的93项测试继续通过；
+41. 完整项目356项基线继续通过；
+42. 不修改禁止模块。
+
+十八、版本结论
+
+V1.3.4采用最简成交模型：
+
+指定执行时点存在有效Open，且不受停牌、对应方向涨跌停、未知状态、资金、持仓、SellableQty和交易单位限制时，整笔按Open成交。
+
+不引入滑点、容量、排队、部分成交或追价。
+
+Phase 3完成后必须先做只读审查，验收通过后才能进入Phase 4。

@@ -1,0 +1,239 @@
+T+1软适应中短期趋势系统 V1.3.6
+Phase 3处理优先级与重复K线修复补充
+版本日期：2026-07-14
+
+一、版本目的
+
+V1.3.6不改变Phase 1、Phase 2、V1.3.4和V1.3.5的成交原则、费用公式和时间规则。
+
+本版本只修复Phase 3复审发现的三项实现偏差：
+
+1. 缺失目标执行K线必须优先于数量、规则、费用和现金校验；
+2. 所有FillRequest都必须校验cash_available输入类型；
+3. 同一规范化证券和bar_start下，trade_date不同属于冲突重复K线；
+4. 增加覆盖上述组合边界的回归测试。
+
+Phase 3在本版本修复并再次通过只读复审前，不得提交检查点，不得进入Phase 4。
+
+
+二、FillEngine校验顺序
+
+execute_fill必须严格按以下顺序处理：
+
+1. 解析FillRequest.execution_type；
+2. 规范化FillRequest.symbol；
+3. 根据execution_type确定唯一：
+   - execution_trade_date；
+   - execution_bar_start；
+4. 从minute_bars中筛选：
+   - 规范化symbol等于请求symbol；
+   - bar_start等于目标execution_bar_start；
+5. 处理目标组：
+   - 目标组为空：
+     status = FAILED
+     failure_reason = missing_execution_bar
+     retryable = true
+     立即返回；
+   - 目标组存在：
+     执行目标组重复和分钟契约校验；
+6. 目标组有效后，才依次校验：
+   - requested_qty、position_qty、sellable_qty类型与范围；
+   - TradingRuleSnapshot；
+   - FeeRuleSnapshot；
+   - cash_available类型；
+   - 交易状态与涨跌停方向；
+   - 交易单位；
+   - 现金、持仓和SellableQty；
+7. 最后计算成交价格和费用。
+
+不得在目标K线组为空时返回：
+
+- invalid_quantity；
+- invalid_rule_snapshot；
+- invalid_fee_snapshot；
+- insufficient_cash；
+- 其他晚于目标K线存在性检查的错误。
+
+该优先级适用于所有execution_type。
+
+
+三、cash_available输入契约
+
+1. cash_available属于FillRequest统一输入字段，所有买入和卖出请求均必须验证其输入类型。
+
+2. 允许：
+
+- Decimal；
+- 可精确解析的十进制字符串。
+
+3. 拒绝：
+
+- float；
+- bool；
+- NaN；
+- Infinity；
+- -Infinity；
+- 无法解析的字符串；
+- 负数。
+
+4. 非法时：
+
+status = INVALID
+failure_reason = invalid_cash_available
+retryable = false
+
+5. 买入请求：
+
+在类型验证后，还需要比较：
+
+cash_available >= CashRequired
+
+不足时：
+
+status = FAILED
+failure_reason = insufficient_cash
+
+6. 卖出请求：
+
+只做类型和非负校验，不参与成交资格或费用计算。
+
+这样可确保FillRequest整体数据契约一致，不因买卖方向改变字段合法性。
+
+
+四、目标K线重复识别
+
+目标组重复识别键必须是：
+
+- normalized_symbol；
+- bar_start。
+
+不得把trade_date放入重复分组键。
+
+原因：
+
+bar_start已经包含本地日期和时间。对于同一规范化证券和同一bar_start，多条记录理应描述同一根K线。
+
+处理规则：
+
+1. 规范化symbol相同、bar_start相同，所有必需字段完全一致：
+
+确定性去重，只保留一条。
+
+2. 规范化symbol相同、bar_start相同，但以下任一必需字段不同：
+
+- trade_date；
+- open；
+- high；
+- low；
+- close；
+- volume；
+- trade_status；
+- limit_status；
+
+返回：
+
+status = INVALID
+failure_reason = conflicting_duplicate_bar:<HH:MM>
+retryable = false
+
+3. 特别规定：
+
+若bar_start为2025-07-14 10:05，但一条记录trade_date为2025-07-15，即使其他字段完全一致，也属于conflicting_duplicate_bar，而不是普通invalid_bar_contract。
+
+4. 输入行顺序不得改变结果。
+
+
+五、稳定失败结果
+
+本版本新增：
+
+invalid_cash_available
+
+retryable = false
+
+FAILED或INVALID仍必须满足：
+
+- filled_qty = 0；
+- execution_price = None；
+- 所有金额字段 = Decimal("0.00")；
+- failure_reason非空；
+- simplified_direct_fill = true。
+
+
+六、必须新增测试
+
+至少新增以下回归测试：
+
+1. 空目标组 + 非法FeeRuleSnapshot：
+   预期missing_execution_bar优先。
+
+2. 空目标组 + 非法TradingRuleSnapshot：
+   预期missing_execution_bar优先。
+
+3. 空目标组 + 非法requested_qty：
+   预期missing_execution_bar优先。
+
+4. 空目标组 + 非法cash_available：
+   预期missing_execution_bar优先。
+
+5. 卖出请求cash_available为float：
+   预期INVALID / invalid_cash_available。
+
+6. 卖出请求cash_available为bool：
+   预期INVALID / invalid_cash_available。
+
+7. 卖出请求cash_available为合法Decimal和十进制字符串：
+   不影响正常卖出。
+
+8. 目标别名600001与600001.SH：
+   - bar_start相同；
+   - trade_date不同；
+   预期conflicting_duplicate_bar。
+
+9. 上述别名冲突交换输入顺序：
+   状态和原因完全相同。
+
+10. 同证券更早非法K线：
+    不影响目标成交。
+
+11. 同证券下一交易日非法K线：
+    不影响目标成交。
+
+12. FeeRuleSnapshot每一个Decimal字段分别测试：
+    - float；
+    - bool；
+    - 0.3 - 0.2；
+    均返回invalid_fee_snapshot。
+
+13. FAILED和INVALID的所有金额字段继续为0.00。
+
+14. 输入对象不可变测试继续通过。
+
+15. Phase 1、Phase 2和现有Phase 3测试全部继续通过。
+
+
+七、验收标准
+
+1. 三项P1实现偏差全部修复。
+2. 关键组合测试全部补齐。
+3. Phase 1的80项测试继续通过。
+4. Phase 2的93项测试继续通过。
+5. Phase 3全部测试通过。
+6. 完整项目无新增失败。
+7. compileall通过。
+8. git diff --cached --check通过。
+9. 不修改任何禁止模块。
+10. 修复后再次进行只读复审。
+11. 复审明确通过后方可提交Phase 3检查点。
+
+
+八、版本结论
+
+V1.3.6不增加任何新的交易模型或参数。
+
+它只冻结：
+
+- 目标执行K线存在性具有最高校验优先级；
+- cash_available对所有FillRequest都必须满足统一Decimal契约；
+- 同一规范化证券和bar_start下，trade_date差异属于重复K线冲突；
+- 所有组合边界必须有正式回归测试。
