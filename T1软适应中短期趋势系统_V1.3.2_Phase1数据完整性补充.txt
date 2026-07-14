@@ -1,0 +1,259 @@
+T+1软适应中短期趋势系统 V1.3.2
+Phase 1数据完整性与确定性补充规格
+版本日期：2026-07-14
+
+一、版本目的
+
+V1.3.2不改变OpportunityScore的评分公式和权重，仅修复Phase 1审查发现的数据完整性、日期对齐、代码去重和确定性问题。
+
+V1.3.1中未被本文件修改的规则继续有效。
+
+Phase 1在完成本文件要求并通过新增测试前，不得进入Phase 2。
+
+
+二、RS收益区间的统一交易日期
+
+1. 统一基准交易日历
+
+先取沪深300、中证1000、创业板指三个指数在as_of及以前的有效日期交集，按日期升序形成：
+
+benchmark_calendar
+
+2. 收益锚点
+
+设benchmark_calendar最后一个日期为t。
+
+20日收益使用：
+
+t20 = benchmark_calendar[-21]
+
+60日收益使用：
+
+t60 = benchmark_calendar[-61]
+
+必须至少存在61个共同基准交易日。
+
+3. 个股与指数收益
+
+个股和三个指数的20日、60日收益必须分别使用完全相同的三个日期：
+
+t
+t20
+t60
+
+计算：
+
+Return20 = Close(t) / Close(t20) - 1
+Return60 = Close(t) / Close(t60) - 1
+
+4. 缺失处理
+
+任一证券在t、t20或t60缺少有效Close时：
+
+该证券当日状态为INVALID。
+
+不得各自使用iloc[-1/-21/-61]后退到不同日期。
+
+5. 指标历史
+
+MA、ATR、SignedER等个股技术指标仍按该个股自身经过清洗后的有效交易日序列计算。
+
+RS收益日期与三个指数必须严格对齐；技术指标不因个股停牌而强制使用指数行数。
+
+
+三、date字段与as_of
+
+1. date是必需字段。
+
+缺少date列：
+
+返回INVALID，原因：
+
+missing_required_field:date
+
+2. date必须能够统一解析为交易日期。
+
+存在无法解析的date：
+
+返回INVALID，原因：
+
+invalid_date_value
+
+3. as_of在函数入口只解析一次。
+
+无法解析的as_of：
+
+抛出稳定领域异常：
+
+OpportunityInputError("invalid_as_of")
+
+不得泄漏pandas DateParseError。
+
+4. as_of语义
+
+as_of是包含式信息截止日：
+
+date <= as_of
+
+OpportunityScore函数不猜测交易判断日。
+
+后续10:00回测调度必须明确传入前一交易日作为as_of，并用集成测试锁定。
+
+
+四、有效历史交易日定义
+
+Phase 1有效交易行必须同时满足：
+
+1. date有效；
+2. high、low、close可转为数值；
+3. high、low、close均为有限值；
+4. high > 0、low > 0、close > 0；
+5. high >= low。
+
+不满足以上条件的行不计入valid_history_days。
+
+清洗后的有效行不足200日：
+
+INVALID，原因：
+
+insufficient_valid_history
+
+若最近61个有效交易日或计算MA60、ATR20、SignedER所需窗口内仍包含无法确定的数据冲突：
+
+INVALID，不得静默填补。
+
+
+五、重复日期
+
+1. 同一股票同一date只有完全相同的high、low、close记录：
+
+允许确定性去重，只保留一条。
+
+2. 同一股票同一date存在不同的high、low或close：
+
+整个股票当日评分为INVALID，原因：
+
+conflicting_duplicate_date:<date>
+
+不得使用keep="last"或依赖输入行顺序。
+
+3. 指数数据同样适用该规则。
+
+
+六、证券代码规范化冲突
+
+1. 所有输入股票代码必须先规范化。
+
+2. 若两个或多个输入键规范化为同一证券，例如：
+
+600001
+600001.SH
+
+则整个调用抛出：
+
+OpportunityInputError(
+    "duplicate_normalized_symbol:600001.SH"
+)
+
+3. 不允许自动保留其中一个，不允许让同一证券重复进入RS池或排名。
+
+
+七、非数值、NaN与无穷值
+
+1. high、low、close中的非数值、NaN、+inf、-inf均视为无效值。
+
+2. 当前评分所需字段中出现上述值：
+
+对应股票为INVALID。
+
+3. invalid候选：
+
+- 不进入RS横截面池；
+- 不参与n>=10判断；
+- 不参与OpportunityScore排名；
+- 不影响其他有效候选的百分位和排名。
+
+
+八、固定基准权重
+
+基准权重必须固定为：
+
+沪深300：0.40
+中证1000：0.40
+创业板指：0.20
+
+实现必须使用不可变结构。
+
+不得公开可原地修改的dict影响运行结果。
+
+允许公开只读常量，例如tuple或MappingProxyType，但计算函数内部不得依赖可被调用方修改的全局对象。
+
+
+九、复权口径契约
+
+Phase 1继续保持纯计算，不负责抓取或转换复权数据。
+
+API文档必须明确：
+
+1. 个股历史必须使用同一种历史时点可用的调整口径；
+2. 三个指数必须使用一致的指数价格口径；
+3. 调用方不得混用无法比较的原始价和调整价；
+4. 后续数据适配层必须携带并校验：
+   - adjust_type
+   - source
+   - known_at或effective_date
+
+Phase 1不因缺少元数据列改变现有函数签名，但必须在docstring和模块说明中冻结该契约。
+
+
+十、输出契约
+
+OpportunityScore当前输出字段数量确认为48列。
+
+保留三个分类汇总字段，因为具有审计价值。
+
+代码、测试和完成报告统一写为48列，不再声称45列。
+
+
+十一、必须补充的测试
+
+至少新增以下测试：
+
+1. 个股缺少共同收益锚点日期时INVALID。
+2. 任一指数在t、t20或t60缺失时INVALID。
+3. date列缺失时INVALID。
+4. date存在无法解析值时INVALID。
+5. as_of非法时抛出OpportunityInputError("invalid_as_of")。
+6. 输入日期乱序后结果不变。
+7. 完全相同重复日期可确定性去重。
+8. 冲突重复日期在任意输入顺序下均INVALID。
+9. high、low、close出现inf、-inf、NaN或非数值。
+10. 历史非正价格不计入valid_history_days。
+11. 清洗后199日INVALID、200日VALID。
+12. 600001与600001.SH同时输入时抛出规范化冲突异常。
+13. 恰好10个输入但1个INVALID时，有效池为9，不启用百分位计分。
+14. 多只并列RS时断言平均名次、百分位和最终RS得分。
+15. INVALID候选不影响有效候选百分位和稳定排名。
+16. BENCHMARK_WEIGHTS不能被调用方修改。
+17. as_of之后的数据不会影响结果。
+18. MA60十日前值和SignedER五日前值仍按清洗后的交易日序列位置计算。
+
+
+十二、验收标准
+
+1. 所有P0问题修复。
+2. P1-2、P1-3、P1-4修复。
+3. P1-1通过API契约和后续集成约束明确，不要求纯计算函数猜测判断日。
+4. P1-5通过docstring冻结，运行时校验留到数据适配层。
+5. 输出文档统一为48列。
+6. 原有229项测试继续通过。
+7. 新增数据完整性测试全部通过。
+8. 完整测试无新增失败。
+9. 旧恒温器、旧事件回测、数据库和网页仍不得修改。
+
+
+十三、版本结论
+
+V1.3.2只强化数据确定性，不改变RS、趋势结构、SignedER和OpportunityScore的原有数学公式。
+
+完成修复并再次通过只读审查后，Phase 1方可验收并进入Phase 2。

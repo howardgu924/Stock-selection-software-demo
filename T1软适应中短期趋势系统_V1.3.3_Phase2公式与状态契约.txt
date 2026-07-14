@@ -1,0 +1,660 @@
+T+1软适应中短期趋势系统 V1.3.3
+Phase 2公式与状态契约补充
+版本日期：2026-07-14
+
+一、版本目的
+
+V1.3.3不修改Phase 1的OpportunityScore公式。
+
+本版本冻结Phase 2中以下模块的唯一实现规则：
+
+1. MarketOverlay
+2. MACD及顶底背离
+3. RiskOverlay
+4. ExecutionGate
+5. EmergencyMarketGate
+
+本阶段继续保持纯计算，不抓取数据、不迁移数据库、不生成订单、不修改旧恒温器。
+
+
+二、Phase 2模块边界
+
+建议新增：
+
+stock_picker/strategies/adaptive_trend_v1_3/
+├── market_overlay.py
+├── divergence.py
+├── risk_overlay.py
+├── execution_gate.py
+└── phase2_models.py
+
+允许调整新策略目录的__init__.py导出。
+
+禁止修改：
+
+- 旧恒温器
+- 旧事件回测
+- 数据库
+- 网页
+- PositionSizing
+- T+1状态机
+- FillEngine
+- ExitEngine
+- OpportunityScore既有公式
+
+
+三、共同数据原则
+
+1. 日线模块的as_of为包含式信息截止日。
+2. 未来10:00回测调用时，日线模块必须传入前一交易日。
+3. 日线必须包含date、high、low、close；MACD还要求按日期排序后的连续close。
+4. 分钟K线时间戳统一表示bar_start。
+5. Phase 2函数只使用调用方传入的数据，不自行回退到日线近似。
+6. 缺失、冲突重复、非法日期、非有限价格或ATR<=0时返回稳定INVALID状态。
+
+
+四、MarketOverlay
+
+1. 单指数指标
+
+对沪深300、中证1000、创业板指分别计算：
+
+MA20 = Close的20日简单移动平均
+MA60 = Close的60日简单移动平均
+ATR20 = 20日Wilder ATR
+
+TrueRange_t =
+max(
+High_t - Low_t,
+abs(High_t - Close_t-1),
+abs(Low_t - Close_t-1)
+)
+
+ATR20使用Wilder递推：
+
+第一个ATR20 =
+前20个TrueRange的算术平均
+
+后续：
+ATR_t =
+(ATR_t-1 × 19 + TrueRange_t) / 20
+
+2. 单指数分数
+
+IndexX1 =
+(Close - MA20) / ATR20
+
+IndexPriceScore =
+100 × clip01((IndexX1 + 1) / 2)
+
+IndexX2 =
+(MA20 - MA60) / ATR20
+
+IndexStructureScore =
+100 × clip01((IndexX2 + 1) / 2.5)
+
+IndexX3 =
+(MA60_t - MA60_t-10) / ATR20
+
+IndexSlopeScore =
+100 × clip01((IndexX3 + 0.5) / 1.5)
+
+SingleIndexScore =
+0.30 × IndexPriceScore
++ 0.40 × IndexStructureScore
++ 0.30 × IndexSlopeScore
+
+3. 三指数日期对齐
+
+只在三个指数共同有效交易日期上形成RawMarketScore。
+
+任一指数在某日缺少当日Close、MA20、MA60、MA60十日前值或ATR20：
+
+该日RawMarketScore为INVALID。
+
+不得重新归一40%/40%/20%权重。
+
+4. 三指数合成
+
+RawMarketScore =
+0.40 × 沪深300得分
++ 0.40 × 中证1000得分
++ 0.20 × 创业板指得分
+
+5. 5日EMA
+
+alpha = 1/3
+
+第一个有效RawMarketScore直接作为初始值。
+
+之后：
+
+SmoothedMarketScore_t =
+1/3 × RawMarketScore_t
++ 2/3 × SmoothedMarketScore_t-1
+
+如果中间某日RawMarketScore为INVALID：
+
+- 当日输出INVALID；
+- EMA状态不更新；
+- 下一有效日继续使用上一有效EMA。
+
+6. 买入门槛
+
+M = SmoothedMarketScore / 100
+
+EntryThreshold =
+70 + 8 × (1 - M)
+
+SmoothedMarketScore < 20：
+
+pause_new_entries = true
+
+7. 仓位上限
+
+RawExposureCap =
+0.90 × M
+
+若没有前一日有效EffectiveExposureCap：
+
+EffectiveExposureCap =
+RawExposureCap
+
+普通情况下：
+
+EffectiveExposureCap_t =
+max(
+RawExposureCap_t,
+PreviousEffectiveExposureCap - 0.10
+)
+
+本阶段只输出数值，不执行降仓。
+
+
+五、MACD唯一公式
+
+1. EMA定义
+
+EMA12 =
+Close.ewm(span=12, adjust=False, min_periods=12).mean()
+
+EMA26 =
+Close.ewm(span=26, adjust=False, min_periods=26).mean()
+
+DIF =
+EMA12 - EMA26
+
+DEA =
+DIF.ewm(span=9, adjust=False, min_periods=9).mean()
+
+MACDHist =
+2 × (DIF - DEA)
+
+选择乘2是为了与常见A股软件柱体口径一致；背离比较只使用同一口径内的相对大小。
+
+2. 数据不足
+
+DIF、DEA或MACDHist在所需摆动点日期不可用：
+
+该摆动点不能参与背离判断。
+
+
+六、摆动点与背离
+
+1. 摆动高点
+
+某日High严格大于左侧3个交易日和右侧3个交易日的全部High。
+
+存在相等最高值时，不认定为摆动高点。
+
+2. 摆动低点
+
+某日Low严格小于左侧3个交易日和右侧3个交易日的全部Low。
+
+存在相等最低值时，不认定为摆动低点。
+
+3. 确认时点
+
+pivot_date：
+摆动点实际日期
+
+confirmed_date：
+右侧第3个交易日收盘后
+
+first_usable_date：
+confirmed_date后的下一个交易日
+
+4. 摆动点间隔
+
+两个同类摆动点之间至少5个交易日、最多40个交易日。
+
+5. 配对规则
+
+在as_of时：
+
+- 只使用first_usable_date <= as_of的已确认摆动点；
+- 第二摆动点优先选择日期最近者；
+- 对同一个第二摆动点，第一摆动点选择满足5至40日间隔且日期最近者；
+- 不为了寻找更强背离而跳过更近的有效第一摆动点。
+
+6. 普通顶背离
+
+第二High > 第一High
+且
+第二DIF < 第一DIF
+
+7. 强顶背离
+
+满足普通顶背离，且：
+
+第二High - 第一High
+>= 0.5 × ATR20_第二摆动点
+
+并且：
+
+第二MACDHist < 第一MACDHist
+
+8. 底背离
+
+第二Low < 第一Low
+且
+第二DIF > 第一DIF
+
+V1.3.3不区分强底背离。
+
+9. 背离有效期
+
+从first_usable_date起20个交易日内有效。
+
+超过20个交易日后自动失效。
+
+如果期间出现更新的已确认同类摆动点组合，以更新组合覆盖旧组合。
+
+
+七、RiskOverlay
+
+输入至少包括：
+
+- OpportunityScore输出
+- 背离状态
+- security_status元数据
+- 当前Close、MA20、MA60、ATR20
+
+1. 硬阻断
+
+以下任一条件：
+
+- ST
+- *ST
+- 退市整理
+- 停牌
+- 无涨跌幅限制特殊交易日
+- 交易状态未知
+- 强顶背离
+- 输入数据INVALID
+
+输出：
+
+risk_status = BLOCK_NEW
+
+2. 普通顶背离
+
+普通顶背离且非强顶背离：
+
+risk_status = REDUCED
+risk_multiplier = 0.75
+
+不得同时触发ExecutionGate HALF。
+
+3. 无风险覆盖
+
+risk_status = ALLOW
+risk_multiplier = 1.0
+
+4. 底背离观察
+
+底背离有效时：
+
+recovery_watch = true
+
+恢复普通候选必须同时满足：
+
+Close > MA20
+
+RS20Improving =
+RS20_t > 0
+且
+RS20_t - RS20_t-5 >= 0.02
+
+SignedER20 > 0
+
+未同时满足时：
+
+RiskOverlay不得因底背离增加分数或放宽门槛。
+
+5. 强顶背离后的持仓提示
+
+StructureBreak =
+Close < MA20 - 0.5 × ATR20
+或
+MA20 < MA60
+
+SignedERWeakening =
+SignedER20 < 0
+或
+SignedER20 - SignedER20_t-5 <= -0.20
+
+输出：
+
+强顶背离 + StructureBreak：
+holding_risk_action = EXIT
+
+强顶背离 + SignedERWeakening且无StructureBreak：
+holding_risk_action = REDUCE
+
+否则：
+holding_risk_action = WATCH
+
+本阶段只输出状态，不生成卖单。
+
+
+八、ExecutionGate数据契约
+
+1. 输入分钟K线
+
+必须恰好包含以下六个bar_start：
+
+09:30
+09:35
+09:40
+09:45
+09:50
+09:55
+
+不得包含或使用10:00开始的K线。
+
+缺少任一K线、存在冲突重复、价格非法或Volume<0：
+
+ExecutionGate = REJECT
+
+2. P10
+
+P10 =
+09:55 K线Close
+
+3. MorningVWAP
+
+TypicalPrice =
+(High + Low + Close) / 3
+
+MorningVWAP =
+Σ(TypicalPrice × Volume)
+/
+ΣVolume
+
+总Volume <= 0：
+
+REJECT
+
+4. DistanceMA20
+
+DistanceMA20 =
+(P10 - MA20) / ATR20
+
+REJECT：
+
+DistanceMA20 > 2.0
+或
+DistanceMA20 < -1.0
+
+HALF：
+
+1.5 <= DistanceMA20 <= 2.0
+
+5. HighTo10Drawdown
+
+HighTo10Drawdown =
+(MaxHigh_六根K线 - P10) / ATR20
+
+REJECT：
+
+HighTo10Drawdown > 0.75
+
+HALF：
+
+0.50 <= HighTo10Drawdown <= 0.75
+
+6. MorningMaxDrawdown
+
+按时间顺序：
+
+RunningHigh_j =
+截至第j根K线的最高High
+
+BarDrawdown_j =
+(RunningHigh_j - Low_j) / ATR20
+
+MorningMaxDrawdown =
+max(BarDrawdown_j)
+
+REJECT：
+
+MorningMaxDrawdown > 0.75
+
+HALF：
+
+0.50 <= MorningMaxDrawdown <= 0.75
+
+7. BelowVWAP
+
+BelowVWAP =
+max(0, MorningVWAP - P10) / ATR20
+
+REJECT：
+
+BelowVWAP > 0.50
+
+HALF：
+
+0.25 <= BelowVWAP <= 0.50
+
+8. 交易状态
+
+10:00时：
+
+- suspended = true
+- limit_status = limit_up
+- limit_status = unknown
+- trade_status = unknown
+
+任一成立：
+
+REJECT
+
+9. 多条件优先级
+
+任一REJECT：
+最终REJECT
+
+无REJECT但至少一个HALF：
+最终HALF
+
+否则：
+PASS
+
+输出必须包含全部触发原因列表，而不仅是最终状态。
+
+
+九、EmergencyMarketGate
+
+1. 输入
+
+三个指数各自：
+
+- PreviousClose
+- ATR20
+- 09:55 K线Close
+
+09:55 Close作为10:00参考价。
+
+2. Shock
+
+Shock_i =
+(IndexP10 / PreviousClose - 1)
+/
+(ATR20 / PreviousClose)
+
+等价于：
+
+Shock_i =
+(IndexP10 - PreviousClose) / ATR20
+
+3. 状态
+
+任一指数输入INVALID：
+
+emergency_status = INVALID
+reject_new_entries = true
+
+至少两个指数Shock <= -1.20：
+
+emergency_status = LEVEL_2
+reject_new_entries = true
+remove_exposure_drop_limit = true
+max_reduction_pct = 0.30
+
+否则，至少两个指数Shock <= -0.80：
+
+emergency_status = LEVEL_1
+reject_new_entries = true
+remove_exposure_drop_limit = false
+max_reduction_pct = 0
+
+否则：
+
+emergency_status = NORMAL
+reject_new_entries = false
+
+本阶段不计算具体卖出数量。
+
+
+十、Phase 2输出要求
+
+MarketOverlay至少输出：
+
+- raw_market_score
+- smoothed_market_score
+- entry_threshold
+- raw_exposure_cap
+- effective_exposure_cap
+- pause_new_entries
+- status
+- invalid_reasons
+
+Divergence至少输出：
+
+- divergence_type
+- strength
+- pivot_1_date
+- pivot_2_date
+- confirmed_date
+- first_usable_date
+- active_until
+- is_active
+
+RiskOverlay至少输出：
+
+- risk_status
+- risk_multiplier
+- block_new_reason
+- recovery_watch
+- recovery_confirmed
+- structure_break
+- signed_er_weakening
+- holding_risk_action
+
+ExecutionGate至少输出：
+
+- execution_gate
+- gate_multiplier
+- p10
+- morning_vwap
+- distance_ma20
+- high_to_10_drawdown
+- morning_max_drawdown
+- below_vwap
+- reasons
+
+EmergencyMarketGate至少输出：
+
+- emergency_status
+- 三指数shock
+- reject_new_entries
+- remove_exposure_drop_limit
+- max_reduction_pct
+- reasons
+
+
+十一、必须测试
+
+MarketOverlay：
+
+1. X1、X2、X3边界。
+2. Wilder ATR初始值和递推值。
+3. 三指数40/40/20合成。
+4. 任一指数缺失时INVALID且不重新归一。
+5. EMA首值、第二值及中间INVALID不更新。
+6. EntryThreshold和ExposureCap公式。
+7. 普通10个百分点下降限速。
+
+MACD与背离：
+
+8. EMA12、EMA26、DEA和Hist与固定样例一致。
+9. 3/3摆动点严格比较，平顶/平底不认定。
+10. first_usable_date无前视。
+11. 5日和40日间隔边界。
+12. 普通顶背离、强顶背离、底背离。
+13. 配对使用最近第二点和最近有效第一点。
+14. 20日有效期及新组合覆盖旧组合。
+
+RiskOverlay：
+
+15. 每个硬阻断状态。
+16. 普通顶背离仅乘0.75一次。
+17. 强顶背离不进入ExecutionGate。
+18. 底背离恢复三个条件。
+19. StructureBreak和SignedERWeakening。
+20. WATCH、REDUCE、EXIT输出。
+
+ExecutionGate：
+
+21. 只接受六根指定K线。
+22. 缺失、重复、非法价格、负Volume和零总Volume。
+23. VWAP固定样例。
+24. DistanceMA20所有端点。
+25. HighTo10Drawdown所有端点。
+26. MorningMaxDrawdown所有端点。
+27. BelowVWAP所有端点。
+28. 多条件REJECT优先于HALF。
+29. 全部reasons保留。
+30. 不读取10:00 K线。
+
+EmergencyMarketGate：
+
+31. Shock计算。
+32. NORMAL、LEVEL_1、LEVEL_2。
+33. 恰好-0.80和-1.20边界。
+34. 任一指数INVALID时拒绝新仓。
+
+工程边界：
+
+35. OpportunityScore既有80项测试继续通过。
+36. 完整项目263项基线继续通过。
+37. 不修改旧恒温器、旧回测、数据库和网页。
+
+
+十二、版本结论
+
+V1.3.3只冻结Phase 2公式和状态，不进入仓位、成交和退出执行。
+
+完成Phase 2后必须先做只读审查，验收通过后才能进入Phase 3。

@@ -1,0 +1,242 @@
+T+1软适应中短期趋势系统 V1.3.1
+公式与数据契约补充规格
+版本日期：2026-07-14
+
+说明：
+本文件在V1.3基础上生效。与V1.3冲突时，以本文件为准。本文件解决Codex架构审查提出的37项歧义，使策略可以唯一编码。所有数值均为研究基准，不代表已优化。
+
+一、统一数学约定
+
+1. clip01(x)=min(1,max(0,x))。
+2. 中间计算使用双精度；展示保留2位小数；决策使用未四舍五入数值。
+3. 以下任一必需字段缺失，或ATR20<=0、价格<=0时，当日OpportunityScore=INVALID，不计0分，也不参与排名：Close、MA20、MA60、ATR20、RS20、RS60、SignedER20、SignedERChange5、三个基准指数对应收益。
+4. 有效日线不足200个交易日，不产生正式买入评分。
+5. 并列池内排名使用平均名次；进入前6/8/10的稳定决胜顺序为：OpportunityScore降序→RS60降序→RS20降序→SignedER20降序→股票代码升序。
+6. 删除“400日完整百分位模式”，V1.3.1不使用该模式。
+
+二、分钟K线时间契约
+
+1. 5分钟时间戳表示bar_start。09:55表示09:55:00—09:59:59。
+2. 10:00判断只允许使用09:30、09:35、09:40、09:45、09:50、09:55六根完整K线。
+3. 10:00判断完成后，买入按10:05 K线Open直接成交；不得使用10:05 K线的High、Low、Close、Volume决定是否以Open成交。
+4. 14:30软退出只使用14:25及以前开始并已完成的K线；按14:35 K线Open成交。
+5. 硬退出由已完成K线确认，按下一根5分钟K线Open尝试成交。
+
+三、相对强度
+
+1. 默认基准收益：
+BenchmarkReturn_h=0.40×沪深300_h+0.40×中证1000_h+0.20×创业板指_h，其中h为20或60日。
+2. RS20=个股20日收益-BenchmarkReturn20。
+3. RS60=个股60日收益-BenchmarkReturn60。
+4. 任一基准指数缺失时，RS状态为INVALID，不重新归一权重。
+
+定义AbsRS(x,L,U)：
+- x<=L：0
+- L<x<0：0.30×(x-L)/(0-L)
+- 0<=x<U：0.30+0.70×x/U
+- x>=U：1
+
+RS20使用L=-10%、U=+10%。
+RS60使用L=-15%、U=+20%。
+
+当有效候选数n>=10：
+Percentile=(n-average_rank)/(n-1)，按RS从高到低排名。
+RS20Score=15×[0.70×AbsRS20+0.30×Percentile20]。
+RS60Score=25×[0.70×AbsRS60+0.30×Percentile60]。
+
+当n<10：
+RS20Score=15×AbsRS20。
+RS60Score=25×AbsRS60。
+池内排名仅展示，不计分。
+
+理由：与基准持平只获得30%的绝对子分，避免“没有超额收益”仍得到过高趋势分；60日正向上限更宽，以适应中期趋势。
+
+四、趋势结构35分
+
+1. X1=(Close-MA20)/ATR20。
+CloseMA20Score=10×clip01((X1+1)/2)。
+X1<=-1得0分，X1=0得5分，X1>=1得10分。
+
+2. X2=(MA20-MA60)/ATR20。
+MA20MA60Score=15×clip01((X2+1)/2.5)。
+X2<=-1得0分，X2=0得6分，X2>=1.5得15分。
+
+3. X3=(MA60_t-MA60_t-10)/ATR20。
+MA60SlopeScore=10×clip01((X3+0.5)/1.5)。
+X3<=-0.5得0分，X3=0得3.3333分，X3>=1得10分。
+
+五、方向性效率25分
+
+1. SignedER20=(Close_t-Close_t-20)/Σ|Close_i-Close_i-1|。
+分母为0时，SignedER20=0。
+SignedERScore=15×clip01((SignedER20+0.20)/0.80)。
+SignedER<=-0.20得0分；0得3.75分；0.20得7.50分；>=0.60得15分。
+
+2. SignedERChange5=SignedER20_t-SignedER20_t-5。
+SignedERChangeScore=10×clip01((SignedERChange5+0.15)/0.30)。
+变化<=-0.15得0分；0得5分；>=+0.15得10分。
+
+3. OpportunityScore为RS20Score、RS60Score、三个趋势结构子分、SignedERScore和SignedERChangeScore之和，范围0—100。
+
+六、MarketOverlay
+
+对每个指数：
+IndexPriceScore=100×clip01((((Close-MA20)/ATR20)+1)/2)。
+IndexStructureScore=100×clip01((((MA20-MA60)/ATR20)+1)/2.5)。
+IndexSlopeScore=100×clip01((((MA60_t-MA60_t-10)/ATR20)+0.5)/1.5)。
+SingleIndexScore=0.30×Price+0.40×Structure+0.30×Slope。
+
+RawMarketScore=0.40×沪深300得分+0.40×中证1000得分+0.20×创业板指得分。
+三个指数必须全部有效，否则MarketOverlay=INVALID并暂停新仓。
+
+5日EMA：alpha=1/3。第一个有效RawMarketScore直接作为初始EMA；之后Smoothed_t=alpha×Raw_t+(1-alpha)×Smoothed_t-1。
+
+EntryThreshold=70+8×(1-SmoothedMarketScore/100)。
+SmoothedMarketScore<20时暂停新仓。
+RawExposureCap=0.90×SmoothedMarketScore/100。
+普通环境下EffectiveExposureCap_t=max(RawExposureCap_t,EffectiveExposureCap_t-1-0.10)。基准是前一日有效仓位上限，不是实际仓位或目标仓位。二级紧急风险触发时取消该限速。
+
+七、风险词唯一公式
+
+1. RS20Improving：RS20_t>0且RS20_t-RS20_t-5>=0.02。
+2. SignedERWeakening：SignedER20_t<0，或SignedER20_t-SignedER20_t-5<=-0.20。
+3. StructureBreak：Close<MA20-0.5×ATR20，或MA20<MA60。
+4. TrendFurtherWeakening：以下四项至少满足两项：
+- OpportunityScore较2个交易日前下降至少8分；
+- SignedER20<0；
+- Close<MA20；
+- RS20<0。
+
+八、MACD背离
+
+1. 左右各3根日K线确认摆动点，必须记录pivot_date、confirmed_date、first_usable_date；first_usable_date为confirmed_date后的下一交易日。
+2. 普通顶背离：第二价格高点更高，且对应DIF更低。仅RiskMultiplier=0.75；不再触发ExecutionGate HALF。
+3. 强顶背离：普通顶背离基础上，第二价格高点至少高0.5×ATR20，且MACD柱峰值更低。禁止新买入和加仓。
+4. 强顶背离+StructureBreak：全部退出。
+5. 强顶背离+SignedERWeakening但无StructureBreak：软减仓。
+6. 底背离只设置recovery_watch。恢复普通候选必须同时Close>MA20、RS20Improving=true、SignedER20>0。
+7. ATR初始止损和移动止损独立触发硬退出，不要求与背离组合。
+
+九、ExecutionGate
+
+1. MorningVWAP使用09:30—09:55六根完整K线：TypicalPrice=(H+L+C)/3；VWAP=Σ(TypicalPrice×Volume)/ΣVolume。总Volume<=0则REJECT。
+2. P10=09:55 K线Close。
+3. DistanceMA20=(P10-MA20)/ATR20：
+- >2.0或<-1.0：REJECT；
+- 1.5<=值<=2.0：HALF。
+4. HighTo10Drawdown=(六根K线最高High-P10)/ATR20：
+- >0.75：REJECT；
+- 0.50<=值<=0.75：HALF。
+5. MorningMaxDrawdown：逐K线计算RunningHigh和(RunningHigh-Low_j)/ATR20，取最大值：
+- >0.75：REJECT；
+- 0.50<=值<=0.75：HALF。
+6. BelowVWAP=max(0,VWAP-P10)/ATR20：
+- >0.50：REJECT；
+- 0.25<=值<=0.50：HALF。
+7. 任一REJECT成立即REJECT；无REJECT但任一HALF成立即HALF；否则PASS。
+8. 10:00状态未知时ExecutionGate=REJECT；10:05才变为未知时由FillEngine整笔失败。
+
+十、EmergencyMarketGate
+
+1. 指数10:00价格使用09:55 K线Close。
+2. Shock_i=(IndexP10/PreviousClose-1)/(ATR20_i/PreviousClose)。
+3. 至少两个指数Shock<=-0.80：一级风险，所有新仓REJECT，不机械卖旧仓。
+4. 至少两个指数Shock<=-1.20：二级风险，停止新仓，取消仓位上限每日10个百分点限速，10:05开始快速降险，单日最多降低30个百分点。
+5. 卖出顺序：OpportunityScore升序→EffectiveRiskPct降序→股票代码升序。
+6. 目标降低值=min(当前实际仓位-RawExposureCap,30个百分点)。可卖不足部分转PendingSell。
+
+十一、T+1尾部风险
+
+1. NormalRiskPct=2×EntryATR20/EntryPrice，EntryATR20在首次买入时冻结。
+2. FirstSellablePrice：从买入后的下一交易日09:30起，寻找首个未停牌、非跌停不可卖、价格有效且规则允许卖出的5分钟Open；最多向后搜索5个交易日。
+3. 5日内仍不能卖：使用第5个交易日最后有效Close审慎计价，并标记censored_exit=true。
+4. T1Return=FirstSellablePrice/SimulatedEntryPrice-1；T1Loss_q=其5%分位绝对值。
+5. 优先最近252个有效样本，最低120个。
+6. 个股样本不足时依次回退：历史申万一级行业→相同板块→三指数合成基准；回退样本也需>=120。仍不足则禁止新买。
+7. EffectiveRiskPct=max(NormalRiskPct,T1Loss_q)。
+
+十二、组合压力与仓位
+
+1. RawWeight_i=min(15%,0.5%/EffectiveRiskPct_i)。
+2. 普通顶背离乘0.75；PASS乘1；HALF乘0.5；REJECT乘0。
+3. 相关性：与1只已选股票60日相关系数>=0.80，仓位减半；与2只均>=0.80，拒绝。
+4. 单行业合计最高30%，超出时该行业全部股票等比例缩放。
+5. 总仓位超过EffectiveExposureCap时，全部目标仓位等比例缩放。
+6. PortfolioStressLoss=ΣWeight_i×T1Loss_q_i，要求<=5%；超出时全部仓位等比例缩放。
+7. 最高相关一对同时尾部损失、单只连续两日涨跌停损失仅作为报告压力场景，不新增硬约束。
+8. 手数取整后剩余现金不再次分配。
+
+十三、持仓、减仓与退出
+
+1. HoldThreshold=EntryThreshold-8。
+2. 新买入：分数达EntryThreshold、稳定排序前6、ExecutionGate为PASS/HALF、风险未阻断。
+3. 持有：分数>=HoldThreshold、稳定排序不低于第8、无硬退出。
+4. 替换：新候选高至少8分，且原持仓连续2日低于HoldThreshold或连续2日跌出前8。
+5. 新买入保护期2个完整交易日；硬退出仍有效。
+6. 禁止主动加仓。
+7. 普通市场降仓：实际仓位-EffectiveExposureCap>=2个百分点时，14:30产生信号，14:35执行；按分数升序、风险降序、代码升序卖至上限。
+8. 软减仓：分数低于HoldThreshold、排名跌出前8、强顶背离且SignedERWeakening、或普通市场降仓涉及该持仓，任一连续2日，减仓50%。同一episode只执行一次；恢复条件为分数回到HoldThreshold以上且排名回前8连续3日。
+9. 软减仓按交易单位向下取整；若为0则不执行并记录below_min_trade。全部退出按规则允许卖出全部零股尾仓。
+10. 全部退出条件：
+- OpportunityScore<EntryThreshold-15连续2日；
+- 排名跌出前10连续3日；
+- 连续2日Close<MA60；
+- 单日Close<MA60-1×ATR20；
+- 强顶背离+StructureBreak；
+- 初始止损；
+- 移动止损；
+- 二级紧急降险分配到该持仓。
+11. InitialStop=EntryPrice-2×EntryATR20。
+12. 浮盈达到1.5×EntryATR20后启用移动止损；CandidateStop=HighestCloseSinceEntry-2.5×CurrentATR20；TrailingStop_t=max(TrailingStop_t-1,CandidateStop)，只能上移。
+
+十四、PendingSell与动作优先级
+
+1. 卖出失败后记录PendingSellQty，从下一根5分钟K线开始在每个后续5分钟执行点重试，跨日保留。
+2. 新卖出要求与旧PendingSell合并：min(PositionQty,max(ExistingPendingSellQty,NewRequiredSellQty))。
+3. 动作优先级：PendingSell→硬止损/硬退出→二级紧急降险→全部退出→软减仓→替换→普通市场降仓→持有→新买入。
+4. 多个退出原因全部保存在all_exit_reasons；primary_exit_reason优先级：trailing_stop→initial_stop→emergency_market→strong_divergence_structure_break→ma60_break→score_exit→rank_exit。
+5. 完全退出后冷却3个完整交易日。例外：OpportunityScore>=EntryThreshold+5、ExecutionGate=PASS、且上次退出不是initial_stop或trailing_stop。
+
+十五、简化FillEngine
+
+1. 买入：10:00确认，10:05 K线Open直接成交。
+2. 硬退出：完成K线确认，下一根K线Open直接成交。
+3. 软退出、替换、普通降仓：14:30确认，14:35 K线Open直接成交。
+4. 不计算滑点、成交容量、部分成交、订单排队或追价。
+5. 整笔失败条件：停牌、买入涨停、卖出跌停、状态未知、价格异常、T+1可卖不足、现金不足、持仓不足、交易单位不符。
+6. 仍计算账户佣金、最低佣金、卖出印花税、过户及结算费用，按日期读取。
+7. 回测期末不强制平仓。
+
+十六、历史数据与规则
+
+1. 历史ST、停牌、退市整理、板块和行业状态优先使用具备历史时点查询能力的JoinQuant；AkShare仅在结果明确包含历史生效日期时回退。无法证明当时已知则status_unknown并禁止新买。
+2. 原始未复权OHLC用于成交、涨跌停、价格单位和订单规则。
+3. 指标调整序列只使用生效日不晚于回测日的公司行为。
+4. 每条数据保存source、adjust_type、fetched_at、known_at或effective_date、data_version。
+5. 固定池模式：回测开始日确定成员并固定整个期间，报告标记lookahead_selection_risk=true。
+6. 历史快照模式：保存每日全量快照；收盘后保存的快照下一交易日生效。
+7. 交易规则表按exchange、board、security_type和effective_from/effective_to管理买入单位、部分卖出单位、零股退出、tick、涨跌幅和特殊日规则。
+
+十七、基准与验证
+
+所有基准使用相同股票池、信息切片、T+1、10:05/14:35成交、涨跌停、停牌和费用。
+
+1. 自选股等权持有：首个可交易日10:05等权买入，之后不主动再平衡；历史快照成员退出时14:35卖出。
+2. RS60前6：每周第一个交易日10:00评估，10:05等权再平衡。
+3. MA趋势前6：每周第一个交易日筛选MA20>MA60，按(MA20-MA60)/ATR20降序取前6，10:05等权再平衡。
+4. OpportunityScore-only：每日10:00评估，使用固定70分买入门槛和8分迟滞，不使用Market/Risk/Execution覆盖层，10:05执行。
+5. 完整V1.3.1。
+
+参数验证不做完整笛卡尔积。先做单变量敏感性测试。按日期前60%训练、20%验证、后20%最终测试；不得随机。验证区间选择稳定参数区域，不选择单一最高点；最终测试区间只运行一次，不得据此继续调参。总历史不足5个完整交易年时，结果标记为探索性。
+
+十八、实施顺序
+
+Phase 0：本文件冻结公式与数据契约。
+Phase 1：OpportunityScore及单元测试。
+Phase 2：MarketOverlay、背离、RiskOverlay、ExecutionGate。
+Phase 3：分钟数据契约与简化FillEngine。
+Phase 4：T+1状态机、仓位、ExitEngine、PendingSell。
+Phase 5：历史快照、日期化规则/费用、基准和报告。
+Phase 6：独立网页入口。
+
+旧恒温器、旧事件回测和旧网页入口必须保留，V1.3.1不得调用旧恒温器内部策略逻辑。
