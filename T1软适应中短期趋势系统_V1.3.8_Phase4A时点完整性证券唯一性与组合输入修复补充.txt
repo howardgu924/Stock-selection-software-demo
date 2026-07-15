@@ -1,0 +1,199 @@
+T+1软适应中短期趋势系统 V1.3.8
+Phase 4A时点完整性、证券唯一性与组合输入修复补充
+版本日期：2026-07-15
+
+一、目的
+
+本版本不改变Phase 1—3及V1.3.7的风险预算、缩放顺序和T+1记账原则，只修复Phase 4A审查发现的4项P0、4项P1及2项P2。修复并通过只读复审前，不得提交Phase 4A，不得进入Phase 4B。
+
+二、T1观测完成时点
+
+T1RiskObservation必须包含：
+instrument_type、symbol、sample_entry_date、completion_trade_date、completion_bar_start、known_at、entry_price、first_sellable_price、t1_return、t1_loss、censored、status。
+
+known_at表示该观测首次完整可知的Asia/Shanghai时间：
+- 正常首个可卖Open：对应5分钟K线结束时刻，即bar_start+5分钟；
+- 第5日censored：第5个交易日15:00。
+
+calculate_t1_risk必须接收evaluation_as_of。只有同时满足：
+- sample_entry_date < evaluation_as_of本地日期；
+- known_at < evaluation_as_of；
+的观测可进入统计。
+
+若上层只提供evaluation_date，适配层固定转换为当日10:00 Asia/Shanghai，不得默认23:59:59。未来完成的卖出或censored结果不得倒灌。
+
+三、观测验证、去重与分位数
+
+ObservationKey：
+instrument_type + normalized_symbol + sample_entry_date。
+
+有效观测必须满足：
+- status=VALID；
+- symbol、日期、known_at有效；
+- entry_price和first_sellable_price为有限正数；
+- t1_return有限；
+- t1_loss有限且0<=t1_loss<=1；
+- censored为严格bool；
+- known_at与completion字段一致。
+
+禁止把非法t1_loss截断到0或1。
+
+相同Key且全部字段一致：去重，只计一次。
+相同Key但任一字段冲突：该Key全部排除，并记录：
+conflicting_t1_observation:<instrument_type>:<symbol>:<sample_entry_date>
+
+NaN、Infinity、负数或大于1的t1_loss：排除并记录稳定原因，不得泄漏Decimal异常。
+
+行业、板块和三指数综合池合并后必须再次去重，禁止跨来源重复计数。
+
+处理顺序：
+1. evaluation_as_of过滤；
+2. 字段验证；
+3. 去重与冲突排除；
+4. 按sample_entry_date、known_at、instrument_type、symbol稳定排序；
+5. 取最近252条；
+6. 有效唯一观测少于120时该层不可用。
+
+sample_count等于实际进入quantile的数量；censored_count只统计最终样本。
+
+回退顺序继续为：
+证券自身→申万一级行业→板块→三指数综合。
+当前层清洗后>=120立即使用；不足则进入下一层。全部不足时：
+BLOCK_NEW / insufficient_t1_risk_samples。
+
+四、证券代码唯一性
+
+候选、现有持仓、收益历史、T1观测、行业元数据和输出必须统一规范化symbol。
+
+候选600001.SH与持仓600001视为同一证券，候选必须：
+eligible=false、final_target_weight=0、order_qty=0，并包含already_held。
+
+多个候选规范化为同一symbol：
+PortfolioAllocationResult.status=INVALID
+reason=duplicate_normalized_candidate_symbol:<symbol>
+
+多个现有持仓规范化为同一symbol：
+status=INVALID
+reason=duplicate_normalized_existing_symbol:<symbol>
+
+不得静默覆盖、重复占名额、重复下单或重复计算权重。输出symbol全部使用规范化形式。
+
+五、组合输入范围契约
+
+以下字段只接受Decimal或可精确解析的十进制字符串，拒绝float、bool、NaN、Infinity和非法字符串：
+
+effective_exposure_cap、现有权重、候选各层权重、候选/持仓t1_loss_q、scenario_loss_pct、risk/gate/correlation multiplier。
+
+必须满足0<=x<=1。
+新候选raw_weight、adjusted_weight、final_target_weight还必须<=0.15。
+
+ExistingExposure必须在[0,1]。
+ExistingStress不得为负；ExistingStress>=0.05时合法结果是禁止新增。
+final_new_exposure不得为负。
+final_portfolio_stress必须在[0,0.05]。
+
+任一集中校验失败：
+PortfolioAllocationResult.status=INVALID，
+所有新候选最终权重和order_qty为0，不得继续缩放。
+
+六、相关性收益日期
+
+每只证券daily_returns先规范化日期。
+
+同一日期：
+- 值完全相同：去重；
+- 值冲突：correlation_status=UNKNOWN，
+  failure_reason=conflicting_return_date:<symbol>:<date>。
+
+输入顺序不得改变结果。NaN和Infinity返回UNKNOWN/invalid_return_value。代码别名规范化后不得重复计持仓。
+
+其余规则保持：最近60个共同有效收益、至少40个、方差非零、Pearson相关系数。
+
+七、行业分类快照
+
+新增不可变IndustryClassificationSnapshot：
+symbol、industry_code、industry_name、effective_date、known_at、source、classification_version。
+
+有效条件：
+- symbol可规范化；
+- code/name非空；
+- effective_date<=evaluation_as_of本地日期；
+- known_at<evaluation_as_of；
+- source和classification_version非空。
+
+任一现有持仓缺少有效行业快照：
+整个分配INVALID，
+invalid_existing_industry_metadata:<symbol>
+
+新候选行业快照无效：
+仅该候选ineligible、权重0，
+invalid_candidate_industry_metadata:<symbol>
+
+不得生成空行业键。
+
+八、PositionState数量类型
+
+应用任何FillResult前必须满足：
+type(requested_qty) is int
+type(filled_qty) is int
+requested_qty>0
+filled_qty>0
+filled_qty=requested_qty
+
+bool、字符串、小数和其他类型均不合法。买卖路径一致执行。非法时：
+INVALID / invalid_filled_qty，旧状态不变。
+
+九、深度不可变
+
+frozen dataclass不得持有调用方可变Mapping引用。
+
+daily_returns改为不可变排序元组或复制后的只读结构；
+industry_weights改为不可变排序元组或只读结构；
+构造时复制输入；
+外部修改原dict/list不得改变模型；
+结果不得支持原地修改；
+Lot、reasons等继续使用tuple。
+
+十、FillResult重放责任
+
+Phase 4A不新增成交唯一ID。公开契约必须明确：
+- apply_buy_fill和apply_sell_fill不是幂等API；
+- 调用方保证每个FILLED FillResult只应用一次；
+- 重放属于调用方错误；
+- docstring和测试必须锁定该责任；
+- Phase 5集成层用成交日志唯一键防止重放。
+
+十一、报告场景
+
+scenario_loss_pct必须为Decimal或十进制字符串且0<=x<=1，否则整个分配INVALID。
+
+highest_correlation_pair只从唯一规范化现有持仓中选择；并列按symbol_1、symbol_2升序。报告场景不得参与仓位缩放。
+
+十二、必须新增测试
+
+1. 过去入场但known_at在evaluation_as_of之后，排除。
+2. completion_trade_date在未来，排除。
+3. evaluation_date适配为当日10:00。
+4. 同一观测重复120次只计1条。
+5. 完全相同重复去重，冲突重复排除且顺序无关。
+6. t1_loss负数、>1、NaN、Infinity不进入样本且不泄漏异常。
+7. 三指数跨来源重复去重。
+8. 最近252条按日期而非输入顺序。
+9. 119/120边界及sample_count/censored_count。
+10. 候选别名识别为已持有。
+11. 重复候选、重复现有持仓INVALID。
+12. selected_symbols规范化且唯一。
+13. cap、权重、t1_loss_q、scenario_loss_pct非法边界。
+14. 非法组合输入不产生正权重或订单。
+15. 重复收益日期相同值去重、冲突值UNKNOWN且顺序无关。
+16. NaN/Infinity收益UNKNOWN。
+17. 行业快照空值、未来effective_date、未来known_at、空source/version。
+18. 现有行业无效使组合INVALID；候选行业无效只阻断候选。
+19. requested_qty或filled_qty为bool、字符串、小数及二者不一致。
+20. 修改原daily_returns输入不影响模型，industry_weights不可原地修改。
+21. docstring与测试明确状态转换非幂等。
+22. 原有532项测试及Phase 1—3继续通过。
+
+十三、验收标准
+
+4项P0、4项P1全部修复；P2深度不可变和重放责任落实；新增测试覆盖上述边界；完整项目无回归；不修改Phase 4B、数据库、网页、旧系统或Phase 1—3公式。修复后必须再次只读复审，通过后才能提交Phase 4A。

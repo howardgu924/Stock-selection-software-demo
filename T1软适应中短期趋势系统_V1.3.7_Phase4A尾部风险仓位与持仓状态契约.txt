@@ -1,0 +1,761 @@
+T+1软适应中短期趋势系统 V1.3.7
+Phase 4A：T+1尾部风险、仓位分配与持仓状态契约
+版本日期：2026-07-15
+
+一、版本目的
+
+Phase 3已经验收通过。
+
+原计划中的Phase 4同时包含尾部风险、仓位分配、T+1持仓、退出和PendingSell，范围过大。自V1.3.7起将其拆为：
+
+- Phase 4A：T1Loss、PositionSizing、PortfolioAllocation、T+1持仓状态；
+- Phase 4B：ExitEngine、PendingSell、保护期、冷却期和替换逻辑。
+
+V1.3.7只实现Phase 4A，不进入Phase 4B。
+
+本版本不修改Phase 1、Phase 2和Phase 3已经验收的数学公式、成交时点与FillEngine规则。
+
+
+二、建议模块
+
+新增：
+
+stock_picker/strategies/adaptive_trend_v1_3/
+- t1_tail_risk.py
+- position_sizing.py
+- portfolio_allocator.py
+- position_state.py
+- phase4_models.py
+
+允许更新新策略目录的__init__.py导出。
+
+禁止实现或修改：
+
+- ExitEngine；
+- PendingSell；
+- 止损和移动止损；
+- 软减仓episode；
+- 替换持仓；
+- 保护期和冷却期；
+- 数据库；
+- 网页；
+- 报告；
+- 旧恒温器；
+- 旧事件回测；
+- Phase 1、2、3既有公式。
+
+
+三、统一输入原则
+
+1. Phase 4A保持纯计算和显式状态转换，不自行抓取数据或查询数据库。
+2. 所有日期使用交易日历，不使用自然日推断下一交易日。
+3. 历史成交价格使用原始未复权5分钟K线。
+4. 指标和行业、板块元数据必须是历史时点可用数据。
+5. 无法验证日期、价格、交易状态或元数据时，返回稳定INVALID或BLOCK_NEW，不得静默填补。
+6. 决策使用未四舍五入值；金额使用Decimal；展示格式留给报告层。
+
+
+四、T+1尾部风险观测
+
+定义一条历史T+1风险观测。
+
+1. 历史入场日
+
+样本入场日记为d。
+
+入场执行时点：
+
+d日10:05。
+
+入场价格：
+
+10:05 K线Open。
+
+入场K线必须：
+
+- 数据契约有效；
+- trade_status = normal；
+- limit_status不是limit_up和unknown；
+- Open为有限正数。
+
+limit_down允许作为历史买入样本。
+
+不满足时，该日期不形成观测。
+
+2. 首个可卖日
+
+从d后的下一个交易日开始，不得在d日卖出。
+
+3. 首个可卖价格搜索
+
+依次搜索下一交易日起最多5个交易日的所有合法5分钟bar_start：
+
+09:30至11:25；
+13:00至14:55。
+
+某根K线可作为首个可卖价格，必须：
+
+- 数据契约有效；
+- trade_status = normal；
+- limit_status不是limit_down和unknown；
+- Open为有限正数。
+
+limit_up允许卖出。
+
+取第一根满足条件K线的Open作为first_sellable_price。
+
+4. 五日均不可卖
+
+若5个交易日内没有可卖Open：
+
+- 取第5个交易日最后一根有效K线的Close；
+- 优先14:55 Close；
+- 若14:55无效，则取该日时间最晚的有效Close；
+- 该观测标记censored = true。
+
+若第5个交易日不存在任何有效Close：
+
+该样本为INVALID_OBSERVATION，不进入分位数。
+
+5. 收益与损失
+
+T1Return =
+first_sellable_price / entry_price - 1
+
+T1Loss =
+max(0, -T1Return)
+
+正常可卖和censored样本均进入统计，但必须保留censored字段用于报告。
+
+
+五、T1Loss分位数
+
+1. 样本窗口
+
+只使用sample_entry_date < evaluation_date的观测。
+
+优先使用最近252条有效观测。
+
+少于252条时使用全部有效观测，但不得少于120条。
+
+2. 分位数
+
+T1Loss_q =
+T1Loss样本的95%分位数。
+
+使用线性插值：
+
+quantile(0.95, method="linear")
+
+T1Loss_q输出为0至1之间的小数。
+
+3. 回退顺序
+
+按以下顺序选择第一个样本数不少于120的集合：
+
+1. 当前证券自身历史；
+2. 历史时点有效的申万一级行业样本；
+3. 当前证券所属板块样本；
+4. 三指数综合样本。
+
+三指数综合样本来源：
+
+沪深300、中证1000、创业板指，权重仅用于来源标识，不对观测损失重新加权。将三个指数有效观测合并后取分位数。
+
+4. 元数据要求
+
+行业和板块归属必须由调用方传入：
+
+- effective_date；
+- known_at；
+- source；
+- classification_version。
+
+无法证明evaluation_date时点有效时，该级回退不可用。
+
+5. 无可用样本
+
+四级样本均少于120：
+
+t1_risk_status = BLOCK_NEW
+failure_reason = insufficient_t1_risk_samples
+
+
+六、NormalRisk与EffectiveRisk
+
+NormalRiskPct =
+2 × EntryATR / EntryPrice
+
+要求：
+
+- EntryATR > 0；
+- EntryPrice > 0；
+- 结果为有限值。
+
+EffectiveRiskPct =
+max(
+NormalRiskPct,
+T1Loss_q
+)
+
+EffectiveRiskPct <= 0或非有限：
+
+BLOCK_NEW。
+
+
+七、单股原始仓位
+
+风险预算固定为账户权益的0.5%。
+
+RawWeight =
+min(
+0.15,
+0.005 / EffectiveRiskPct
+)
+
+其中：
+
+- 0.15为单股最高15%；
+- 0.005为单股风险预算0.5%。
+
+不允许RawWeight为负数或超过15%。
+
+
+八、候选资格
+
+新买候选必须同时满足：
+
+1. OpportunityScore状态VALID；
+2. OpportunityScore >= EntryThreshold；
+3. opportunity_rank <= 6；
+4. MarketOverlay未暂停新仓；
+5. EmergencyMarketGate为NORMAL；
+6. RiskOverlay不是BLOCK_NEW；
+7. ExecutionGate不是REJECT；
+8. T1风险状态不是BLOCK_NEW；
+9. 当前未持有该证券；
+10. 不处于后续Phase 4B提供的冷却期。
+
+Phase 4A尚未实现冷却期，因此调用方必须传入：
+
+cooldown_blocked: bool
+
+cooldown_blocked = true时不允许买入。
+
+
+九、仓位乘数
+
+按以下顺序应用，且每项只应用一次。
+
+1. RiskOverlay
+
+ALLOW：
+risk_multiplier = 1.00
+
+普通顶背离REDUCED：
+risk_multiplier = 0.75
+
+BLOCK_NEW：
+最终权重为0。
+
+2. ExecutionGate
+
+PASS：
+gate_multiplier = 1.00
+
+HALF：
+gate_multiplier = 0.50
+
+REJECT：
+最终权重为0。
+
+3. 相关性
+
+计算候选与每个现有持仓最近60个共同有效交易日的日收益Pearson相关系数。
+
+每一对至少需要40个共同有效收益。
+
+若任一现有持仓无法形成40个共同收益：
+
+correlation_status = UNKNOWN
+最终权重为0
+failure_reason = insufficient_correlation_history
+
+可计算时：
+
+- 与1个现有持仓相关系数 >= 0.80：
+  correlation_multiplier = 0.50
+- 与2个或更多现有持仓相关系数 >= 0.80：
+  correlation_multiplier = 0
+- 否则：
+  correlation_multiplier = 1.00
+
+负相关和低于0.80不处罚。
+
+4. 调整后单股权重
+
+AdjustedWeight =
+RawWeight
+× risk_multiplier
+× gate_multiplier
+× correlation_multiplier
+
+仍须不超过15%。
+
+
+十、最大持仓数量
+
+最大同时持有6只股票。
+
+现有持仓数量记为N。
+
+可新增名额：
+
+max(0, 6 - N)
+
+候选按Phase 1稳定排名顺序选择：
+
+OpportunityScore降序
+→ RS60降序
+→ RS20降序
+→ SignedER20降序
+→ symbol升序
+
+只保留前述可新增名额数量的候选。
+
+不因后续手数舍入为0而把名额重新分配给更低排名候选。
+
+
+十一、行业上限
+
+单个申万一级行业总目标权重不得超过30%。
+
+对每个行业：
+
+ExistingIndustryWeight =
+现有持仓该行业实际权重之和
+
+IndustryRoom =
+max(0, 0.30 - ExistingIndustryWeight)
+
+若该行业新候选AdjustedWeight总和 <= IndustryRoom：
+
+不缩放。
+
+若超过：
+
+该行业全部新候选按相同比例缩放：
+
+IndustryScale =
+IndustryRoom / NewIndustryAdjustedWeightSum
+
+现有持仓不在Phase 4A中被动缩减。
+
+若ExistingIndustryWeight >= 0.30：
+
+该行业所有新买权重为0。
+
+
+十二、总仓位上限
+
+市场有效仓位上限来自Phase 2：
+
+EffectiveExposureCap
+
+ExistingExposure =
+现有持仓实际权重之和
+
+ExposureRoom =
+max(0, EffectiveExposureCap - ExistingExposure)
+
+若行业调整后的新候选权重总和超过ExposureRoom：
+
+所有新候选按相同比例缩放。
+
+现有持仓不在Phase 4A中被动缩减。
+
+若ExistingExposure >= EffectiveExposureCap：
+
+不允许新增仓位。
+
+
+十三、组合压力上限
+
+PortfolioStressLoss =
+Σ(
+position_weight × position_T1Loss_q
+)
+
+组合压力上限固定为账户权益的5%：
+
+PortfolioStressLoss <= 0.05
+
+ExistingStress =
+现有持仓实际权重 × 各自T1Loss_q之和
+
+StressRoom =
+max(0, 0.05 - ExistingStress)
+
+新候选压力：
+
+NewStress =
+Σ(
+new_weight × candidate_T1Loss_q
+)
+
+若NewStress > StressRoom且NewStress > 0：
+
+所有新候选按相同比例缩放：
+
+StressScale =
+StressRoom / NewStress
+
+现有持仓不在Phase 4A中被动缩减。
+
+若ExistingStress >= 0.05：
+
+不允许新增仓位。
+
+
+十四、组合缩放顺序
+
+新候选权重按以下固定顺序处理：
+
+1. 单股RawWeight；
+2. RiskOverlay乘数；
+3. ExecutionGate乘数；
+4. 相关性乘数；
+5. 最大6只持仓筛选；
+6. 行业30%上限比例缩放；
+7. EffectiveExposureCap比例缩放；
+8. PortfolioStressLoss 5%比例缩放；
+9. 交易单位向下取整。
+
+不得改变顺序。
+
+不得在舍入后重新分配剩余现金或剩余权重。
+
+
+十五、数量与交易单位
+
+输入：
+
+- PortfolioEquity；
+- ExecutionPrice；
+- buy_lot_size；
+- FinalTargetWeight。
+
+TargetAmount =
+PortfolioEquity × FinalTargetWeight
+
+RawQty =
+TargetAmount / ExecutionPrice
+
+OrderQty =
+floor(
+RawQty / buy_lot_size
+)
+× buy_lot_size
+
+规则：
+
+- PortfolioEquity、ExecutionPrice必须为有限正Decimal或十进制字符串；
+- buy_lot_size必须为正整数；
+- OrderQty <= 0时不生成订单；
+- failure_reason = below_min_trade；
+- 不向上取整；
+- 不重新分配剩余现金；
+- 实际权重：
+  ActualOrderWeight =
+  OrderQty × ExecutionPrice / PortfolioEquity。
+
+
+十六、报告型压力场景
+
+以下只输出报告，不改变仓位：
+
+1. 最高相关持仓对：
+   输出相关系数最高的两只持仓。
+
+2. 连续两日跌停场景：
+   对每只持仓计算：
+
+TwoLimitDownScenarioLoss =
+position_weight × scenario_loss_pct
+
+scenario_loss_pct由调用方根据当日历史规则快照提供。
+
+组合报告为各持仓场景损失之和。
+
+不得用该报告型场景重复缩放仓位。
+
+
+十七、T+1持仓状态
+
+1. 持仓字段
+
+PositionState至少包含：
+
+- symbol；
+- total_qty；
+- sellable_qty；
+- today_bought_qty；
+- average_cost；
+- cost_basis；
+- entry_trade_date；
+- entry_price；
+- entry_atr；
+- highest_close；
+- realized_pnl；
+- lots；
+- status。
+
+2. Lot字段
+
+每个买入Lot至少包含：
+
+- buy_trade_date；
+- qty；
+- remaining_qty；
+- execution_price；
+- allocated_buy_fees；
+- unlock_trade_date。
+
+unlock_trade_date为buy_trade_date后的下一个交易日。
+
+3. 买入成交更新
+
+收到FILLED买入后：
+
+total_qty += filled_qty
+
+today_bought_qty += filled_qty
+
+sellable_qty不变
+
+新增Lot。
+
+BuyCost =
+gross_amount + total_fees
+
+cost_basis += BuyCost
+
+average_cost =
+cost_basis / total_qty
+
+当买入前total_qty = 0：
+
+- entry_trade_date = execution_trade_date；
+- entry_price = execution_price；
+- entry_atr由调用方传入并冻结；
+- highest_close初始化为entry_price。
+
+V1.3.7仍禁止主动加仓；状态模型保留多Lot能力，仅用于确定性和未来兼容。
+
+4. 交易日解锁
+
+在新交易日开始时，根据trading_calendar执行unlock。
+
+所有：
+
+unlock_trade_date <= current_trade_date
+
+且remaining_qty > 0的Lot转为可卖。
+
+重新计算：
+
+sellable_qty =
+所有已解锁Lot的remaining_qty之和
+
+today_bought_qty =
+所有buy_trade_date = current_trade_date的remaining_qty之和
+
+不得在买入当日提前解锁。
+
+5. 卖出成交更新
+
+卖出只能扣减已解锁Lot。
+
+扣减顺序固定为FIFO：
+
+buy_trade_date升序
+→ Lot创建顺序升序
+
+收到FILLED卖出后：
+
+total_qty -= filled_qty
+
+sellable_qty -= filled_qty
+
+SoldCost =
+卖出数量对应的Lot剩余成本
+
+realized_pnl += net_proceeds - SoldCost
+
+cost_basis -= SoldCost
+
+若total_qty > 0：
+
+average_cost =
+cost_basis / total_qty
+
+若total_qty = 0：
+
+- average_cost = 0；
+- cost_basis = 0；
+- sellable_qty = 0；
+- today_bought_qty = 0；
+- entry_trade_date、entry_price、entry_atr、highest_close清空；
+- lots清空；
+- status = CLOSED。
+
+6. 非法状态转换
+
+以下情况返回INVALID，不修改原状态：
+
+- filled_qty <= 0；
+- 买入或卖出FillResult不是FILLED；
+- 卖出数量超过sellable_qty；
+- 卖出数量超过total_qty；
+- 交易日早于当前状态日期；
+- Lot数量与汇总字段不一致；
+- 金额字段非法。
+
+7. 输入不可变
+
+状态转换函数不得原地修改旧PositionState或FillResult。
+
+必须返回新的不可变状态对象。
+
+
+十八、Phase 4A输出
+
+T1RiskResult至少包含：
+
+- status；
+- source_level；
+- sample_count；
+- t1_loss_q；
+- censored_count；
+- normal_risk_pct；
+- effective_risk_pct；
+- failure_reason。
+
+SizingResult至少包含：
+
+- symbol；
+- eligible；
+- raw_weight；
+- risk_multiplier；
+- gate_multiplier；
+- correlation_multiplier；
+- adjusted_weight；
+- industry_scaled_weight；
+- exposure_scaled_weight；
+- stress_scaled_weight；
+- final_target_weight；
+- order_qty；
+- actual_order_weight；
+- failure_reasons。
+
+PortfolioAllocationResult至少包含：
+
+- selected_symbols；
+- existing_exposure；
+- effective_exposure_cap；
+- existing_stress；
+- final_new_exposure；
+- final_portfolio_stress；
+- industry_weights；
+- highest_correlation_pair；
+- two_limit_down_scenario_loss；
+- status；
+- reasons。
+
+PositionTransitionResult至少包含：
+
+- status；
+- previous_state；
+- new_state；
+- action；
+- qty_delta；
+- cash_delta；
+- realized_pnl_delta；
+- failure_reason。
+
+
+十九、必须测试
+
+T1风险：
+
+1. 10:05有效买入样本。
+2. 买入涨停或停牌不形成样本。
+3. 下一交易日09:30即可卖出。
+4. 跌停时继续搜索下一根。
+5. 午休和跨交易日搜索。
+6. 第5日最后有效Close及censored。
+7. 第5日无有效Close时样本INVALID。
+8. T1Return和T1Loss。
+9. 95%线性分位数固定样例。
+10. 252条截断和120条下限。
+11. 证券→行业→板块→综合回退。
+12. 元数据known_at/effective_date无效时跳过该层。
+13. 全部不足120时BLOCK_NEW。
+
+仓位：
+
+14. NormalRisk和EffectiveRisk。
+15. RawWeight的0.5%风险预算和15%上限。
+16. RiskOverlay 0.75只应用一次。
+17. ExecutionGate HALF只应用一次。
+18. 一个高相关持仓减半。
+19. 两个高相关持仓拒绝。
+20. 相关历史不足时拒绝。
+21. 最大6只及稳定排序。
+22. 行业30%比例缩放。
+23. 总仓位比例缩放。
+24. 组合压力5%比例缩放。
+25. 固定缩放顺序。
+26. lot size向下取整。
+27. below_min_trade。
+28. 不重新分配剩余资金。
+
+持仓状态：
+
+29. 买入当日不可卖。
+30. 下一交易日解锁。
+31. 周五买入后按交易日历周一或下一实际交易日解锁。
+32. FIFO卖出。
+33. 买入费用进入成本。
+34. 卖出费用通过net_proceeds进入已实现盈亏。
+35. 部分卖出后的cost_basis和average_cost。
+36. 全部退出清空状态。
+37. 非FILLED结果不更新状态。
+38. 超过sellable_qty时INVALID且旧状态不变。
+39. 多Lot汇总一致性。
+40. 输入对象不可变。
+
+回归：
+
+41. Phase 1的80项测试继续通过。
+42. Phase 2的93项测试继续通过。
+43. Phase 3的130项测试继续通过。
+44. 完整项目486项基线继续通过。
+45. 不修改禁止模块。
+
+
+二十、验收标准
+
+1. Phase 4A全部测试通过。
+2. Phase 1、2、3无回归。
+3. 不实现Phase 4B内容。
+4. 不修改数据库、网页和旧系统。
+5. 完成后进行只读审查。
+6. 只读审查通过后才提交Phase 4A检查点。
+
+
+二十一、版本结论
+
+V1.3.7只建立风险预算、组合新仓分配和T+1持仓记账基础。
+
+退出、PendingSell、保护期、冷却期和替换逻辑留给Phase 4B。

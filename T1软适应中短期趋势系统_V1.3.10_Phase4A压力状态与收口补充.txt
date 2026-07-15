@@ -1,0 +1,70 @@
+T+1软适应中短期趋势系统 V1.3.10
+Phase 4A压力状态与收口补充
+版本日期：2026-07-15
+
+一、目的
+
+本文件一次性修复Phase 4A剩余的2项P1和1项P2。除本文件明确内容外，不修改Phase 4A公式、缩放顺序、T1风险、持仓记账或其他阶段。
+
+二、PortfolioAllocationResult新增字段
+
+- final_new_stress: Decimal
+- stress_status: str
+- allocation_status: str
+
+保留status字段表示输入结构和计算是否有效。
+
+stress_status：NORMAL、AT_LIMIT、OVER_LIMIT、INVALID。
+allocation_status：READY、BLOCK_NEW、INVALID。
+
+三、压力状态规则
+
+ExistingStress < 0.05：
+- stress_status=NORMAL；
+- allocation_status=READY；
+- final_new_stress为全部组合缩放完成后的final_target_weight乘candidate_t1_loss_q之和；
+- final_portfolio_stress=existing_stress+final_new_stress，且不得超过0.05。
+
+ExistingStress = 0.05：
+- stress_status=AT_LIMIT；
+- allocation_status=BLOCK_NEW；
+- 所有新候选final_target_weight和order_qty为0；
+- final_new_stress=0；
+- final_portfolio_stress=existing_stress；
+- reasons包含existing_stress_at_limit；
+- status不得为INVALID。
+
+ExistingStress > 0.05：
+- stress_status=OVER_LIMIT；
+- allocation_status=BLOCK_NEW；
+- 所有新候选final_target_weight和order_qty为0；
+- final_new_stress=0；
+- final_portfolio_stress保留真实ExistingStress；
+- reasons包含existing_stress_over_limit；
+- 不主动缩减现有持仓；
+- status不得为INVALID。
+
+输入结构、Decimal类型、范围或元数据非法：
+- status=INVALID；
+- stress_status=INVALID；
+- allocation_status=INVALID；
+- final_new_stress=0；
+- 所有新权重和订单为0。
+
+四、计算顺序与兼容性
+
+final_new_stress在RiskOverlay、ExecutionGate、相关性、最大6只、行业上限、总仓位上限和压力上限全部处理完成后，使用final_target_weight计算。lot size向下取整不得触发重新分配。
+
+不得删除或重命名PortfolioAllocationResult既有字段。所有VALID、INVALID、空候选、无新增空间路径均须提供三个新字段，结果继续深度不可变。
+
+五、FillResult重放责任
+
+apply_buy_fill和apply_sell_fill均不是幂等操作。调用方必须保证每个FILLED FillResult只应用一次。Phase 5集成层必须使用成交日志唯一键防止重复应用。本阶段不增加成交ID或内部重放检测。
+
+六、测试与边界
+
+必须覆盖ExistingStress为0.049、0.05和0.051，非法输入、空候选、无新增空间、真实超限压力不截断、现有持仓不变，以及买卖API完整Phase 5防重docstring契约。
+
+七、禁止范围
+
+不得修改t1_tail_risk.py、position_sizing.py、Phase 1至3公式、ExitEngine、PendingSell、止损、移动止损、软减仓、替换、保护期、冷却期、数据库、网页、报告持久化、旧系统或Phase 4B内容。

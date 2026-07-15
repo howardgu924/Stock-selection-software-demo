@@ -1,0 +1,92 @@
+T+1软适应中短期趋势系统 V1.3.9
+Phase 4A既有压力超限处理补充
+版本日期：2026-07-15
+
+一、目的
+
+V1.3.8同时要求：
+1. Phase 4A不得主动缩减现有持仓；
+2. PortfolioStressLoss原则上不得超过5%。
+
+当既有持仓压力已经超过5%时，两条规则无法同时满足。V1.3.9只冻结该边界，不修改其他Phase 4A公式。
+
+二、ExistingStress < 0.05
+
+StressRoom = 0.05 - ExistingStress。
+
+新候选必须经过压力比例缩放，使：
+
+FinalPortfolioStress =
+ExistingStress + FinalNewStress
+<= 0.05。
+
+三、ExistingStress = 0.05
+
+- 不允许新增；
+- 所有新候选final_target_weight=0；
+- 所有新候选order_qty=0；
+- stress_status=AT_LIMIT；
+- final_portfolio_stress=ExistingStress；
+- 不主动缩减现有持仓。
+
+四、ExistingStress > 0.05
+
+- 不允许新增；
+- 所有新候选final_target_weight=0；
+- 所有新候选order_qty=0；
+- stress_status=OVER_LIMIT；
+- allocation_status=BLOCK_NEW；
+- reasons包含existing_stress_over_limit；
+- final_portfolio_stress=ExistingStress；
+- 允许final_portfolio_stress>0.05；
+- 不主动缩减现有持仓；
+- 实际减仓留给Phase 4B。
+
+该状态不是INVALID，因为既有压力超限可能由市场变化导致，不代表输入结构非法。
+
+五、最终不变量
+
+1. ExistingStress < 0.05：
+   FinalPortfolioStress <= 0.05。
+
+2. ExistingStress >= 0.05：
+   FinalNewExposure = 0，
+   FinalPortfolioStress = ExistingStress。
+
+3. Phase 4A不得通过负权重、反向缩放或卖出旧仓强行把压力降到5%。
+
+六、输出补充
+
+PortfolioAllocationResult应明确包含或可推导：
+
+- existing_stress；
+- final_new_stress；
+- final_portfolio_stress；
+- stress_status；
+- allocation_status；
+- reasons。
+
+stress_status至少包括：
+
+NORMAL
+AT_LIMIT
+OVER_LIMIT
+INVALID
+
+七、测试要求
+
+1. ExistingStress=0.049：新仓缩放后最终压力不得超过0.05。
+2. ExistingStress=0.05：新仓全部为0，stress_status=AT_LIMIT。
+3. ExistingStress=0.051：
+   - 新仓全部为0；
+   - allocation_status=BLOCK_NEW；
+   - reasons包含existing_stress_over_limit；
+   - final_portfolio_stress=0.051；
+   - 不修改现有持仓。
+4. ExistingStress>0.05时不得返回INVALID，除非输入字段本身非法。
+5. ExistingStress>0.05时不得产生负新仓权重或负StressRoom。
+6. final_portfolio_stress必须保留真实既有压力，不得截断为0.05。
+
+八、结论
+
+Phase 4A负责阻止风险继续扩大，但不负责卖出现有持仓。既有压力已超限时：禁止新增、报告真实超限值、等待Phase 4B处理减仓。
