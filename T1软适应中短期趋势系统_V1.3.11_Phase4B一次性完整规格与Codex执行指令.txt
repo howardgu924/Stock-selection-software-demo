@@ -1,0 +1,368 @@
+T+1软适应中短期趋势系统 V1.3.11
+Phase 4B一次性完整规格与Codex执行指令
+日期：2026-07-15
+
+前置检查点
+- Phase 4A SHA：63a2289cfda6798cd8cc086ecc924ce44baaa9b0
+- 工作区应保持干净
+- 本轮完成后只暂存，不提交，不进入Phase 5
+
+一、实现范围
+
+新增建议模块：
+- phase4b_models.py
+- exit_engine.py
+- pending_sell.py
+- exit_control_state.py
+- cooldown.py
+- portfolio_derisk.py
+
+允许更新新策略目录__init__.py，并新增对应测试。
+
+本轮一次性实现：
+1. 初始止损和只升不降的移动止损；
+2. 紧急/硬退出；
+3. 14:30软退出；
+4. 普通顶背离和MA20破位50%减仓episode；
+5. 组合仓位超限降仓；
+6. 替换退出；
+7. T+1不可卖数量拆分；
+8. PendingSell创建、合并、升级、重试、取消和完成；
+9. 保护期和冷却期；
+10. 与Phase 3 FillEngine、Phase 4A PositionState衔接。
+
+禁止修改数据库、网页、报告、旧恒温器、旧事件回测、Phase 1—4A既有公式；禁止实现买入、加仓、券商接口、滑点、容量、部分成交、排队和追价。
+
+二、时间规则
+
+时区为Asia/Shanghai，分钟时间戳为bar_start。
+
+硬退出：
+- 只能使用已完成5分钟K线；
+- 下一合法5分钟K线Open成交；
+- 使用Phase 3 HARD_EXIT；
+- 11:25触发→13:00；
+- 14:55触发→下一交易日09:30；
+- 缺失指定K线不得寻找更晚价格成交。
+
+软退出、替换、普通减仓：
+- 14:30统一决策；
+- 只能使用截至14:25的已完成K线；
+- P1430=14:25 Close；
+- 14:35 Open成交；
+- 使用既有SOFT_EXIT、REPLACEMENT_EXIT、ORDINARY_REDUCTION。
+
+三、不可变模型
+
+新增冻结模型：
+
+1. ExitIntent
+symbol、decision_trade_date/time、execution_type、reason、priority、requested_target_qty、full_exit、sticky、requires_revalidation、episode_id、trigger_bar_start、trigger_price、active_stop、created_at、reasons。
+
+2. PendingSellState
+symbol、status、reason、priority、execution_type、target_qty、remaining_qty、created时间、next_attempt时间、sticky、requires_revalidation、episode_id、retry_count、last_failure、last_attempt、completed时间、cancelled_reason。
+
+status：ACTIVE、COMPLETED、CANCELLED、ERROR。
+
+3. ExitControlState
+symbol、initial_stop、trailing_stop、highest_close、price_basis_id、weak_score_streak、MA20 episode及恢复计数、acted_episode_ids、active_pending_sell、最后评估/更新日期、最后全退出原因和日期。
+
+4. CooldownRecord
+symbol、exit_reason、exit_trade_date、blocked_trade_dates、reentry_allowed_date、status。
+
+5. ExitDecisionResult
+symbol、status、selected_intent、all_triggered_reasons、active_stop、sellable_qty、unsellable_qty、executable_qty、pending_remaining_qty、前后控制状态、failure_reason。
+
+所有symbol统一规范化；Decimal拒绝float/bool；数量严格int且排除bool；集合使用tuple；不得保存外部可变引用。
+
+四、退出优先级
+
+从高到低：
+100 EMERGENCY_MARKET
+90 INITIAL_STOP
+85 TRAILING_STOP
+70 STRONG_TOP_DIVERGENCE
+65 MA60_TREND_BREAK
+60 WEAK_SCORE_CONFIRMED
+50 NORMAL_TOP_DIVERGENCE_REDUCTION
+45 MA20_BREAK_REDUCTION
+40 PORTFOLIO_EXPOSURE_REDUCTION
+30 REPLACEMENT_EXIT
+
+同一证券同一周期只保留最高优先级。相同优先级按固定枚举顺序决胜，禁止依赖输入顺序。
+
+五、初始与移动止损
+
+InitialStop = EntryPrice × (1 - EffectiveRiskPct)
+
+EffectiveRiskPct来自Phase 4A。要求EntryPrice>0，0<EffectiveRiskPct<=1，结果非负，并与执行价格使用同一原始未复权price_basis_id；基础不一致返回INVALID/price_basis_mismatch。
+
+新仓初始化：
+highest_close=entry_price
+trailing_stop=initial_stop
+
+收盘后更新，下一交易日生效：
+NewHighestClose=max(previous_highest_close, daily_close)
+TrailingCandidate=NewHighestClose-2×ATR20
+NewTrailingStop=max(previous_trailing_stop, initial_stop, TrailingCandidate)
+
+规则：
+- trailing_stop只能升或保持；
+- Close/ATR非法时保持旧状态；
+- 同日重复更新幂等；
+- 不反向影响当日退出；
+- price_basis_id必须一致。
+
+六、硬退出
+
+每根已完成5分钟K线检查：
+
+1. Phase 2既有EmergencyMarketGate进入紧急状态：
+EMERGENCY_MARKET，全退出，sticky=true，不需重新验证。
+
+2. Low<=InitialStop：
+INITIAL_STOP。
+
+3. Low<=TrailingStop且TrailingStop>InitialStop：
+TRAILING_STOP。
+
+Emergency优先。两个止损同时触发时使用更高active_stop；相同则INITIAL_STOP优先。成交始终为下一合法K线Open，不按止损价成交。
+
+买入当日止损仍生效；sellable_qty=0时创建sticky PendingSell，下一实际交易日09:30尝试，不得当日卖出。
+
+七、14:30全部软退出
+
+输入必须包含P1430、前一完整交易日MA20/MA60、MA20五日斜率、OpportunityScore、EntryThreshold、RiskOverlay、顶背离、MarketOverlay、持仓和控制状态。
+
+触发：
+
+1. 强顶背离有效：
+STRONG_TOP_DIVERGENCE，全退出。
+
+2. P1430<previous_MA60 且 previous_MA20<=previous_MA60：
+MA60_TREND_BREAK，全退出。
+
+3. WeakScoreThreshold=EntryThreshold-12。
+每日14:30只更新一次：
+- VALID且Score<阈值：streak+1
+- VALID且Score>=阈值：streak=0
+- INVALID：保持不变
+streak>=2触发WEAK_SCORE_CONFIRMED全退出。
+同日重复调用不得重复增加。
+
+以上均使用SOFT_EXIT、14:35 Open、sticky=false、requires_revalidation=true。
+
+八、50%减仓episode
+
+1. 普通顶背离：
+使用Phase 2稳定episode/pivot标识；目标为当前total_qty的50%；同一episode只有实际FILLED后才写入acted_episode_ids；未成交不算执行；新episode可再次减仓。
+
+2. MA20破位：
+P1430<previous_MA20且MA20_slope5<=0，且未触发更高优先级全退出。
+episode_id=MA20_BREAK:<首次触发交易日>。
+连续2个有效14:30评估日P1430>=previous_MA20后结束episode；INVALID日不增加也不清零恢复计数。
+
+数量：
+RawTargetQty=floor(total_qty×0.5)
+LotQty=floor(RawTargetQty/partial_sell_lot_size)×partial_sell_lot_size
+LotQty<=0返回below_min_reduction_lot。
+不得向上取整或扩大到超过50%。
+
+九、保护期
+
+保护：
+- 买入当日；
+- 买入后的第1个实际交易日。
+
+从第2个实际交易日起允许软退出、episode减仓和替换。
+
+保护期不阻止：
+EMERGENCY_MARKET、INITIAL_STOP、TRAILING_STOP、PORTFOLIO_EXPOSURE_REDUCTION。
+
+使用交易日历，不使用自然日；以首次建仓entry_trade_date为准。
+
+十、组合仓位超限降仓
+
+14:30处理：
+
+ProjectedExposureAfterHigherPriority =
+ExistingExposure - HigherPriorityPlannedSellWeight
+
+ExcessExposure =
+max(0, ProjectedExposureAfterHigherPriority-EffectiveExposureCap)
+
+若超限，按弱势顺序：
+OpportunityScore升序→RS60升序→RS20升序→symbol升序。
+
+逐只计算：
+TargetNotional=min(持仓市值, 尚需移除金额)
+RawQty=TargetNotional/P1430
+PartialQty=floor(RawQty/partial_sell_lot_size)×partial_sell_lot_size
+
+规则：
+- PartialQty<=0跳过；
+- 不向上取整；
+- 微小超限不强卖一手；
+- 有更高优先级全退出的证券不重复降仓；
+- 保护期不阻止；
+- 只生成意图，不修改PositionState；
+- 输出residual_excess。
+
+十一、替换退出
+
+14:30全组合每日最多1只。
+
+前提：
+- 紧急市场未触发，MarketOverlay允许新仓；
+- 有Phase 4A最终order_qty>0的新候选；
+- 已持有6只或无新增名额；
+- incumbent不在保护期、无ACTIVE PendingSell、无更高退出；
+- candidate不在冷却期、不是现有持仓别名；
+- candidate Score>=EntryThreshold；
+- candidate Score-incumbent Score>=12；
+- incumbent Score<EntryThreshold。
+
+incumbent排序：
+Score升序→RS60升序→RS20升序→symbol升序。
+
+candidate排序使用Phase 1稳定排名：
+Score降序→RS60降序→RS20降序→SignedER20降序→symbol升序。
+
+生成REPLACEMENT_EXIT全退出，14:35 Open。不得自动创建次日买单、保留资金或名额；候选次日必须重新通过10:00完整逻辑。
+
+十二、数量与T+1
+
+全退出：
+DesiredQty=total_qty
+ExecutableQty=min(DesiredQty,sellable_qty)
+PendingRemaining=DesiredQty-ExecutableQty
+
+部分减仓和超限降仓同理，但即时请求绝不能超过sellable_qty。不可卖部分保存为PendingSell，不得把明知超SellableQty的请求交给FillEngine。
+
+十三、PendingSell
+
+每个规范化symbol最多一个ACTIVE记录。
+
+合并规则：
+- 新意图优先级更高：升级reason/priority/type；full exit时目标为当前total_qty；目标取新目标与旧剩余的较大值；不得重复累计。
+- 同reason+episode：完全去重。
+- 同优先级不同reason：固定枚举顺序。
+- 低优先级：忽略。
+- total_qty=0：终止，不再重试。
+
+粘性：
+EMERGENCY_MARKET、INITIAL_STOP、TRAILING_STOP为sticky，直到完成、持仓关闭或ERROR。
+
+重新验证：
+软全退、episode、组合降仓、替换在下一次14:30前重新验证；条件失效时CANCELLED/signal_no_longer_valid。已成交部分不恢复。episode只有实际成交后才记为acted。
+
+尝试时间：
+- 硬Pending：下一合法5分钟Open；retryable失败后继续下一根；14:55后下一交易日09:30。
+- 非硬Pending：当日14:35；未完成时下一交易日14:30重新验证，仍有效则14:35重试，不得次日09:30提前卖。
+
+FillResult：
+- FILLED：remaining_qty减filled_qty；为0则COMPLETED。
+- retryable FAILED：保持ACTIVE，retry_count+1。
+- non-retryable FAILED或INVALID：ERROR，不自动重试。
+- Position关闭后不得再重试。
+
+Phase 4B不直接修改持仓。流程必须为：
+Exit/Pending→Phase 3 FillEngine→Phase 4A apply_sell_fill→更新Pending和控制状态。
+
+十四、冷却期
+
+仅完全退出后创建：
+
+EMERGENCY_MARKET：阻断后续1个交易日
+INITIAL_STOP/TRAILING_STOP：5个交易日
+STRONG_TOP_DIVERGENCE/MA60_TREND_BREAK/WEAK_SCORE_CONFIRMED：3个交易日
+REPLACEMENT_EXIT：2个交易日
+PORTFOLIO_EXPOSURE_REDUCTION导致全退出：2个交易日
+普通部分减仓：不创建
+
+exit日不计入；从下一实际交易日起计数；reentry_allowed_date为最后阻断日后的下一交易日；多条记录采用更晚日期。输出供Phase 4A cooldown_blocked使用。
+
+十五、组合级14:30顺序
+
+1. 重新验证非sticky Pending；
+2. 计算全部软退出；
+3. 计算episode减仓；
+4. 计算高优先级计划后的ProjectedExposure；
+5. 计算组合超限降仓；
+6. 最后评估最多1个替换；
+7. 每个symbol只保留最高优先级；
+8. 解析sellable和Pending；
+9. 生成14:35 FillRequest。
+
+不得让替换抢占风险退出证券。
+
+十六、必须覆盖的测试
+
+至少完整覆盖以下类别，总数不得以少量测试代替：
+
+A. 止损
+- 初始公式、price basis、只升不降、非法ATR、次日生效、同日幂等、跳空Open。
+
+B. 硬退出
+- Emergency优先、Initial/Trailing、同时触发、11:25→13:00、14:55跨日、买入当日T+1、周末休市、跌停/停牌重试、INVALID转ERROR。
+
+C. 软退出
+- 强顶背离、MA60、weak score两日、恢复清零、INVALID冻结、同日幂等、保护期、14:25数据、14:35成交。
+
+D. episode
+- 普通顶背离和MA20各一次、未成交不记acted、新episode、连续2日恢复、INVALID恢复日、50%和lot边界。
+
+E. 超限降仓
+- 先扣高优先级、弱势排序、目标数量、lot向下、微小超限、保护期不阻断、不重复降仓、residual_excess、输入不可变。
+
+F. 替换
+- 6只限制、分差12边界、incumbent阈值、保护期、Pending阻断、每日1只、稳定选择、不自动买入、次日重评、市场禁止、冷却候选。
+
+G. PendingSell
+- 每证券唯一、高优先级升级、低优先级不降级、同episode去重、full exit升级、T+1拆分、sticky、条件失效取消、retryable/non-retryable/INVALID、FILLED扣减、完成、持仓关闭、输入顺序稳定、不可变。
+
+H. 冷却
+- 1/5/3/2日、部分减仓无冷却、exit日不计、休市跳过、允许日期边界、多记录更晚、Phase 4A衔接。
+
+I. 回归
+- Phase 1：80项
+- Phase 2：93项
+- Phase 3：130项
+- Phase 4A：103项
+- 现有完整项目589项不得回归
+- compileall、git diff检查通过
+- 不修改禁止模块
+
+十七、Codex执行要求
+
+1. 先读取V1.3至V1.3.11全部规格和当前代码。
+2. 一次性实现全部Phase 4B范围，不在中途只交一半。
+3. 优先复用现有枚举和模型，不创建语义重复类型。
+4. 所有错误原因冻结，输出不依赖输入顺序。
+5. 不删除旧测试，不降低旧断言。
+6. 新增正向、边界、异常和输入顺序交换测试。
+7. 完成后运行：
+   - Phase 1、2、3、4A、4B测试
+   - 完整项目测试
+   - python -m compileall -q stock_picker tests
+   - git diff --check
+   - git diff --cached --check
+   - git status --short
+8. 将代码、测试和本V1.3.11规格全部暂存。
+9. 不提交Phase 4B，不进入Phase 5。
+
+十八、完成报告
+
+报告必须包含：
+- 新增/修改文件与行号；
+- 各规则对应实现位置；
+- 新增测试函数及参数化实例数量；
+- 止损、硬退、软退、episode、超限降仓、替换结果；
+- PendingSell优先级、重试、T+1结果；
+- 保护期和冷却期结果；
+- 各阶段及完整项目测试数量；
+- compileall和Git检查；
+- 是否修改禁止模块；
+- 未解决问题或规格冲突。
+
+完成后停止，等待一次只读验收。

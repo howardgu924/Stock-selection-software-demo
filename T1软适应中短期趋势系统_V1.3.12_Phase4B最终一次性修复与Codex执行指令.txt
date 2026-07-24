@@ -1,0 +1,398 @@
+T+1软适应中短期趋势系统 V1.3.12
+Phase 4B最终一次性修复与Codex执行指令
+版本日期：2026-07-15
+
+前置检查点：
+- Phase 4A SHA：63a2289cfda6798cd8cc086ecc924ce44baaa9b0
+- Phase 4B当前仅暂存，尚未提交
+- 本轮只修复已审查确认的4项P0、3项P1
+- 不进入Phase 5
+- 完成后只暂存，不提交
+
+权威规格：
+1. V1.3至V1.3.10全部规格
+2. 原始V1.3.11全文：
+   T1软适应中短期趋势系统_V1.3.11_Phase4B一次性完整规格与Codex执行指令.txt
+3. 本V1.3.12修复文件
+
+原始V1.3.11附件SHA256：
+1c133e008927cafc4f8bad1a73b6910cd80c7ed6499c0e5619cd37347b7889d1
+
+必须用上述原始V1.3.11全文替换仓库中的206行简写版本，文件内容必须逐字节一致，不得再次摘要、改写或压缩。
+
+======================================================================
+一、P0-1：退出FillRequest不得超过意图目标
+======================================================================
+
+修复 build_exit_fill_request 及所有等价入口。
+
+在创建FillRequest前必须同时满足：
+
+- intent为合法ExitIntent；
+- intent.execution_type属于卖出类型：
+  HARD_EXIT
+  SOFT_EXIT
+  REPLACEMENT_EXIT
+  ORDINARY_REDUCTION
+- executable_qty为严格正整数，bool非法；
+- intent.requested_target_qty为严格正整数；
+- executable_qty <= intent.requested_target_qty；
+- executable_qty <= position_qty；
+- executable_qty <= sellable_qty；
+- position_qty和sellable_qty为严格非负整数；
+- sellable_qty <= position_qty；
+- symbol规范化后与意图一致。
+
+任一不满足：
+
+- 不生成FillRequest；
+- 返回稳定INVALID或抛出冻结的契约异常；
+- 原因使用固定值：
+  invalid_exit_fill_quantity
+  invalid_exit_execution_type
+  invalid_exit_intent_contract
+
+特别测试：
+
+1. 50%减仓目标500，传入executable_qty=1000：
+   必须拒绝。
+2. 全退出目标1000，executable_qty=500：
+   允许。
+3. executable_qty超过sellable_qty：
+   拒绝。
+4. ENTRY_BUY或其他买入execution_type：
+   拒绝。
+5. bool数量：
+   拒绝。
+6. 输入顺序和别名不改变结果。
+
+======================================================================
+二、P0-2：PendingSell只能接受匹配的卖出FillResult
+======================================================================
+
+apply_fill_result_to_pending及所有等价函数在修改PendingSell前必须校验完整成交契约：
+
+- pending.status == ACTIVE；
+- fill.side == SELL；
+- fill.execution_type == pending.execution_type；
+- 规范化fill.symbol == pending.symbol；
+- fill.requested_qty为严格正整数；
+- fill.filled_qty为严格非负整数；
+- fill.filled_qty <= fill.requested_qty；
+- fill.filled_qty <= pending.remaining_qty；
+- fill.execution_trade_date和bar_start与本次attempt一致；
+- 若存在FillRequest标识或attempt identity，必须与pending当前尝试匹配。
+
+不匹配时：
+
+- PendingSell转ERROR；
+- remaining_qty保持不变；
+- retry_count不增加；
+- last_failure_reason = fill_contract_mismatch；
+- 不得变为COMPLETED；
+- 不得扣减任何待卖数量。
+
+必须覆盖：
+
+1. BUY/ENTRY_BUY FILLED传给PendingSell；
+2. SELL但execution_type不匹配；
+3. symbol不匹配；
+4. filled_qty超过remaining_qty；
+5. requested_qty小于filled_qty；
+6. 正确匹配的SELL FILLED；
+7. 非FILLED的匹配结果；
+8. 输入对象不可变。
+
+======================================================================
+三、P0-3：优先级只能来自冻结映射
+======================================================================
+
+建立唯一权威函数或常量：
+
+canonical_exit_priority(reason)
+
+映射严格为V1.3.11冻结值：
+
+EMERGENCY_MARKET 100
+INITIAL_STOP 90
+TRAILING_STOP 85
+STRONG_TOP_DIVERGENCE 70
+MA60_TREND_BREAK 65
+WEAK_SCORE_CONFIRMED 60
+NORMAL_TOP_DIVERGENCE_REDUCTION 50
+MA20_BREAK_REDUCTION 45
+PORTFOLIO_EXPOSURE_REDUCTION 40
+REPLACEMENT_EXIT 30
+
+要求：
+
+1. select_highest_intent不得信任对象中可伪造的priority。
+2. pending合并、升级和同级决胜也必须使用canonical_exit_priority(reason)。
+3. ExitIntent.priority若保留，必须等于权威映射。
+4. priority与reason不一致时：
+   - 意图无效；
+   - 返回invalid_exit_priority；
+   - 不参与选择或合并。
+5. 相同优先级按固定ExitReason枚举顺序决胜。
+6. 外部传入REPLACEMENT_EXIT/999不得抢占STRONG_TOP_DIVERGENCE/70。
+7. 输入顺序不得改变结果。
+
+优先采用模型构造期校验加所有入口防御性校验，避免仅修补单个排序函数。
+
+======================================================================
+四、P0-4：INVALID市场数据不得触发MA退出
+======================================================================
+
+market_data_valid=False时：
+
+- 不得评估MA60_TREND_BREAK；
+- 不得评估MA20_BREAK_REDUCTION；
+- 不得使用p1430、previous_ma20、previous_ma60、ma20_slope5生成任何MA依赖意图；
+- MA20恢复计数不得增加或清零；
+- MA相关episode状态保持不变。
+
+允许独立评估的信号：
+
+- OpportunityScore有效时的WEAK_SCORE_CONFIRMED；
+- 已由Phase 2明确标记为有效的强/普通顶背离；
+- 不依赖当前P1430/MA数值的其他冻结信号。
+
+如现有输入不能区分各信号有效性，新增明确的独立有效标志，不得把INVALID数值继续用于比较。
+
+返回行为：
+
+- 若只有MA条件可触发：NO_ACTION；
+- failure/reasons可包含market_data_invalid；
+- 不得返回MA60或MA20意图。
+
+测试：
+
+1. market_data_valid=False但数值满足MA60：
+   不触发。
+2. market_data_valid=False但数值满足MA20：
+   不触发，不改变episode恢复状态。
+3. market_data_valid=False且OpportunityScore连续转弱：
+   weak score仍按独立有效性执行。
+4. market_data_valid=False且有效强顶背离：
+   强顶背离仍可执行。
+5. 同日重复调用保持幂等。
+
+======================================================================
+五、P1-1：同一次Pending尝试必须幂等
+======================================================================
+
+定义AttemptIdentity，至少由以下字段组成：
+
+- normalized_symbol；
+- execution_type；
+- attempt_trade_date；
+- attempt_bar_start。
+
+PendingSell保存最后已处理AttemptIdentity。
+
+apply_fill_result时：
+
+- 新AttemptIdentity == last_processed_attempt：
+  返回UNCHANGED；
+  retry_count不增加；
+  remaining_qty不变化；
+  next_attempt不重复推进。
+- 新AttemptIdentity早于last_processed_attempt：
+  返回UNCHANGED或ERROR/stale_attempt；
+  不修改数量和计数。
+- 只有严格更新的attempt才可应用一次。
+
+同一retryable limit_down结果连续应用两次：
+
+- 第一次retry_count从0到1；
+- 第二次仍为1。
+
+FILLED、FAILED、INVALID都必须防止同一attempt重复应用。
+
+本阶段不要求新增Phase 3成交ID，但AttemptIdentity必须锁定当前状态机幂等边界。
+
+======================================================================
+六、P1-2：新增组合级14:30唯一协调器
+======================================================================
+
+新增纯计算统一入口，建议名称：
+
+coordinate_1430_exit_cycle
+
+不得只保留分散函数让调用方自行保证顺序。
+
+统一入口必须严格执行V1.3.11冻结九步：
+
+1. 规范化所有symbol并验证重复；
+2. 重新验证非sticky PendingSell；
+3. 计算每只持仓全部软退出；
+4. 计算episode减仓；
+5. 按高优先级计划卖出计算ProjectedExposure；
+6. 计算PORTFOLIO_EXPOSURE_REDUCTION；
+7. 最后计算全组合最多1个REPLACEMENT_EXIT；
+8. 按规范化symbol使用权威优先级只保留一个最终意图；
+9. 解析sellable_qty、PendingSell和14:35 FillRequest。
+
+协调器输出至少包含：
+
+- intents_by_symbol；
+- fill_requests；
+- pending_updates；
+- cancelled_pending；
+- projected_exposure；
+- residual_excess；
+- replacement_symbol；
+- reasons；
+- status。
+
+强制规则：
+
+- 同一证券不得同时全退出、普通减仓、超限降仓和替换；
+- 风险退出必须压过替换；
+- 已有sticky硬Pending优先；
+- 别名归一后仍只能一个意图；
+- 每个symbol最多一个ACTIVE PendingSell；
+- 每个symbol最多一个14:35 FillRequest；
+- 替换每日最多1只；
+- 输入列表顺序不改变输出；
+- 协调器不得直接修改PositionState或现金；
+- 只能生成请求和新状态对象。
+
+必须测试：
+
+1. 同一证券同时软全退、episode、超限降仓、替换；
+2. STRONG_TOP_DIVERGENCE压过REPLACEMENT_EXIT；
+3. sticky硬Pending压过全部14:30信号；
+4. 600001与600001.SH别名冲突；
+5. 输入乱序；
+6. 两个替换候选只选一个；
+7. 高优先级计划卖出正确进入ProjectedExposure；
+8. 同一symbol只输出一个FillRequest和一个ACTIVE Pending。
+
+======================================================================
+七、P1-3：仓库必须保存原始V1.3.11全文
+======================================================================
+
+删除或替换当前简写规格：
+
+T1软适应中短期趋势系统_V1.3.11_Phase4B退出与PendingSell契约.txt
+
+仓库中必须保存原始附件全文，推荐文件名保持：
+
+T1软适应中短期趋势系统_V1.3.11_Phase4B一次性完整规格与Codex执行指令.txt
+
+要求：
+
+- 内容与附件逐字节一致；
+- SHA256必须为：
+  1c133e008927cafc4f8bad1a73b6910cd80c7ed6499c0e5619cd37347b7889d1
+- 不得保留会被误认为权威规格的206行改写版；
+- V1.3.11原文和本V1.3.12必须一并暂存。
+
+======================================================================
+八、一次性补充测试要求
+======================================================================
+
+除上述逐项测试外，新增综合回归：
+
+1. 50%减仓不得扩大为全退出。
+2. BUY FillResult不得完成PendingSell。
+3. 伪造priority不得改变选择。
+4. INVALID市场数据不得触发MA退出。
+5. 同一attempt重复FAILED/FILLED/INVALID均幂等。
+6. 协调器保证九步顺序和每symbol唯一结果。
+7. 协调器不修改输入持仓和现金。
+8. Phase 4B所有模型继续深度不可变。
+9. 原72项Phase 4B测试不得删除或降低断言。
+10. Phase 1：80项继续通过。
+11. Phase 2：93项继续通过。
+12. Phase 3：130项继续通过。
+13. Phase 4A：103项继续通过。
+14. 完整项目661项基线不得回归。
+15. 新测试应使Phase 4B和完整项目数量明显增加。
+
+======================================================================
+九、允许修改
+======================================================================
+
+允许：
+
+- phase4b_models.py
+- exit_engine.py
+- pending_sell.py
+- portfolio_derisk.py
+- 新增统一协调器模块，建议exit_coordinator.py
+- 新策略__init__.py
+- Phase 4B测试
+- V1.3.11权威原文文件
+- 本V1.3.12文件
+
+仅在修复必需时允许小幅修改exit_control_state.py或cooldown.py，但不得改变已验收规则。
+
+======================================================================
+十、禁止修改
+======================================================================
+
+不得修改：
+
+- Phase 1—4A公式和公开行为；
+- 数据库；
+- 网页；
+- 报告；
+- 旧恒温器；
+- 旧事件回测；
+- Phase 5；
+- 买入或加仓逻辑；
+- FillEngine成交价格与时间规则；
+- PositionState成本和T+1记账规则；
+- 滑点、容量、部分成交、排队、追价。
+
+======================================================================
+十一、执行方式
+======================================================================
+
+本轮一次性完成全部修复，不要中途只报告部分结果。
+
+运行：
+
+1. Phase 1测试
+2. Phase 2测试
+3. Phase 3测试
+4. Phase 4A测试
+5. Phase 4B测试
+6. 完整项目测试
+7. python -m compileall -q stock_picker tests
+8. git diff --check
+9. git diff --cached --check
+10. git status --short
+11. 计算仓库V1.3.11文件SHA256并核对
+
+将以下内容全部暂存：
+
+- 修复代码；
+- 新增测试；
+- 原始V1.3.11全文；
+- 本V1.3.12文件。
+
+不提交Phase 4B，不进入Phase 5。
+
+======================================================================
+十二、完成报告
+======================================================================
+
+报告必须包含：
+
+1. 修改文件和行号；
+2. 4项P0的修复位置和复现结果；
+3. 3项P1的修复位置和复现结果；
+4. coordinate_1430_exit_cycle的输入、输出和顺序；
+5. 新增测试函数与pytest实例数量；
+6. Phase 1、2、3、4A、4B结果；
+7. 完整项目结果；
+8. compileall和Git检查；
+9. 仓库V1.3.11文件SHA256；
+10. V1.3.11和V1.3.12是否均已暂存；
+11. 是否修改禁止模块；
+12. 尚未解决问题。
+
+完成后停止，等待一次极简最终验收；不提交，不进入Phase 5。
