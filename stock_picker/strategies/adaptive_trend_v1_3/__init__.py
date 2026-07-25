@@ -178,6 +178,94 @@ from stock_picker.strategies.adaptive_trend_v1_3.portfolio_derisk import (
     plan_portfolio_derisk,
     select_replacement_exit,
 )
+from stock_picker.strategies.adaptive_trend_v1_3.account_ledger import (
+    apply_fill_to_ledger,
+    rebuild_cash,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.account_snapshot_service import (
+    create_account_snapshot,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.data_catalog import (
+    DataCatalog,
+    LookaheadAccessError,
+    MarketView,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.data_snapshot import (
+    create_data_snapshot,
+    verify_data_snapshot,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.date_range import (
+    WARMUP_TRADING_DAYS,
+    resolve_date_range,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.event_clock import (
+    build_event_clock,
+    deterministic_id,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.market_cache import (
+    RAW_PRICE_BASIS,
+    MarketCache,
+    fetch_complete_partition,
+    validate_coverage,
+    validate_partition,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.performance_metrics import (
+    build_benchmark_curve,
+    calculate_performance_metrics,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.phase5_models import (
+    AccountProfile,
+    AccountSnapshot,
+    CachePartition,
+    ClockEvent,
+    DataReadinessReport,
+    DataSnapshot,
+    DateRangeKind,
+    DateRangeSpec,
+    LedgerEvent,
+    NetworkAccessPolicy,
+    PartitionStatus,
+    PerformanceMetrics,
+    Phase5Error,
+    ResolvedDateRange,
+    ResolvedUniverse,
+    RunConfig,
+    RunMode,
+    RunStatus,
+    RunSummary,
+    ServiceResult,
+    UniverseKind,
+    UniverseSnapshot,
+    UniverseSpec,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.phase5_service import (
+    PartitionRequest,
+    Phase5Service,
+    prepare_market_cache,
+    resolve_run_inputs,
+    validate_data_readiness,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.run_orchestrator import (
+    CoreStrategyDependencies,
+    RuntimeDataDependencies,
+    RuntimeHooks,
+    create_run,
+    execute_run,
+    run_fingerprint,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.run_recovery import resume_run
+from stock_picker.strategies.adaptive_trend_v1_3.run_reporting import (
+    generate_run_report,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.run_store import RunStore
+from stock_picker.strategies.adaptive_trend_v1_3.valuation import (
+    SessionCloseMark,
+    select_session_close_mark,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.universe_resolver import (
+    BENCHMARK_SYMBOLS,
+    resolve_universe,
+)
 
 __all__ = [
     "BENCHMARK_WEIGHTS",
@@ -310,4 +398,64 @@ __all__ = [
     "select_highest_intent",
     "select_replacement_exit",
     "update_trailing_stop",
+    "AccountProfile",
+    "AccountSnapshot",
+    "BENCHMARK_SYMBOLS",
+    "CachePartition",
+    "CoreStrategyDependencies",
+    "RuntimeDataDependencies",
+    "ClockEvent",
+    "DataCatalog",
+    "DataReadinessReport",
+    "DataSnapshot",
+    "DateRangeKind",
+    "DateRangeSpec",
+    "LedgerEvent",
+    "LookaheadAccessError",
+    "MarketCache",
+    "MarketView",
+    "NetworkAccessPolicy",
+    "PartitionRequest",
+    "PartitionStatus",
+    "PerformanceMetrics",
+    "Phase5Error",
+    "Phase5Service",
+    "RAW_PRICE_BASIS",
+    "ResolvedDateRange",
+    "ResolvedUniverse",
+    "RunConfig",
+    "RunMode",
+    "RunStatus",
+    "RunStore",
+    "RunSummary",
+    "RuntimeHooks",
+    "ServiceResult",
+    "SessionCloseMark",
+    "UniverseKind",
+    "UniverseSnapshot",
+    "UniverseSpec",
+    "WARMUP_TRADING_DAYS",
+    "apply_fill_to_ledger",
+    "build_benchmark_curve",
+    "build_event_clock",
+    "calculate_performance_metrics",
+    "create_account_snapshot",
+    "create_data_snapshot",
+    "create_run",
+    "deterministic_id",
+    "execute_run",
+    "fetch_complete_partition",
+    "generate_run_report",
+    "prepare_market_cache",
+    "rebuild_cash",
+    "resolve_date_range",
+    "resolve_run_inputs",
+    "resolve_universe",
+    "resume_run",
+    "run_fingerprint",
+    "validate_data_readiness",
+    "validate_coverage",
+    "select_session_close_mark",
+    "validate_partition",
+    "verify_data_snapshot",
 ]

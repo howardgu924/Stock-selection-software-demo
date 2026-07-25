@@ -1,0 +1,690 @@
+T+1软适应中短期趋势系统 V1.3.13
+Phase 5数据服务、运行编排、持久化、防重与报告
+一次性完整规格与Codex执行指令
+版本日期：2026-07-24
+
+0. 前置检查点
+
+Phase 4B已提交：
+- SHA：f55c48257b02d846a98f68d4a7176679f79de675
+- 测试：691 passed
+- 分支：codex/feature/t1-adaptive-trend-v1.3
+- 工作区：干净
+
+本轮一次性实现Phase 5，完成后只暂存，不提交，不进入Phase 6。
+
+Phase 5范围：
+1. 统一股票池和日期范围；
+2. 本地行情缓存与完整性；
+3. 历史规则、行业、费用和账户快照；
+4. 不可变数据快照；
+5. BACKTEST与DAILY_PAPER运行编排；
+6. 10:00、逐根硬退出、14:30退出和日终时间轴；
+7. 账户现金账本；
+8. 决策、订单、成交和状态防重；
+9. SQLite持久化与中断恢复；
+10. 指标、审计日志和整洁Excel报告；
+11. 为Phase 6网页提供服务接口。
+
+不实现网页、券商/QMT实盘、后台任务、新策略、加仓、滑点、容量、部分成交、排队、追价或强制期末平仓。
+
+一、建议模块
+
+在adaptive_trend_v1_3下新增：
+- phase5_models.py
+- universe_resolver.py
+- date_range.py
+- market_cache.py
+- data_catalog.py
+- data_snapshot.py
+- rule_snapshot_service.py
+- account_snapshot_service.py
+- event_clock.py
+- run_orchestrator.py
+- account_ledger.py
+- run_store.py
+- run_recovery.py
+- performance_metrics.py
+- run_reporting.py
+- phase5_service.py
+
+可新增adaptive_v13_schema.py并更新__init__.py。优先复用现有Provider、SQLite、账户、Watchlist和Excel模块，不把所有逻辑堆入一个文件。
+
+二、工程边界
+
+Phase 5只编排Phase 1—4B，不得修改其公式和公开行为，不得复制第二套策略公式。必须经过：
+- Phase 3 FillEngine；
+- Phase 4A apply_buy_fill/apply_sell_fill；
+- Phase 4B coordinate_1430_exit_cycle和PendingSell状态机。
+
+不得修改旧恒温器、旧事件回测、旧数据库表语义或网页。
+
+三、日期范围
+
+缓存和运行共用不可变DateRangeSpec：
+
+- RECENT_MONTHS(value)
+- RECENT_YEARS(value)
+- CUSTOM(start_date,end_date)
+
+规则：
+- Asia/Shanghai；
+- end_date包含；
+- value为严格正整数，bool非法；
+- start<=end；
+- 通过交易日历解析；
+- 不用自然日推断；
+- 缓存和运行调用同一resolve_date_range；
+- 保存请求范围和实际交易日范围；
+- warmup_trading_days固定320；
+- 缺少320个历史交易日则INSUFFICIENT_WARMUP，不静默缩短。
+
+四、股票池
+
+共用不可变UniverseSpec：
+
+- MANUAL
+- WATCHLIST
+- MARKET_SCOPE
+- COMBINED
+
+规则：
+- 使用既有A股代码规范化；
+- 别名确定性去重；
+- 空池INVALID；
+- 最终symbol升序；
+- 当前持仓自动加入required_symbols，但不加入新买候选；
+- 沪深300、中证1000、创业板指自动加入数据要求；
+- 缓存和运行调用同一resolve_universe；
+- Phase 6不得复制解析逻辑。
+
+五、价格基础
+
+执行、止损、持仓成本和估值固定使用RAW_UNADJUSTED_V1。
+
+信号默认也使用RAW_UNADJUSTED_V1，避免普通QFQ/HFQ利用未来复权因子造成历史泄漏。未来只有满足effective_date和known_at历史时点约束的PIT_ADJUSTED_V1才能启用。
+
+严格回测模式禁止普通当前时点QFQ/HFQ。所有数据和状态携带price_basis_id，基础不一致返回PRICE_BASIS_MISMATCH。
+
+六、本地缓存
+
+使用SQLite，不新增大型存储依赖。建议：
+- market_cache.sqlite3
+- strategy_runs.sqlite3
+
+路径来自应用配置的绝对路径，禁止依赖CWD的相对路径。
+
+初始化：
+- foreign_keys=ON
+- journal_mode=WAL
+- busy_timeout>=5000
+- 写入使用事务
+
+新表使用adaptive_v13_前缀，不修改旧表语义。
+
+至少缓存：
+- trading_calendar
+- security_master_snapshot
+- industry_classification_snapshot
+- trading_rule_snapshot
+- fee_rule_snapshot
+- daily_bar
+- minute_5m_bar
+- benchmark数据
+- cache_partition
+- immutable_data_snapshot
+- snapshot_partition_link
+
+行情行必须包含symbol、日期、bar_start、OHLC、volume、amount、trade_status、limit_status、price_basis_id、source、source_version、known_at、ingested_at和partition_id。Decimal不得先转float。
+
+七、分区与不可变版本
+
+建议最小分区：
+- 日线：symbol+frequency+year+price_basis
+- 5分钟：symbol+trade_date+frequency+price_basis
+- 规则/行业：symbol+effective_date+dataset_type
+
+partition_id由规范化元数据和排序后的全部行SHA256生成。
+
+同一逻辑分区重抓后内容不同：
+- 不覆盖；
+- 创建新版本；
+- 记录supersedes；
+- 旧运行继续引用旧分区。
+
+运行前创建data_snapshot_id并冻结本次全部partition_id。运行期间缓存变化不得影响已启动run。
+
+八、缓存完整性
+
+正常活跃日：
+- 日线预期1条；
+- 5分钟预期48根，时间为09:30—11:25及13:00—14:55。
+
+全天停牌可为0根，但必须有历史规则或状态证明。未知状态不得视为停牌。
+
+缺1根即PARTIAL；重复冲突、非法OHLC、日期/时区不符即INVALID。缓存只有请求范围全部COMPLETE才算命中。部分覆盖只抓缺口并重新验证，禁止“查到任何数据就返回”。
+
+九、Provider回退
+
+Provider声明支持类型、频率、历史范围、调整模式、时区、规则能力和版本。
+
+回退以完整分区为单位：
+1. 第一来源完整合法则接受；
+2. 不完整或INVALID则整分区废弃；
+3. 下一来源完整才接受；
+4. 全部失败则FAILED。
+
+不得在同一symbol+trade_date的5分钟分区中按单行混合来源。完全相同重复可去重，冲突重复使该来源分区INVALID。
+
+缓存允许联网；运行默认network_access_policy=FORBID。运行中缺数据必须失败，禁止临时联网补数据。
+
+十、数据准备服务
+
+prepare_market_cache(universe_spec,date_range_spec,account_profile_id,mode)必须：
+
+1. 解析日期和320日预热；
+2. 解析候选池；
+3. 加入持仓和基准；
+4. 处理上市/退市有效区间；
+5. 缓存日历、主数据、行业、规则和费用；
+6. 缓存日线和所需5分钟；
+7. 验证分区；
+8. 创建data_snapshot_id；
+9. 输出DataReadinessReport。
+
+报告包含请求/实际/预热范围、candidate/required/benchmark symbols、完整/部分/非法/失败分区、来源使用、price_basis和snapshot_id。只有READY才能运行。
+
+十一、历史规则快照
+
+TradingRuleSnapshot按证券和交易日保存：
+symbol、effective_date、known_at、board、is_st、listing_status、trade_status、limit_up/down_price、price_tick、buy_lot_size、partial_sell_lot_size、source、rule_version。
+
+FeeRuleSnapshot保存：
+account_profile_id、effective_date、known_at、各费率、最低佣金、印花税、source、fee_version。
+
+要求：
+- effective_date等于执行日；
+- known_at不晚于执行时点；
+- 遵守Phase 3 Decimal契约；
+- 缺历史规则不得用当前规则回填；
+- 涨跌停价格优先使用历史明确值；
+- 规则未知则当日BLOCK。
+
+十二、账户快照
+
+AccountProfile至少有：
+account_profile_id、backtest_initial_cash、paper_cash、fee_schedule_id、base_currency、默认股票池、Provider优先级、数据目录和报告目录。
+
+Run开始时生成不可变AccountSnapshot。
+
+BACKTEST：
+- 默认使用backtest_initial_cash；
+- 默认空仓；
+- 不得静默使用当前真实持仓；
+- 只有显式历史InitialPortfolioSnapshot才能带仓。
+
+DAILY_PAPER：
+- 使用模拟现金和模拟持仓。
+
+金额只接受Decimal或十进制字符串。
+
+十三、RunConfig
+
+不可变RunConfig至少包含：
+run_mode、strategy_version、account_snapshot_id、universe_snapshot_id、data_snapshot_id、date_range、warmup、price_basis、network_policy、report_directory、initial_position_policy、created_at、config_hash。
+
+支持：
+- BACKTEST
+- DAILY_PAPER
+
+不实现LIVE_BROKER。
+
+十四、ID与数据库防重
+
+run_id用UUID。run_fingerprint对策略版本、配置和各snapshot规范化JSON做SHA256。
+
+同一run内以下ID确定性生成：
+event_id、decision_id、exit_intent_id、fill_request_id、fill_id、position_event_id、ledger_event_id、pending_event_id、cooldown_event_id、daily_snapshot_id。
+
+数据库UNIQUE约束必须防止：
+- event重放；
+- FillRequest重复；
+- Fill重复记账；
+- Fill重复应用PositionState；
+- Pending attempt重复计数；
+- weak streak同日重复；
+- episode重复acted。
+
+不得只用内存set防重。
+
+十五、运行数据库
+
+至少新增：
+adaptive_v13_schema_version
+adaptive_v13_runs
+adaptive_v13_run_events
+adaptive_v13_run_checkpoints
+adaptive_v13_universe_snapshots
+adaptive_v13_account_snapshots
+adaptive_v13_data_snapshots
+adaptive_v13_decisions
+adaptive_v13_exit_intents
+adaptive_v13_fill_requests
+adaptive_v13_fills
+adaptive_v13_ledger_events
+adaptive_v13_position_state_versions
+adaptive_v13_exit_control_state_versions
+adaptive_v13_pending_sell_versions
+adaptive_v13_cooldown_records
+adaptive_v13_daily_account_snapshots
+adaptive_v13_audit_events
+adaptive_v13_report_manifests
+
+要求：
+- 外键和唯一约束；
+- 状态追加版本，不覆盖；
+- Decimal用字符串或最小单位整数，禁止REAL；
+- 带时区时间；
+- migration可重复执行；
+- schema不匹配拒绝；
+- 不修改旧表。
+
+十六、EventClock
+
+每个交易日：
+
+1. SESSION_START
+2. 每个bar_start：
+   a. BAR_OPEN
+   b. 10:00时DECISION_1000
+   c. 14:30时DECISION_1430
+   d. BAR_CLOSE
+3. SESSION_CLOSE
+
+冻结顺序：
+- SESSION_START先于09:30 Open；
+- 到期Fill在BAR_OPEN先执行；
+- 10:00硬卖先执行，再做10:00决策；
+- 10:00决策只能看09:30—09:55，不能看10:00 Open；
+- 14:30硬卖先执行，再做14:30决策；
+- 14:30决策只能看至14:25，不能看14:30 bar；
+- 10:05 Open执行买入；
+- 14:35 Open执行软卖；
+- BAR_CLOSE后才评估硬退出；
+- 14:55 Close后SESSION_CLOSE。
+
+同时间戳使用固定sequence_number。
+
+十七、MarketView防前视
+
+新增只读MarketView：
+
+BAR_OPEN只暴露当前Open和此前完成数据，不暴露当前High/Low/Close/Volume/Amount。
+
+BAR_CLOSE才暴露当前bar全部字段。
+
+DECISION_1000：
+- 日线截至前一交易日；
+- 分钟截至09:55；
+- T1观测known_at<10:00；
+- 不可访问10:00 Open。
+
+DECISION_1430：
+- 日线指标来自前一交易日；
+- P1430=14:25 Close；
+- 不可访问14:30及之后。
+
+SESSION_CLOSE可访问当日完整数据，只用于估值、移动止损和下一日状态。
+
+未来访问抛LookaheadAccessError并使run FAILED。
+
+十八、SESSION_START
+
+1. 验证当日规则；
+2. 解锁Lot；
+3. 更新sellable/today_bought；
+4. 更新Cooldown；
+5. 加载Pending；
+6. 加载昨日收盘后生效的TrailingStop；
+7. 创建事件清单；
+8. 保存checkpoint。
+
+不得创建买入或软退出。
+
+十九、BAR_OPEN
+
+只处理该准确时点到期FillRequest：
+
+1. 防重；
+2. 从data_snapshot读取准确bar；
+3. 调Phase 3 FillEngine；
+4. 保存FillResult；
+5. BUY FILLED：apply_buy_fill、现金账本、初始化ExitControl；
+6. SELL FILLED：apply_sell_fill、现金账本、更新Pending，完全退出创建Cooldown；
+7. FAILED/INVALID按既有契约；
+8. 状态和账本同事务；
+9. checkpoint。
+
+禁止用Close模拟Open。
+
+二十、BAR_CLOSE硬退出
+
+对持仓按symbol升序：
+1. 读取当日有效stop；
+2. 调硬退出；
+3. 合并Pending；
+4. 计算下一合法时点；
+5. 只为sellable数量生成FillRequest；
+6. 不可卖量留Pending；
+7. 保存意图和checkpoint。
+
+同一BAR_CLOSE重放不得重复创建。
+
+二十一、10:00买入
+
+固定顺序：
+1. MarketOverlay和EntryThreshold；
+2. Phase 1 OpportunityScore；
+3. Phase 2 Divergence/Risk/ExecutionGate；
+4. T1Risk；
+5. 排除持仓、ACTIVE Pending、Cooldown、数据/规则INVALID；
+6. Phase 4A sizing/allocation；
+7. 稳定排序生成10:05 FillRequest；
+8. 保存所有候选及拒绝原因。
+
+规则：
+- 不追价、不重试、不部分成交；
+- 不重分配失败订单权重；
+- 买单按稳定排名；
+- 费用导致现金不足则该单FAILED，不缩量；
+- 已持有或当日已买不得再买；
+- 最大6只和15%由Phase 4A控制。
+
+二十二、14:30退出
+
+必须调用coordinate_1430_exit_cycle，输入最新持仓、控制状态、Pending、评分、市场/风险/背离、Phase 4A候选、组合权重、ExposureCap、日历和截至14:25数据。
+
+保存：
+- 每symbol唯一意图；
+- 14:35 FillRequest；
+- Pending更新和取消；
+- ProjectedExposure；
+- residual_excess；
+- replacement_symbol；
+- 所有触发和被压制原因。
+
+Phase 5不得再重写优先级。
+
+二十三、SESSION_CLOSE
+
+14:55 Close后：
+1. 生成当日原始日线；
+2. 计算下一日指标；
+3. 更新移动止损，次日生效；
+4. 估值；
+5. 保存每日账户快照；
+6. 保存现金、持仓、已实现/未实现盈亏、Exposure、Stress和行业权重；
+7. 保存数据质量；
+8. checkpoint。
+
+估值价优先14:55 Close；否则当日最后有效Close；全天停牌用昨日mark；仍无mark则DEGRADED/missing_mark_price。禁止未来价格。
+
+二十四、现金账本
+
+BUY：cash_delta=-CashRequired
+SELL：cash_delta=NetProceeds
+
+要求：
+- Decimal；
+- fill_id唯一；
+- 同fill只记一次；
+- BUY后现金不负；
+- SELL资金当日可用于后续买入；
+- 不融资融券；
+- 不重复扣费；
+- 不重算Phase 3费用；
+- 账本与PositionState同事务；
+- 任一步失败全部回滚；
+- 可由事件重建现金和持仓。
+
+二十五、事件事务
+
+每个event在一个SQLite事务中：
+1. 检查event_id；
+2. 写PROCESSING；
+3. 决策/成交/账本/状态；
+4. checkpoint；
+5. COMPLETED；
+6. commit。
+
+异常整事务回滚，不留半个Fill或半个状态。关键事件失败不得静默跳过。
+
+二十六、中断恢复
+
+resume_run(run_id)：
+- 校验配置、snapshot、schema和fingerprint；
+- 读取最后COMPLETED checkpoint；
+- 重建现金、Position、ExitControl、Pending、Cooldown；
+- 从下一事件继续；
+- 已完成event、Fill和状态不重放；
+- snapshot损坏或fingerprint不符拒绝；
+- 多次resume幂等；
+- 报告可重建。
+
+二十七、运行结束
+
+最后交易日SESSION_CLOSE后结束：
+- 不强平；
+- 开放持仓保留；
+- Pending保留；
+- 最终权益含开放持仓最后合法mark；
+- 未实现盈亏单列；
+- 不用期末后数据。
+
+status：
+COMPLETED
+COMPLETED_WITH_OPEN_POSITIONS
+DEGRADED
+FAILED
+
+二十八、绩效指标
+
+DailyReturn=Equity_t/Equity_(t-1)-1
+TotalReturn=End/Start-1
+AnnualizedReturn=(End/Start)^(252/n)-1
+AnnualizedVolatility=样本标准差(ddof=1)*sqrt(252)
+Sharpe=mean/std*sqrt(252)，rf=0，std=0则None
+MaxDrawdown=min(Equity/RunningPeak-1)
+AverageExposure、MaxExposure
+Turnover=sum(abs(gross))/平均权益
+RealizedWinRate=正realized_pnl_delta卖出次数/非零realized卖出次数
+ProfitFactor=正realized之和/负realized绝对值；无负值None
+
+还要输出买卖次数、总费用、failure原因、Pending各状态、涨跌停失败、T+1阻断、最大/平均持仓、冷却阻断、替换次数、组合降仓次数。开放持仓不得算已实现胜负。
+
+二十九、基准
+
+40%沪深300+40%中证1000+20%创业板指，各自归一为1。
+
+任一指数当日缺失可用上一有效Close仅用于连续展示并记录benchmark_stale；起始值缺失则基准INVALID。
+
+输出BenchmarkReturn、ExcessReturn和日度曲线。Alpha/Beta仅在至少60个共同有效日时计算。
+
+三十、审计日志
+
+AuditEvent至少包含run_id、event_id、日期时间、event_type、symbol、component、action、status、reason_code、message、input_hash、output_hash、source_ids、created_at。
+
+记录缓存/回退、数据失败、股票池、评分和拒绝原因、退出和被压制意图、Fill、状态、Pending、Cooldown、账本、恢复和报告。message不得包含DataFrame行号或依赖输入顺序。
+
+三十一、报告
+
+每次运行输出：
+<report_directory>/<run_id>/
+
+至少：
+- backtest_report.xlsx
+- run_manifest.json
+- run_config.json
+- audit_log.jsonl
+- data_readiness.json
+
+Excel sheets：
+运行摘要、每日权益、基准对比、成交明细、订单与失败、每日持仓、候选与评分、退出与Pending、冷却期、数据覆盖、异常与警告。
+
+格式：
+- 冻结首行；
+- 自动筛选；
+- 表头加粗；
+- 日期/金额/百分比格式统一；
+- 文本换行；
+- 列宽最大50；
+- 长错误信息不越界；
+- symbol文本格式；
+- 不大量合并单元格；
+- 文件先写临时文件再原子替换；
+- 失败不留下假完整文件；
+- 完全从RunStore重建。
+
+manifest包含run/fingerprint/策略/Git/schema/各snapshot/price basis/范围/symbols/provider/rule/fee版本、状态、时间、文件及SHA256，不得包含密码/API密钥。
+
+三十二、服务接口
+
+至少：
+- resolve_run_inputs
+- prepare_market_cache
+- validate_data_readiness
+- create_run
+- execute_run
+- resume_run
+- get_run_status
+- generate_run_report
+- list_runs
+- load_run_summary
+
+UI不得直接操作数据库或复制业务逻辑。同步执行即可，不实现后台队列。
+
+三十三、稳定错误码
+
+INVALID_CONFIG
+INVALID_UNIVERSE
+INVALID_DATE_RANGE
+INSUFFICIENT_WARMUP
+DATA_NOT_READY
+PARTIAL_CACHE
+INVALID_PARTITION
+PROVIDER_FAILED
+RULE_SNAPSHOT_MISSING
+FEE_SNAPSHOT_MISSING
+PRICE_BASIS_MISMATCH
+LOOKAHEAD_ACCESS
+DUPLICATE_EVENT
+DUPLICATE_FILL
+LEDGER_CONFLICT
+STATE_VERSION_CONFLICT
+SCHEMA_VERSION_MISMATCH
+RUN_FINGERPRINT_MISMATCH
+REPORT_WRITE_FAILED
+MISSING_MARK_PRICE
+UNEXPECTED_ENGINE_ERROR
+
+不可恢复问题使run FAILED。单证券可隔离问题BLOCK并记录。禁止裸except吞错。
+
+三十四、必须覆盖测试
+
+至少覆盖以下148项边界，不得用少量“能运行”测试代替：
+
+A 日期与股票池
+1 最近月；2 最近年；3 自定义；4 bool/0/负数；5 反向日期；6 320日预热；7 日历不足；8 手动；9 Watchlist；10 多市场；11 组合来源；12 别名；13 空池；14 持仓只加入required；15 基准自动加入；16 输入顺序稳定。
+
+B 缓存
+17 完整日线命中；18 部分只抓缺口；19 48根；20 缺1根PARTIAL；21 相同重复去重；22 冲突重复INVALID；23 停牌0根；24 未知0根拒绝；25 非法OHLC；26 日期/bar不符；27 新版本不覆盖；28 旧snapshot不变；29 运行禁网；30 整分区回退；31 不混来源；32 全Provider失败。
+
+C 规则与账户
+33 历史ST/板块；34 effective_date错误；35 known_at未来；36 费用Decimal；37 不用当前规则回填；38 profile读取；39 回测空仓；40 paper持仓；41 float金额拒绝。
+
+D snapshot
+42 不可变；43 哈希稳定；44 缓存更新不影响run；45 price basis拒绝；46 普通QFQ/HFQ严格模式拒绝；47 warmup和正式范围完整才READY。
+
+E EventClock
+48 SESSION_START顺序；49 BAR_OPEN先Fill；50 10:00硬卖先；51 10:00仅至09:55；52 看不到10:00 Open；53 14:30硬卖先；54 14:30仅至14:25；55 BAR_CLOSE后硬退出；56 SESSION_CLOSE顺序；57 未来访问异常；58 乱序稳定。
+
+F 10:00
+59 Phase顺序；60 持仓排除；61 Pending排除；62 Cooldown排除；63 INVALID排除；64 10:05 Open；65 稳定排名；66 现金不足不缩量；67 不重分配；68 最大6/15%；69 当日不重复买。
+
+G 退出
+70 每根Close硬退出；71 只发sellable；72 不可卖留Pending；73 11:25→13:00；74 14:55跨日；75 调协调器；76 每symbol唯一；77 ProjectedExposure；78 替换最后；79 14:35 Open；80 不重写优先级。
+
+H 账本状态
+81 BUY扣现金；82 SELL加现金；83 fill只记一次；84 fill只应用状态一次；85 费用不重复；86 现金不负；87 卖出资金当日可用；88 同事务；89 状态失败回滚；90 全退Cooldown；91 Pending同步。
+
+I 数据库防重
+92 migration幂等；93 schema不符；94 Decimal不REAL；95 event唯一；96 request唯一；97 fill唯一；98 状态追加；99 streak防重；100 episode防重；101 Pending attempt防重；102 旧表不变。
+
+J 恢复
+103 事务回滚；104 checkpoint恢复；105 event不重放；106 fill不重复记账；107 snapshot变化拒绝；108 fingerprint拒绝；109 resume幂等；110 报告重建。
+
+K 日终期末
+111 14:55估值；112 最后Close回退；113 停牌昨日mark；114 无mark DEGRADED；115 stop次日生效；116 不强平；117 开放仓计权益；118 Pending保留。
+
+L 指标
+119 TotalReturn；120 Annualized；121 Vol ddof1；122 Sharpe zero；123 MDD；124 Exposure；125 Turnover；126 WinRate；127 ProfitFactor；128 开放仓不算已实现；129 费用失败计数；130 基准40/40/20；131 起始缺失；132 stale记录。
+
+M 报告
+133 sheets；134 冻结筛选；135 symbol文本；136 换行列宽<=50；137 长错误不越界；138 原子替换；139 失败不假完整；140 RunStore重建；141 manifest版本/SHA；142 不泄密；143 文件SHA。
+
+N 回归
+144 服务错误码；145 UI未实现；146 Phase 1—4B全部既有测试继续通过；147 当前691项不得回归；148 compileall、diff和禁止模块检查通过。
+
+三十五、Codex执行要求
+
+1. 读取V1.3至V1.3.13全部规格和现有代码。
+2. 先检查现有Provider、数据库、账户、Watchlist和报告实现并复用。
+3. 一次性完成全部Phase 5，不中途交半套。
+4. 不复制已有策略公式。
+5. 新模型冻结且深度不可变。
+6. 金额Decimal，ID/排序/原因/事件顺序确定。
+7. 数据库使用事务和UNIQUE约束。
+8. 不删除或降低旧测试。
+9. 新测试覆盖正向、边界、异常、重放和输入乱序。
+10. 不新增不必要依赖。
+11. 报告优先复用现有openpyxl等依赖。
+12. 完成全部实现和测试后统一汇报。
+
+三十六、运行和暂存
+
+运行：
+- Phase 1测试
+- Phase 2测试
+- Phase 3测试
+- Phase 4A测试
+- Phase 4B测试
+- Phase 5测试
+- 完整项目测试
+- python -m compileall -q stock_picker tests
+- git diff --check
+- git diff --cached --check
+- git status --short
+
+暂存Phase 5代码、迁移、测试和本V1.3.13规格。不提交Phase 5，不进入Phase 6。
+
+三十七、完成报告
+
+必须包含：
+1. 文件和行号；
+2. 缓存和Provider回退；
+3. data/rule/account snapshots；
+4. EventClock和防前视；
+5. 10:00、硬退出、14:30、日终编排；
+6. 现金账本和事务；
+7. 防重ID和唯一约束；
+8. 中断恢复；
+9. 指标和报告；
+10. 服务接口；
+11. 新测试函数和实例数；
+12. Phase 1、2、3、4A、4B、5结果；
+13. 完整项目结果；
+14. compileall和Git检查；
+15. 是否修改禁止模块；
+16. 未解决问题。
+
+完成后停止，等待一次只读验收。

@@ -1,0 +1,910 @@
+T+1软适应中短期趋势系统 V1.3.14
+Phase 5核心闭环最终一次性修复与Codex执行指令
+版本日期：2026-07-25
+
+======================================================================
+0. 前置状态
+======================================================================
+
+当前基准：
+
+- Phase 4B检查点：
+  f55c48257b02d846a98f68d4a7176679f79de675
+- Phase 5当前仅暂存，尚未提交
+- 当前完整测试基线：
+  842 passed
+- Phase 5测试基线：
+  151 passed
+
+Phase 5最终只读验收发现：
+
+- 6项P0
+- 1项P1
+
+本轮必须一次性修复全部问题。
+
+完成后：
+
+- 只暂存；
+- 不提交Phase 5；
+- 不进入Phase 6；
+- 等待一次聚焦验收。
+
+本轮不得扩展新的产品需求。
+
+
+======================================================================
+1. 权威规格
+======================================================================
+
+按以下优先级执行：
+
+1. V1.3至V1.3.12已冻结规格；
+2. V1.3.13 Phase 5完整规格；
+3. 本V1.3.14最终修复规格。
+
+如旧实现与本文件冲突，以本文件为准。
+
+本轮不是新增另一套Phase 5，而是修复现有实现，使其真正形成可执行、可持久化、可恢复的闭环。
+
+
+======================================================================
+2. P0-1：缓存必须按实际请求范围验证
+======================================================================
+
+现有问题：
+
+只要相同logical_key存在任意COMPLETE分区，就可能把一个月缓存误判为一年完整缓存。
+
+必须修复：
+
+2.1 分区覆盖元数据
+
+每个缓存分区至少保存：
+
+- logical_key；
+- dataset_type；
+- normalized_symbol；
+- frequency；
+- price_basis_id；
+- coverage_start_date；
+- coverage_end_date；
+- covered_trade_dates；
+- expected_trade_dates；
+- row_count；
+- completeness_status；
+- partition_id；
+- partition_version；
+- source；
+- source_version；
+- content_hash。
+
+covered_trade_dates和expected_trade_dates必须以确定性格式保存，不能只依赖start/end推断。
+
+2.2 缓存命中
+
+缓存命中必须基于：
+
+RequestedTradingDates
+⊆
+Union(所有可用COMPLETE分区的covered_trade_dates)
+
+并且每个被覆盖交易日自身通过完整性检查。
+
+不得使用：
+
+- logical_key存在；
+- 任意COMPLETE分区存在；
+- coverage_start/end表面包含；
+
+作为充分条件。
+
+2.3 缺口计算
+
+MissingTradingDates =
+RequestedTradingDates
+-
+ValidatedCoveredTradingDates
+
+只抓取MissingTradingDates对应的完整逻辑分区。
+
+重新抓取后必须：
+
+1. 验证新分区；
+2. 重新合并覆盖；
+3. 再次逐交易日检查；
+4. 只有全部交易日和320日预热都完整时才READY。
+
+2.4 5分钟完整性
+
+正常交易日必须准确覆盖48个合法bar_start。
+
+47根：
+
+PARTIAL。
+
+0根只有在历史规则明确证明全天停牌时才COMPLETE。
+
+未知状态：
+
+INVALID或PARTIAL，不得当停牌。
+
+2.5 DataSnapshot
+
+创建data_snapshot前必须验证：
+
+- 正式范围完整；
+- 320日预热完整；
+- 基准完整；
+- 规则和费用快照完整；
+- snapshot引用的partition覆盖实际运行要求。
+
+不得让READY snapshot引用不完整分区。
+
+2.6 测试
+
+必须覆盖：
+
+1. 同logical_key先缓存1个月，再请求1年；
+2. 仅start/end看似覆盖但缺中间交易日；
+3. 多个COMPLETE分区拼接完整覆盖；
+4. 多分区之间存在一天缺口；
+5. 5分钟缺1根；
+6. 停牌0根且有历史证明；
+7. 0根但状态未知；
+8. 320日预热缺1日；
+9. 后续补齐缺口后READY；
+10. 输入顺序不改变缺口结果。
+
+
+======================================================================
+3. P0-2：核心编排必须是不可绕过的必经路径
+======================================================================
+
+现有问题：
+
+默认RuntimeHooks为空时，事件仍可COMPLETED，但不会执行Phase 1—4B核心逻辑。
+
+必须修复：
+
+3.1 删除“空Hook即成功”
+
+不得允许：
+
+RuntimeHooks()
+
+在缺少核心策略依赖时运行并标记成功。
+
+以下任一缺失必须在create_run或execute_run前失败：
+
+- Phase 1评分入口；
+- Phase 2市场、风险、背离和执行过滤入口；
+- T1Risk入口；
+- Phase 4A仓位分配入口；
+- Phase 4B硬退出入口；
+- Phase 4B coordinate_1430_exit_cycle；
+- Phase 3 FillEngine；
+- Phase 4A apply_buy_fill/apply_sell_fill；
+- 规则、数据和账户快照读取器。
+
+错误码：
+
+INVALID_CONFIG
+或
+UNEXPECTED_ENGINE_ERROR
+
+不得把事件标记COMPLETED。
+
+3.2 RunOrchestrator必须内置冻结流程
+
+DECISION_1000必须在RunOrchestrator内部强制执行：
+
+1. MarketOverlay和EntryThreshold；
+2. Phase 1 OpportunityScore；
+3. Phase 2 Divergence；
+4. Phase 2 RiskOverlay；
+5. Phase 2 ExecutionGate；
+6. T1Risk；
+7. Phase 4A PositionSizing；
+8. Phase 4A PortfolioAllocator；
+9. 排除持仓、Pending、Cooldown和INVALID；
+10. 稳定生成10:05 FillRequest。
+
+BAR_CLOSE必须强制执行：
+
+1. 对持仓按规范化symbol升序；
+2. Phase 4B硬退出；
+3. Pending合并；
+4. 下一合法执行时点；
+5. sellable拆分；
+6. 保存意图、Pending和FillRequest。
+
+DECISION_1430必须强制调用：
+
+coordinate_1430_exit_cycle
+
+SESSION_CLOSE必须强制执行估值和TrailingStop更新。
+
+3.3 Hook允许范围
+
+如保留RuntimeHooks，只能用于：
+
+- 可观察性；
+- 指标记录；
+- 外部Provider适配；
+- 测试故障注入。
+
+Hook不得决定是否执行核心逻辑，也不得替代核心逻辑。
+
+3.4 事件完成条件
+
+只有核心处理成功并且：
+
+- 决策已保存；
+- 状态已保存；
+- checkpoint已保存；
+
+事件才能COMPLETED。
+
+3.5 测试
+
+必须覆盖：
+
+1. 默认空Hooks被拒绝；
+2. 缺Phase 1入口被拒绝；
+3. 缺Phase 4B协调器被拒绝；
+4. 有持仓时每根BAR_CLOSE确实调用硬退出；
+5. 10:00确实执行Phase 1→2→T1→4A；
+6. 14:30确实调用唯一协调器；
+7. 核心依赖异常时event FAILED而非COMPLETED；
+8. Hook不调用也不影响核心链；
+9. Hook试图跳过核心链无效。
+
+
+======================================================================
+4. P0-3：Retryable卖出失败不得丢失
+======================================================================
+
+现有问题：
+
+retryable SELL FAILED后直接continue，请求被删除，Pending未更新。
+
+必须修复：
+
+4.1 失败处理
+
+SELL FillResult为：
+
+FAILED
+且
+retryable=True
+
+时必须在同一事件事务中：
+
+1. 调用Phase 4B PendingSell状态转换；
+2. retry_count只增加一次；
+3. 保存新的PendingSell版本；
+4. 计算next_attempt_trade_date/bar_start；
+5. 创建新的确定性FillRequest；
+6. 标记旧FillRequest已尝试；
+7. 新请求进入待执行队列；
+8. 保存审计事件；
+9. 保存checkpoint。
+
+不得：
+
+- 丢弃请求；
+- 把Pending删除；
+- 只写FillResult不写状态；
+- 复用同一个fill_request_id造成语义混乱。
+
+4.2 重试时间
+
+硬退出：
+
+- 同交易日有下一合法5分钟Open：
+  下一根重试；
+- 14:55之后：
+  下一实际交易日09:30。
+
+非硬退出：
+
+- 下一交易日14:30重新验证；
+- 仍有效才创建14:35请求。
+
+4.3 幂等
+
+同一AttemptIdentity重复处理：
+
+- retry_count不得再次增加；
+- 不得创建第二个下一次请求；
+- 不得重复写Pending版本。
+
+4.4 non-retryable和INVALID
+
+- non-retryable FAILED：
+  Pending转ERROR；
+- INVALID：
+  Pending转ERROR；
+- 均不得自动安排下一尝试。
+
+4.5 测试
+
+必须覆盖：
+
+1. limit_down_sell retryable；
+2. suspension retryable；
+3. missing bar retryable；
+4. 14:55跨日；
+5. 非硬Pending次日14:30重验；
+6. 同Attempt重复应用；
+7. retryable失败后run中断再恢复；
+8. non-retryable转ERROR；
+9. INVALID转ERROR；
+10. Pending和下一FillRequest都落库。
+
+
+======================================================================
+5. P0-4：SESSION_CLOSE必须强制估值开放持仓
+======================================================================
+
+现有问题：
+
+未提供session_close hook时，equity默认等于cash，开放持仓被忽略。
+
+必须修复：
+
+5.1 强制估值
+
+SESSION_CLOSE必须对每个开放持仓计算mark：
+
+1. 当日14:55有效Close；
+2. 否则当日最后一个有效Close；
+3. 若全天停牌，上一交易日有效mark；
+4. 若仍无mark：
+   记录MISSING_MARK_PRICE；
+   run/day状态DEGRADED。
+
+HoldingMarketValue =
+total_qty × mark_price
+
+Equity =
+cash
++
+Σ HoldingMarketValue
+
+不得由Hook决定是否估值。
+
+5.2 未实现盈亏
+
+必须保存：
+
+- position_market_value；
+- unrealized_pnl；
+- realized_pnl；
+- total_equity；
+- cash；
+- exposure；
+- holding_count。
+
+5.3 TrailingStop
+
+SESSION_CLOSE必须调用Phase 4B移动止损更新。
+
+更新：
+
+- 使用当日完整有效Close和ATR；
+- 只从下一实际交易日生效；
+- 与price_basis一致；
+- 保存ExitControlState新版本。
+
+5.4 期末
+
+最后交易日：
+
+- 不强平；
+- 开放持仓计入最终权益；
+- 未实现盈亏单列；
+- Pending保留；
+- status为COMPLETED_WITH_OPEN_POSITIONS或DEGRADED。
+
+5.5 测试
+
+必须覆盖：
+
+1. 有现金和开放持仓；
+2. 14:55正常mark；
+3. 14:55无效但14:50有效；
+4. 全天停牌用昨日mark；
+5. 无昨日mark时DEGRADED；
+6. equity不等于cash；
+7. 未实现盈亏正确；
+8. TrailingStop次日生效；
+9. 无session_close Hook仍完整估值；
+10. 期末不强平。
+
+
+======================================================================
+6. P0-5：Pending、ExitControl和Cooldown必须持久化并恢复
+======================================================================
+
+现有问题：
+
+数据库有对应表，但运行路径没有写入；恢复只重建Position和FillRequest。
+
+必须修复：
+
+6.1 RunStore写入API
+
+必须实现并实际调用：
+
+- append_pending_sell_version(...)
+- append_exit_control_state_version(...)
+- append_cooldown_record(...)
+- load_latest_pending_sells(run_id)
+- load_latest_exit_control_states(run_id)
+- load_active_cooldowns(run_id, as_of_date)
+
+所有版本追加，不覆盖历史。
+
+6.2 写入时机
+
+必须在以下事件事务中保存：
+
+SESSION_START：
+- 解锁后的PositionState；
+- 激活/失效Cooldown；
+- 当前Pending状态。
+
+BAR_OPEN：
+- Fill后PositionState；
+- Pending状态转换；
+- 完全退出后的Cooldown；
+- ExitControl变化。
+
+BAR_CLOSE：
+- 硬退出意图；
+- Pending创建/升级；
+- ExitControl变化。
+
+DECISION_1430：
+- Pending重验；
+- Pending取消/升级；
+- episode状态；
+- weak streak；
+- MA20恢复状态；
+- ExitControlState；
+- Cooldown相关变化。
+
+SESSION_CLOSE：
+- TrailingStop更新；
+- 其他ExitControl状态。
+
+6.3 同事务
+
+Fill、Ledger、Position、Pending、ExitControl和Cooldown必须在同一个事件事务内提交。
+
+任一步失败：
+
+全部回滚。
+
+6.4 Recovery
+
+resume_run必须从数据库重建：
+
+- cash；
+- PositionState；
+- ExitControlState；
+- PendingSell；
+- Cooldown；
+- 未完成FillRequests；
+- 最后checkpoint。
+
+不得以checkpoint内存对象作为唯一来源。
+
+6.5 测试
+
+必须覆盖：
+
+1. 14:30创建Pending后中断恢复；
+2. weak streak更新后恢复；
+3. episode acted状态恢复；
+4. TrailingStop更新后恢复；
+5. 完全退出Cooldown恢复；
+6. Pending retry_count恢复；
+7. 状态版本递增；
+8. 事务失败全部回滚；
+9. 多次resume状态一致；
+10. 旧版本仍可审计。
+
+
+======================================================================
+7. P0-6：Run快照必须原子落库并由真实缓存校验
+======================================================================
+
+现有问题：
+
+create_run只保存字符串或调用方哈希，没有真正保存account、universe和data snapshot；恢复信任调用方再次传值。
+
+必须修复：
+
+7.1 create_run原子保存
+
+create_run必须在同一个SQLite事务中保存：
+
+1. adaptive_v13_runs；
+2. account_snapshot；
+3. universe_snapshot；
+4. data_snapshot；
+5. data_snapshot_partition_links；
+6. RunConfig；
+7. run_fingerprint；
+8. 初始checkpoint。
+
+任何一步失败：
+
+run不得创建。
+
+7.2 AccountSnapshot
+
+保存完整规范化内容和hash：
+
+- profile ID；
+- initial cash；
+- fee schedule；
+- currency；
+- provider priority；
+- data/report directory；
+- mode；
+- 初始持仓策略。
+
+7.3 UniverseSnapshot
+
+保存：
+
+- candidate_symbols；
+- required_symbols；
+- current_holding_symbols；
+- benchmark_symbols；
+- source specification；
+- normalized hash。
+
+7.4 DataSnapshot
+
+保存：
+
+- data_snapshot_id；
+- partition IDs；
+- partition content hashes；
+- coverage；
+- source/version；
+- price_basis；
+- rule/fee snapshot IDs；
+- readiness status；
+- snapshot hash。
+
+7.5 Recovery真实性校验
+
+resume_run不得要求调用方重新提供权威快照内容。
+
+恢复时必须从数据库读取并验证：
+
+1. snapshot记录存在；
+2. 所有partition链接存在；
+3. MarketCache中partition存在；
+4. partition content_hash一致；
+5. coverage仍满足run范围和预热；
+6. price_basis一致；
+7. rule/fee版本存在；
+8. run_fingerprint与数据库内容重算一致。
+
+调用方提供的参数只能作为可选断言，不能作为事实来源。
+
+7.6 破坏检测
+
+以下任一发生必须拒绝恢复：
+
+- snapshot记录缺失；
+- partition链接缺失；
+- partition被删除；
+- content hash改变；
+- coverage不足；
+- rule/fee snapshot丢失；
+- fingerprint不匹配。
+
+错误码：
+
+DATA_NOT_READY
+RUN_FINGERPRINT_MISMATCH
+或
+STATE_VERSION_CONFLICT
+
+7.7 测试
+
+必须覆盖：
+
+1. create_run后快照表都有记录；
+2. create_run中途失败全部回滚；
+3. 删除partition后恢复失败；
+4. 修改content_hash后恢复失败；
+5. 删除snapshot link后恢复失败；
+6. 调用方传入伪造相同ID不能通过；
+7. 缓存新增新版本不影响旧run；
+8. 旧snapshot仍指向旧partition；
+9. fingerprint按数据库内容重算；
+10. 多次resume无需重复传入映射。
+
+
+======================================================================
+8. P1：审计日志和Manifest必须来自权威RunStore
+======================================================================
+
+现有问题：
+
+没有完整审计写入路径；manifest依赖可选manifest_context，服务默认不传，仍生成不完整manifest。
+
+必须修复：
+
+8.1 AuditEvent写入
+
+以下关键事件必须在对应事务中写入：
+
+- 缓存命中、缺口和Provider回退；
+- DataReadiness；
+- create_run；
+- Event开始/完成/失败；
+- 所有候选评分；
+- 所有拒绝原因；
+- FillRequest；
+- FillResult；
+- Ledger；
+- PositionState；
+- PendingSell；
+- ExitControlState；
+- Cooldown；
+- checkpoint；
+- recovery；
+- report生成。
+
+审计至少包含：
+
+run_id、event_id、trade_date、event_time、event_type、symbol、component、action、status、reason_code、message、input_hash、output_hash、source_ids、created_at。
+
+8.2 Manifest权威来源
+
+generate_run_report(run_id)必须自动从RunStore和MarketCache读取：
+
+- git_commit_sha；
+- schema_version；
+- strategy_version；
+- account_snapshot_id和hash；
+- universe_snapshot_id和hash；
+- data_snapshot_id和hash；
+- partition/provider/source versions；
+- trading rule versions；
+- fee version；
+- price_basis；
+- requested/resolved/warmup range；
+- run status；
+- started/completed timestamps；
+- report files和SHA256；
+- warnings。
+
+不得依赖可选manifest_context补齐关键字段。
+
+如关键元数据缺失：
+
+REPORT_WRITE_FAILED
+
+不得生成看似完整的manifest。
+
+8.3 完整标记
+
+只有所有报告文件成功原子写入并计算SHA256后：
+
+- 写manifest；
+- report status标记COMPLETED。
+
+任一文件失败：
+
+- 不写完成manifest；
+- 不留下假完整report_manifest记录。
+
+8.4 测试
+
+必须覆盖：
+
+1. 服务接口不传manifest_context；
+2. manifest仍包含全部权威版本；
+3. 缺git/schema/provider/rule/fee任一关键字段时失败；
+4. audit覆盖Fill、Pending、Cooldown和Recovery；
+5. 报告文件失败不写完成manifest；
+6. 文件SHA256正确；
+7. manifest不包含凭证；
+8. 报告可完全从数据库重建。
+
+
+======================================================================
+9. RunStore与事务接口要求
+======================================================================
+
+不得继续让业务代码直接零散调用conn.execute形成隐式半事务。
+
+建议提供：
+
+with run_store.event_transaction(run_id, event_id) as tx:
+    ...
+
+tx必须支持：
+
+- mark_event_processing；
+- save_decision；
+- save_exit_intent；
+- save_fill_request；
+- save_fill_result；
+- append_ledger_event；
+- append_position_version；
+- append_pending_version；
+- append_exit_control_version；
+- append_cooldown_record；
+- append_daily_snapshot；
+- append_audit_event；
+- save_checkpoint；
+- mark_event_completed。
+
+上下文成功才commit。
+
+异常：
+
+rollback全部业务写入。
+
+FAILED事件如需保留，必须在rollback后使用独立最小事务写入失败状态和异常审计，不能留下部分业务状态。
+
+
+======================================================================
+10. 允许修改
+======================================================================
+
+允许修改：
+
+- phase5_models.py
+- market_cache.py
+- data_catalog.py
+- data_snapshot.py
+- phase5_service.py
+- run_orchestrator.py
+- run_store.py
+- run_recovery.py
+- account_ledger.py
+- run_reporting.py
+- adaptive_v13_schema.py
+- Phase 5相关__init__.py
+- Phase 5测试
+- V1.3.13规格文件仅在保证原文不被删改时保留
+- 本V1.3.14文件
+
+可在确有必要时小幅修改：
+
+- event_clock.py
+- account_snapshot_service.py
+- rule_snapshot_service.py
+- performance_metrics.py
+
+但不得改变已冻结算法。
+
+
+======================================================================
+11. 禁止修改
+======================================================================
+
+不得修改：
+
+- Phase 1—4B公式和公开行为；
+- Phase 3 FillEngine成交规则；
+- Phase 4A持仓和T+1记账；
+- Phase 4B退出、Pending和Cooldown规则；
+- 旧恒温器；
+- 旧事件回测；
+- 旧数据库表；
+- 网页；
+- Phase 6；
+- 券商/QMT；
+- 买入或加仓策略；
+- 滑点、容量、部分成交、排队、追价；
+- 强制期末平仓。
+
+
+======================================================================
+12. 必须新增的综合回归测试
+======================================================================
+
+除逐项测试外，至少新增以下端到端测试：
+
+1. 一个月缓存不能启动一年回测。
+2. 缺一根5分钟K线不能READY。
+3. 第一Provider 47根、第二Provider 48根时完整回退。
+4. 默认空Hook不能完成run。
+5. 有持仓时BAR_CLOSE必定产生硬退出评估记录。
+6. 14:30必定存在协调器调用记录。
+7. retryable卖出失败后Pending和下一请求均保留。
+8. retryable失败后中断恢复仍只重试一次。
+9. 开放持仓日终equity包含市值。
+10. 无mark时DEGRADED。
+11. Pending、ExitControl、Cooldown在恢复前后一致。
+12. 删除snapshot partition后resume失败。
+13. 修改partition hash后resume失败。
+14. Fill、Ledger、Position、Pending任一步异常时整事务回滚。
+15. 报告不传manifest_context仍完整。
+16. 报告文件写入失败不生成完成manifest。
+17. audit包含缓存、决策、Fill、Pending、Cooldown、恢复和报告。
+18. 多次resume幂等。
+19. Phase 1—4B既有测试全部继续通过。
+20. 当前842项完整测试不得回归。
+21. Phase 5测试数量必须明显高于151。
+22. 不得删除或降低现有Phase 5测试断言。
+
+
+======================================================================
+13. 执行和检查
+======================================================================
+
+先读取：
+
+- V1.3至V1.3.14全部规格；
+- 当前暂存代码；
+- 最终验收报告。
+
+一次性修复全部6项P0和1项P1。
+
+不要中途只交部分实现。
+
+至少运行：
+
+1. Phase 1测试
+2. Phase 2测试
+3. Phase 3测试
+4. Phase 4A测试
+5. Phase 4B测试
+6. Phase 5测试
+7. 完整项目测试
+8. python -m compileall -q stock_picker tests
+9. git diff --check
+10. git diff --cached --check
+11. git status --short
+
+将以下全部暂存：
+
+- 修复代码；
+- migration；
+- 新增测试；
+- V1.3.13权威规格；
+- 本V1.3.14规格。
+
+不要暂存只读验收说明文件，除非它本来就是项目文档的一部分。
+
+不提交Phase 5，不进入Phase 6。
+
+
+======================================================================
+14. 完成报告
+======================================================================
+
+报告必须包含：
+
+1. 修改文件和行号；
+2. P0-1缓存范围覆盖修复及复现结果；
+3. P0-2强制策略编排及依赖校验；
+4. P0-3 retryable卖出状态和下一请求；
+5. P0-4开放持仓估值和TrailingStop；
+6. P0-5三类状态持久化及恢复；
+7. P0-6快照落库和真实缓存校验；
+8. P1审计与Manifest权威来源；
+9. event_transaction原子性；
+10. 新增测试函数和pytest实例数量；
+11. Phase 1、2、3、4A、4B、5测试结果；
+12. 完整项目测试结果；
+13. compileall和Git检查；
+14. 是否修改禁止模块；
+15. 是否仍有未解决问题。
+
+完成后停止，等待一次聚焦验收；不提交、不进入Phase 6。

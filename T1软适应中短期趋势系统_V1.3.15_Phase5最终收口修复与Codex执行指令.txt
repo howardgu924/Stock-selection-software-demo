@@ -1,0 +1,373 @@
+T+1软适应中短期趋势系统 V1.3.15
+Phase 5最终收口修复与Codex执行指令
+版本日期：2026-07-25
+
+0. 前置状态
+
+- Phase 4B提交：f55c48257b02d846a98f68d4a7176679f79de675
+- Phase 5当前仅暂存，尚未提交
+- Phase 5测试：180 passed
+- 完整项目：871 passed
+
+V1.3.14聚焦验收发现3项P0、1项P1。本轮只修复这4项，不扩展需求。完成后只暂存，不提交Phase 5，不进入Phase 6。
+
+1. 权威规格
+
+执行优先级：
+1. V1.3至V1.3.13冻结规格；
+2. V1.3.14修复规格；
+3. 本V1.3.15。
+
+本文件只收紧：
+- 核心策略链不可替换；
+- 日终mark由编排器权威选择；
+- Cooldown恢复使用checkpoint时点；
+- 缓存与Ledger审计覆盖。
+
+2. P0-1 核心策略链不得由调用方替换
+
+现有问题：
+RunOrchestrator只检查依赖是否callable，调用方可传返回空字典的lambda替代真实Phase 1—4B逻辑，事件仍COMPLETED。
+
+必须修复：
+
+2.1 删除可替换的核心函数依赖
+
+以下行为不得作为可注入callable：
+- Phase 1 OpportunityScore；
+- Phase 2 MarketOverlay、Divergence、RiskOverlay、ExecutionGate；
+- T1Risk；
+- Phase 4A PositionSizing、PortfolioAllocator；
+- Phase 4B硬退出、coordinate_1430_exit_cycle、PendingSell转换、TrailingStop更新；
+- Phase 3 FillEngine；
+- Phase 4A apply_buy_fill/apply_sell_fill。
+
+RunOrchestrator必须在模块内部直接导入并调用权威函数。不得再通过dependencies.phase1、dependencies.coordinate_1430、dependencies.valuation等入口替换核心实现。
+
+2.2 允许注入的依赖
+
+依赖对象只能提供数据或外部适配：
+- MarketView或原始行情读取；
+- TradingRuleSnapshot、FeeRuleSnapshot；
+- AccountSnapshot、UniverseSnapshot、DataSnapshot；
+- Provider适配；
+- 时钟；
+- 测试故障注入；
+- 可观察性回调。
+
+这些依赖不得返回最终策略决策。
+
+2.3 RuntimeHooks
+
+RuntimeHooks只能用于before/after观察、指标、日志和测试异常注入。默认空RuntimeHooks合法，但不能跳过核心链。
+
+核心权威函数、数据读取器或规则快照缺失：
+- run失败；
+- 错误码INVALID_CONFIG或UNEXPECTED_ENGINE_ERROR；
+- 事件不得COMPLETED。
+
+2.4 固定流程
+
+DECISION_1000必须内部直接执行：
+1. 读取截至09:55的MarketView；
+2. 真实MarketOverlay和EntryThreshold；
+3. 真实OpportunityScore；
+4. 真实Divergence；
+5. 真实RiskOverlay；
+6. 真实ExecutionGate；
+7. 真实T1Risk；
+8. 真实PositionSizing；
+9. 真实PortfolioAllocator；
+10. 生成10:05 FillRequest。
+
+BAR_CLOSE内部直接调用真实Phase 4B硬退出。
+
+DECISION_1430内部直接调用真实coordinate_1430_exit_cycle，不得存在替代入口。
+
+SESSION_CLOSE内部直接执行估值和TrailingStop更新。
+
+2.5 测试
+
+必须修正当前错误测试test_mandatory_event_chain_and_1430_run_without_hooks。新断言：
+- 空RuntimeHooks不会跳过核心链；
+- 核心链实际执行；
+- 返回空字典lambda不能替换核心函数。
+
+新增测试：
+1. 旧核心callable位置传空lambda时构造拒绝或参数已不存在；
+2. monkeypatch调用方dependency.coordinate_1430不影响内部真实协调器；
+3. 真实coordinate_1430_exit_cycle调用恰好一次；
+4. 真实Phase 1→2→T1→4A顺序固定；
+5. Hook返回空值、False或空字典不跳过核心链；
+6. 核心函数异常时event FAILED；
+7. BAR_CLOSE有持仓时真实硬退出入口被调用；
+8. 测试替身不能改变交易优先级。
+
+3. P0-2 日终mark必须由编排器选择和验证
+
+现有问题：
+dependencies.valuation可直接返回任意close=999，编排器只校验有限正数。
+
+3.1 删除最终mark注入
+
+依赖不得直接提供：
+- position_marks；
+- final_close；
+- final_equity；
+- unrealized_pnl；
+- 已选择估值价格。
+
+依赖只能提供原始候选：
+- 当日5分钟K线；
+- 交易状态；
+- 上一交易日mark；
+- price_basis_id；
+- TradingRuleSnapshot；
+- ATR20和日线数据。
+
+3.2 权威选择函数
+
+实现不可替换的select_session_close_mark：
+
+输入至少有symbol、trade_date、当日5分钟bars、previous_valid_mark、trading_rule_snapshot、expected_price_basis_id。
+
+固定顺序：
+1. 14:55 bar完整合法且price_basis一致，使用14:55 Close；
+2. 否则按bar_start降序选择当日最后有效Close；
+3. 当日明确全天停牌，使用previous_valid_mark；
+4. 否则MISSING_MARK_PRICE并DEGRADED。
+
+不得使用未来交易日数据。
+
+3.3 有效性
+
+mark必须：
+- Decimal或精确十进制；
+- 有限且>0；
+- bar.trade_date等于当前日；
+- 合法5分钟bar_start；
+- OHLC合法；
+- price_basis一致；
+- source属于data_snapshot；
+- bar已完成。
+
+previous_valid_mark只在当日明确全天停牌、来自更早交易日且price_basis一致时允许。
+
+3.4 Equity
+
+HoldingValue=total_qty×selected_mark
+Equity=cash+ΣHoldingValue
+
+依赖不得覆盖。
+
+3.5 TrailingStop
+
+使用同一个权威mark和ATR20调用真实Phase 4B更新函数。无有效mark时保持旧状态并记录MISSING_MARK_PRICE。
+
+3.6 测试
+
+1. 外部返回close=999不再被接受或不影响估值；
+2. 14:55有效选14:55；
+3. 14:55无效但14:50有效选14:50；
+4. bars乱序仍选最后合法时间；
+5. 全天停牌且有昨日mark时使用昨日mark；
+6. 非停牌无当日mark时DEGRADED；
+7. 昨日mark price_basis不一致时拒绝；
+8. bar日期不是当前日时拒绝；
+9. 开放持仓Equity正确；
+10. TrailingStop只用权威mark且次日生效。
+
+4. P0-3 恢复Cooldown必须按checkpoint时点
+
+现有问题：
+恢复时使用整个回测最后交易日作为as_of，导致尚未到期的Cooldown被提前过滤。
+
+4.1 恢复时点
+
+resume_run计算recovery_as_of_trade_date，来源：
+1. 最后COMPLETED checkpoint事件的trade_date；
+2. 无checkpoint时使用run首个交易日前一实际交易日或明确初始状态日期；
+3. 判断下一事件可交易性时使用next_pending_event.trade_date。
+
+不得使用date_range.end_date、当前自然日或最终交易日。
+
+4.2 Cooldown加载
+
+恢复时保留所有：
+reentry_allowed_date > recovery_as_of_trade_date
+
+下一事件日期D：
+D < reentry_allowed_date时blocked；
+D == reentry_allowed_date时允许。
+
+4.3 Checkpoint
+
+checkpoint明确保存：
+- event_id；
+- trade_date；
+- event_time；
+- sequence_number；
+- next_event_id或足以确定下一事件的信息。
+
+4.4 测试
+
+1. 回测1月2日至10日；
+2. 1月3日中断；
+3. Cooldown至1月6日允许；
+4. 恢复后1月4、5仍blocked；
+5. 1月6允许；
+6. 最终交易日不影响恢复；
+7. 周末和休市日正确跳过；
+8. 无checkpoint初始恢复；
+9. 多次resume一致；
+10. checkpoint与下一事件边界。
+
+5. P1-1 缓存与Ledger审计必须完整
+
+5.1 缓存审计
+
+缓存发生在run创建前时，可使用market_cache_audit表，或adaptive_v13_audit_events中的preparation_id/data_snapshot_id。
+
+至少记录：
+CACHE_LOOKUP、CACHE_HIT、CACHE_MISS、CACHE_PARTIAL、MISSING_TRADING_DATES、PROVIDER_ATTEMPT、PROVIDER_REJECTED、PROVIDER_FALLBACK、PARTITION_VALIDATED、PARTITION_INVALID、DATA_READINESS_READY、DATA_READINESS_FAILED、DATA_SNAPSHOT_CREATED。
+
+字段至少包含：
+preparation_id或run_id、data_snapshot_id、logical_key、symbol、dataset_type、source、source_version、action、status、reason_code、covered_dates_hash、missing_dates_hash、input_hash、output_hash、created_at。
+
+Provider回退必须记录首个Provider被拒原因和最终来源。
+
+5.2 Ledger审计
+
+每个LedgerEvent在同一事件事务内写独立AuditEvent：
+- component=account_ledger；
+- action=BUY_CASH_DEBIT或SELL_CASH_CREDIT；
+- fill_id；
+- ledger_event_id；
+- cash_before；
+- cash_delta；
+- cash_after；
+- fee_total；
+- status；
+- reason_code。
+
+不得用fill_engine审计替代Ledger审计。
+
+同一ledger_event_id重放：
+- 不重复记账；
+- 不重复写第二个成功审计。
+
+5.3 报告审计
+
+报告审计日志必须包含cache、DataReadiness、Fill、Ledger、Pending、ExitControl、Cooldown、Recovery和Report。
+
+缓存审计若不属于具体run，manifest引用preparation_id或data_snapshot_id，并纳入相关缓存审计。
+
+5.4 测试
+
+1. 完整缓存命中审计；
+2. 部分缓存缺口审计；
+3. 第一Provider 47根被拒及第二Provider回退审计；
+4. DataReadiness失败审计；
+5. BUY Ledger独立审计；
+6. SELL Ledger独立审计；
+7. Ledger事务回滚无成功审计；
+8. 重复fill不重复ledger审计；
+9. 报告audit包含cache和account_ledger；
+10. 审计输入顺序稳定。
+
+6. 允许修改
+
+允许：
+- run_orchestrator.py
+- phase5_models.py
+- run_recovery.py
+- run_store.py
+- account_ledger.py
+- market_cache.py
+- phase5_service.py
+- run_reporting.py
+- data_catalog.py
+- Phase 5测试
+- __init__.py
+- V1.3.15规格
+
+确有必要可新增：
+- valuation.py
+- strategy_runtime.py
+- cache_audit.py
+
+7. 禁止修改
+
+不得修改：
+- Phase 1—4B冻结算法；
+- Phase 3 FillEngine规则；
+- Phase 4A持仓/T+1；
+- Phase 4B退出和Pending语义；
+- 旧恒温器；
+- 旧事件回测；
+- 旧数据库表；
+- 网页；
+- Phase 6；
+- QMT或券商；
+- 强制期末平仓；
+- 滑点、容量、部分成交、排队或追价。
+
+8. 测试和回归
+
+必须：
+1. 修正错误测试test_mandatory_event_chain_and_1430_run_without_hooks；
+2. 不删除旧测试；
+3. 不降低旧断言；
+4. 新增上述复现；
+5. Phase 5测试明显高于180；
+6. 完整项目明显高于871。
+
+运行：
+- Phase 1：80项
+- Phase 2：93项
+- Phase 3：130项
+- Phase 4A：103项
+- Phase 4B：102项
+- Phase 5全部测试
+- 完整项目测试
+- python -m compileall -q stock_picker tests
+- git diff --check
+- git diff --cached --check
+- git status --short
+
+9. 暂存要求
+
+暂存：
+- 修复代码；
+- 新增/修改测试；
+- migration（如有）；
+- V1.3.13；
+- V1.3.14；
+- 本V1.3.15。
+
+只读验收说明文件继续未跟踪。
+
+不提交Phase 5，不进入Phase 6。
+
+10. 完成报告
+
+报告必须包含：
+1. 修改文件和行号；
+2. 核心函数如何改为内部权威直接调用；
+3. 删除了哪些可替换核心依赖；
+4. 10:00、BAR_CLOSE、14:30真实调用证据；
+5. mark选择函数和固定回退顺序；
+6. 外部close=999复现结果；
+7. recovery_as_of_trade_date计算方式；
+8. Cooldown中断恢复边界结果；
+9. cache审计和Provider回退；
+10. Ledger独立审计；
+11. 修改的错误测试；
+12. 新测试函数和pytest实例数；
+13. 各阶段测试；
+14. 完整项目结果；
+15. compileall和Git检查；
+16. 是否修改禁止模块；
+17. 未解决问题。
+
+完成后停止，等待一次极简验收；不提交、不进入Phase 6。
