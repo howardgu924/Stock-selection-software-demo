@@ -266,6 +266,38 @@ from stock_picker.strategies.adaptive_trend_v1_3.universe_resolver import (
     BENCHMARK_SYMBOLS,
     resolve_universe,
 )
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_controller import (
+    Phase6Controller,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_models import (
+    AccountSummaryVM,
+    CacheProgressVM,
+    DataReadinessVM,
+    DateRangeVM,
+    ErrorVM,
+    ExecutionBackend,
+    ProviderStatusVM,
+    ReportFileVM,
+    RunDetailVM,
+    RunListItemVM,
+    RunSummaryVM,
+    SubmissionResult,
+    UniverseSelectionVM,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_app_factory import (
+    create_phase6_application,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_idempotency import (
+    Phase6IdempotencyStore,
+    SubmissionClaim,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_profile_store import (
+    AccountProfileStore,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_provider_registry import (
+    ProviderDescriptor,
+    ProviderRegistry,
+)
 
 __all__ = [
     "BENCHMARK_WEIGHTS",
@@ -458,4 +490,24 @@ __all__ = [
     "select_session_close_mark",
     "validate_partition",
     "verify_data_snapshot",
+    "AccountProfileStore",
+    "AccountSummaryVM",
+    "CacheProgressVM",
+    "DataReadinessVM",
+    "DateRangeVM",
+    "ErrorVM",
+    "ExecutionBackend",
+    "Phase6Controller",
+    "Phase6IdempotencyStore",
+    "ProviderDescriptor",
+    "ProviderRegistry",
+    "ProviderStatusVM",
+    "ReportFileVM",
+    "RunDetailVM",
+    "RunListItemVM",
+    "RunSummaryVM",
+    "SubmissionClaim",
+    "SubmissionResult",
+    "UniverseSelectionVM",
+    "create_phase6_application",
 ]

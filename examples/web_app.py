@@ -37,6 +37,19 @@ from stock_picker.reporting.t1_thermostat_report import (
     export_t1_thermostat_excel,
 )
 from stock_picker.user import ManualPortfolioStore, WatchlistStore
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_controller import Phase6Controller
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_app_factory import (
+    create_phase6_application,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_models import ErrorVM
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_web import (
+    PHASE6_PAGES,
+    Phase6WebState,
+    handle_phase6_action,
+    phase6_nav,
+    refresh_snapshot_state,
+    render_phase6_page,
+)
 from examples.list_lhb_candidates import build_lhb_candidates
 
 
@@ -46,7 +59,18 @@ REPORT_DIR = Path("data/reports")
 LAST_FORM: dict[str, str] = {}
 JOBS: dict[str, "ThermostatJob"] = {}
 JOBS_LOCK = threading.Lock()
-PAGES = {"thermostat", "backtest", "portfolio"}
+PAGES = {"thermostat", "backtest", "portfolio", *PHASE6_PAGES}
+PHASE6_CONTROLLER: Phase6Controller | None = None
+PHASE6_STARTUP_ERROR: ErrorVM | None = None
+PHASE6_STATE = Phase6WebState()
+PHASE6_STATES: dict[str, Phase6WebState] = {}
+PHASE6_STATES_LOCK = threading.Lock()
+
+
+def configure_phase6(controller: Phase6Controller) -> None:
+    """Attach a production Phase 5 service composition to the local web UI."""
+    global PHASE6_CONTROLLER
+    PHASE6_CONTROLLER = controller
 APP_NAME = "选股工作台"
 
 TITLE_LABELS = {
@@ -701,12 +725,55 @@ class WebAppHandler(BaseHTTPRequestHandler):
             job_id = parse_qs(parsed.query).get("id", [""])[-1]
             self._send_thermostat_report(job_id)
             return
+        if path == "/adaptive-v13-report-file":
+            query = parse_qs(parsed.query)
+            run_id = query.get("run_id", [""])[-1]
+            name = query.get("name", [""])[-1]
+            if PHASE6_CONTROLLER is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "Phase 6 service unavailable")
+                return
+            try:
+                self._send_phase6_report(
+                    PHASE6_CONTROLLER.validate_report_file(run_id, name)
+                )
+            except Exception as exc:
+                view = PHASE6_CONTROLLER.get_error_view(exc)
+                self.send_error(HTTPStatus.BAD_REQUEST, f"{view.title} [{view.code}]")
+            return
         if path == "/":
             self._send_page(render_page(page="thermostat", form=_display_form_for_page("thermostat", LAST_FORM)))
             return
         page = path.strip("/")
         if page not in PAGES:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        if page in PHASE6_PAGES:
+            phase6_state = self._phase6_state()
+            phase6_query = parse_qs(parsed.query)
+            if phase6_query.get("run_id"):
+                phase6_state.run_id = phase6_query["run_id"][-1]
+            if page == "adaptive-v13-runs":
+                allowed = {
+                    "mode","status","date_from","date_to","account","strategy_version",
+                    "has_open_positions","degraded","page","page_size",
+                }
+                submitted_filters = {
+                    key: values[-1] for key,values in phase6_query.items()
+                    if key in allowed and values
+                }
+                if submitted_filters:
+                    phase6_state.run_filters = submitted_filters
+            if PHASE6_CONTROLLER is not None and page in {
+                "adaptive-v13-cache","adaptive-v13-backtest","adaptive-v13-paper",
+            }:
+                refresh_snapshot_state(
+                    PHASE6_CONTROLLER,phase6_state,
+                    "DAILY_PAPER" if page == "adaptive-v13-paper" else "BACKTEST",
+                )
+            self._send_page(render_page(
+                page=page, form={}, phase6_state=phase6_state,
+                phase6_error=PHASE6_STARTUP_ERROR,
+            ))
             return
         query_form = _query_form(parsed.query)
         display_form = _display_form_for_page(page, {**LAST_FORM, **query_form} if query_form else LAST_FORM)
@@ -724,6 +791,20 @@ class WebAppHandler(BaseHTTPRequestHandler):
         try:
             form = self._read_form()
             display_form = form
+            if path.startswith("/adaptive-v13-"):
+                if PHASE6_CONTROLLER is None:
+                    raise RuntimeError("Phase 6 服务尚未配置")
+                phase6_state = self._phase6_state()
+                page, message = handle_phase6_action(
+                    path, form, PHASE6_CONTROLLER, phase6_state
+                )
+                self._send_page(
+                    render_page(
+                        page=page, result=RenderResult(message), form={},
+                        phase6_state=phase6_state,
+                    )
+                )
+                return
             if path == "/thermostat":
                 page = "thermostat"
                 result = handle_thermostat(form)
@@ -768,7 +849,24 @@ class WebAppHandler(BaseHTTPRequestHandler):
             LAST_FORM.update(display_form)
             self._send_page(render_page(page=page, result=result, form=display_form))
         except Exception as exc:
-            self._send_page(render_page(page=_page_for_path(path), error=str(exc), form=form))
+            failed_page = _page_for_path(path)
+            failed_state = (
+                self._phase6_state() if failed_page in PHASE6_PAGES else None
+            )
+            if failed_page in PHASE6_PAGES:
+                view = (
+                    PHASE6_CONTROLLER.get_error_view(exc)
+                    if PHASE6_CONTROLLER is not None
+                    else _startup_error_view(exc)
+                )
+                self._send_page(render_page(
+                    page=failed_page,form=form,phase6_state=failed_state,
+                    phase6_error=view,
+                ))
+            else:
+                self._send_page(render_page(
+                    page=failed_page,error=str(exc),form=form,
+                ))
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"[web] {self.address_string()} - {fmt % args}", file=sys.stderr)
@@ -784,8 +882,28 @@ class WebAppHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
+        if getattr(self, "_phase6_session_cookie", ""):
+            self.send_header(
+                "Set-Cookie",
+                f"adaptive_v13_session={self._phase6_session_cookie}; Path=/; SameSite=Strict",
+            )
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _phase6_state(self) -> Phase6WebState:
+        cookie = self.headers.get("Cookie", "")
+        session_id = ""
+        for item in cookie.split(";"):
+            key, separator, value = item.strip().partition("=")
+            if separator and key == "adaptive_v13_session":
+                session_id = value
+                break
+        if not session_id.replace("-", "").isalnum() or len(session_id) > 64:
+            session_id = uuid.uuid4().hex
+        with PHASE6_STATES_LOCK:
+            state = PHASE6_STATES.setdefault(session_id, Phase6WebState())
+        self._phase6_session_cookie = session_id
+        return state
 
     def _send_text(self, body: str) -> None:
         encoded = body.encode("utf-8")
@@ -802,6 +920,20 @@ class WebAppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _send_phase6_report(self, path: Path) -> None:
+        payload = path.read_bytes()
+        content_type = (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if path.suffix.lower() == ".xlsx"
+            else ("application/x-ndjson" if path.suffix.lower() == ".jsonl" else "application/json")
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _send_thermostat_report(self, job_id: str) -> None:
         with JOBS_LOCK:
@@ -1582,14 +1714,23 @@ def render_page(
     result: RenderResult | None = None,
     error: str | None = None,
     form: dict[str, str] | None = None,
+    phase6_state: Phase6WebState | None = None,
+    phase6_error: ErrorVM | None = None,
 ) -> str:
     form = form or {}
     page = page if page in PAGES else "thermostat"
-    page_body = {
-        "thermostat": render_thermostat_section(form),
-        "backtest": render_thermostat_backtest_section(form),
-        "portfolio": render_portfolio_section(form),
-    }[page]
+    if page in PHASE6_PAGES:
+        page_body = render_phase6_page(
+            page, PHASE6_CONTROLLER, phase6_state or PHASE6_STATE,
+            message="" if result is None else result.title,
+            error=phase6_error,
+        )
+    else:
+        page_body = {
+            "thermostat": render_thermostat_section(form),
+            "backtest": render_thermostat_backtest_section(form),
+            "portfolio": render_portfolio_section(form),
+        }[page]
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1607,6 +1748,7 @@ def render_page(
     <div class="status">本地运行 · {html.escape(datetime.now().strftime("%Y-%m-%d %H:%M"))}</div>
   </header>
   <nav>
+    {phase6_nav(page)}
     {nav_link("thermostat", "恒温器策略", page)}
     {nav_link("backtest", "回测诊断", page)}
     {nav_link("portfolio", "账户", page)}
@@ -2911,6 +3053,19 @@ def _checked(form: dict[str, str], key: str) -> bool:
 
 
 def _page_for_path(path: str) -> str:
+    phase6_paths = {
+        "/adaptive-v13-preview":"adaptive-v13-cache",
+        "/adaptive-v13-cache-prepare":"adaptive-v13-cache",
+        "/adaptive-v13-backtest-run":"adaptive-v13-backtest",
+        "/adaptive-v13-paper-run":"adaptive-v13-paper",
+        "/adaptive-v13-resume":"adaptive-v13-runs",
+        "/adaptive-v13-report":"adaptive-v13-runs",
+        "/adaptive-v13-provider-test":"adaptive-v13-account",
+        "/adaptive-v13-account-save":"adaptive-v13-account",
+        "/adaptive-v13-watchlist":"adaptive-v13-account",
+    }
+    if path in phase6_paths:
+        return phase6_paths[path]
     if path in {
         "/thermostat",
         "/portfolio-buy",
@@ -3357,12 +3512,66 @@ button {
   background: #f2f5f8;
 }
 h3 span { color: var(--muted); font-weight: 400; }
+.nav-group { display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
+.nav-title { color:var(--muted); font-size:11px; text-transform:uppercase; margin-right:4px; }
+.adaptive-v13 { --ready:#197047; --partial:#9a6700; --failed:#b42318; }
+.strategy-heading { display:flex; justify-content:space-between; align-items:end; margin-bottom:12px; }
+.strategy-heading h2 { margin:2px 0 0; }
+.eyebrow { color:var(--accent); font-size:12px; font-weight:700; }
+.status-chip { border:1px solid var(--line); border-radius:999px; padding:4px 9px; font-weight:700; }
+.status-ready,.status-completed { color:var(--ready); border-color:var(--ready); }
+.status-partial,.status-running,.status-degraded { color:var(--partial); border-color:var(--partial); }
+.status-invalid,.status-failed { color:var(--failed); border-color:var(--failed); }
+.account-summary,.card-grid,.selector-grid,.form-grid { display:grid; gap:10px; }
+.account-summary { grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); margin-bottom:14px; }
+.account-summary div,.metric-card,.panel { background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px; }
+.account-summary span { display:block; color:var(--muted); font-size:11px; }
+.card-grid { grid-template-columns:repeat(3,minmax(0,1fr)); margin-bottom:14px; }
+.selector-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+.form-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+.span-2 { grid-column:span 2; }
+.panel { margin-bottom:14px; }
+.panel h3 { margin-top:0; }
+.table-scroll { max-width:100%; overflow-x:auto; }
+.table-scroll table { width:100%; border-collapse:collapse; font-size:13px; }
+.table-scroll th,.table-scroll td { border-bottom:1px solid var(--line); padding:8px; text-align:left; }
+.actions,.filter-row,.data-summary { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
+.hint,.empty-state { color:var(--muted); }
+.validation,.warning { color:var(--failed); }
+button:disabled { opacity:.45; cursor:not-allowed; }
 @media (max-width: 720px) {
   header, nav { padding-left: 16px; padding-right: 16px; }
   main { padding: 14px 16px 32px; }
   .columns { grid-template-columns: 1fr; }
+  .card-grid,.selector-grid,.form-grid { grid-template-columns:1fr; }
 }
 """
+
+
+def _startup_error_view(error: BaseException) -> ErrorVM:
+    return ErrorVM(
+        title="Phase 6服务初始化失败",
+        action="请检查项目数据目录、账户配置和Provider安装状态后重启。",
+        code="INVALID_CONFIG",
+        detail="",
+        recoverable=False,
+        correlation_id=uuid.uuid4().hex[:16],
+    )
+
+
+def initialize_phase6() -> Phase6Controller | None:
+    """Compose Phase 6 before HTTP startup while preserving legacy pages on failure."""
+    global PHASE6_STARTUP_ERROR
+    try:
+        controller = create_phase6_application(
+            project_root=Path(__file__).resolve().parents[1],
+        )
+    except Exception as exc:
+        PHASE6_STARTUP_ERROR = _startup_error_view(exc)
+        return None
+    configure_phase6(controller)
+    PHASE6_STARTUP_ERROR = None
+    return controller
 
 
 def main() -> None:
@@ -3371,6 +3580,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
 
+    initialize_phase6()
     server = ThreadingHTTPServer((args.host, args.port), WebAppHandler)
     url = f"http://{args.host}:{args.port}"
     print(f"Stock Picker local web app running at {url}")

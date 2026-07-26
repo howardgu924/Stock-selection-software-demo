@@ -1,0 +1,558 @@
+T+1软适应中短期趋势系统 V1.3.17
+Phase 6最终收口修复与Codex执行指令
+版本日期：2026-07-26
+
+一、前置状态
+
+- Phase 5检查点：
+  7f5695cd166cf45027faec057f5455a6c16b0b92
+- Phase 6当前仅暂存，尚未提交
+- Phase 6测试：
+  135 passed
+- 完整项目：
+  1042 passed
+
+V1.3.16最终验收发现：
+- 1项P0
+- 6项P1
+
+本轮只修复这7项，不扩展新的Phase 6需求。
+
+完成后：
+- 只暂存；
+- 不提交Phase 6；
+- 不进入Phase 7；
+- 等待一次极简最终验收。
+
+二、权威规格
+
+执行优先级：
+
+1. V1.3至V1.3.15冻结规格；
+2. V1.3.16 Phase 6完整规格；
+3. 本V1.3.17收口修复。
+
+不得删减或改写V1.3.16。
+
+三、P0：重复点击不得创建两个Run
+
+现有问题：
+
+锁在create_backtest之后，以新生成的run_id为键，无法阻止同一READY snapshot连续创建run-1、run-2。
+
+必须修复：
+
+1. 新增确定性SubmissionFingerprint：
+
+SHA256(
+  account_snapshot_id
+  + universe_input_hash
+  + date_range_input_hash
+  + data_snapshot_id
+  + run_mode
+  + strategy_version
+  + normalized overrides
+)
+
+2. 在create_run之前获取锁。
+
+锁范围必须覆盖：
+
+- 输入重新验证；
+- create_run；
+- execute_run首次启动；
+- 最终返回run_id。
+
+3. 锁键使用：
+
+submission_fingerprint
+
+不得使用新生成的run_id。
+
+4. 持久层新增防重复约束：
+
+- submission_token或submission_fingerprint；
+- 同一活动提交只允许一个run；
+- COMPLETED、RUNNING、CREATED和可恢复FAILED状态均返回已有run_id；
+- 明确“重新运行”操作才生成新的submission_token。
+
+5. HTTP POST必须带一次性operation_token或Idempotency-Key。
+
+同一个token重复提交：
+
+- 不创建第二个run；
+- 返回原run_id和当前状态。
+
+6. 浏览器端按钮在提交后禁用只是辅助，不能作为唯一防重。
+
+7. 并发测试：
+
+- 两线程同时提交同一输入；
+- 只能创建一个run；
+- 两个响应返回同一run_id。
+
+8. 回归测试：
+
+- 连续两次同POST；
+- 页面刷新后浏览器重发；
+- 网络超时后重试；
+- 不同输入允许创建不同run；
+- 明确“重新运行”生成新token后允许新run。
+
+四、P1-1：默认网页入口必须正式装配Phase 6
+
+现有问题：
+
+直接运行examples/web_app.py时PHASE6_CONTROLLER为None，main()未调用configure_phase6，全部POST返回“服务尚未配置”。
+
+必须修复：
+
+1. 新增正式应用工厂，例如：
+
+create_phase6_application(...)
+或
+build_phase6_controller_from_config(...)
+
+2. 工厂必须创建并装配：
+
+- AccountProfileStore；
+- ProviderRegistry；
+- Phase 5 Service；
+- MarketCache；
+- RunStore；
+- report目录；
+- data目录；
+- Provider优先级；
+- 必要的数据读取适配器；
+- Phase6Controller。
+
+3. main()启动服务器前必须调用工厂并执行：
+
+configure_phase6(controller)
+
+4. 配置来源：
+
+- 项目现有配置；
+- 环境变量；
+- 默认项目数据目录。
+
+不得要求用户手工修改Python文件。
+
+5. 启动失败：
+
+- 服务器不得以“Phase 6看似可用但全部POST失败”的状态启动；
+- 应输出结构化启动错误；
+- 新页面显示“服务初始化失败”；
+- 旧页面仍可访问。
+
+6. 默认路径必须为绝对路径，不依赖CWD。
+
+7. 测试：
+
+- 直接调用main或应用工厂；
+- PHASE6_CONTROLLER非None；
+- 六个页面GET可访问；
+- 缓存预览POST不返回“服务尚未配置”；
+- 缺配置时返回明确启动错误；
+- 旧页面仍可打开。
+
+五、P1-2：DAILY_PAPER必须使用权威初始状态
+
+现有问题：
+
+控制器自行构造的状态缺少exit_controls和fill_requests，与RunStore初始checkpoint哈希不一致。
+
+必须修复：
+
+1. 控制器不得自行拼装DAILY_PAPER初始状态。
+
+2. create_daily_paper_run必须调用Phase 5权威服务：
+
+- create_run；
+- load_initial_runtime_state
+  或
+- create_run直接返回canonical_initial_state。
+
+3. canonical_initial_state必须完整包含：
+
+- cash；
+- positions；
+- exit_controls；
+- pending_sells；
+- cooldowns；
+- fill_requests；
+- account_snapshot_id；
+- universe_snapshot_id；
+- data_snapshot_id；
+- event cursor；
+- price_basis_id。
+
+4. 控制器返回给execute_run的状态必须与RunStore初始checkpoint逐字段一致。
+
+5. 哈希必须由Phase 5统一生成，Phase 6不得复制规范化算法。
+
+6. 测试：
+
+- DAILY_PAPER创建后控制器状态hash等于checkpoint hash；
+- 包含空exit_controls和fill_requests字段；
+- 有现有模拟持仓时状态一致；
+- Pending/Cooldown存在时状态一致；
+- 不再触发initial_state_differs_from_snapshot。
+
+六、P1-3：Provider Registry必须反映真实适配器
+
+现有问题：
+
+Provider版本硬编码installed，检测全部probe_not_configured，Fallback仅按频率计数。
+
+必须修复：
+
+1. ProviderDescriptor必须从实际Provider实例生成。
+
+字段至少来自真实适配器：
+
+- provider_name；
+- source_version；
+- supported_dataset_types；
+- supported_frequencies；
+- adjustment_modes；
+- timezone；
+- historical_range；
+- supports_rules；
+- supports_suspension；
+- supports_limit_prices；
+- supports_industry；
+- configured；
+- enabled；
+- priority。
+
+2. 不得用installed作为通用版本。
+
+版本来源优先级：
+
+- provider.source_version；
+- provider.__version__；
+- 所属包版本；
+- 明确unknown。
+
+3. 连接检测必须调用Provider只读探针：
+
+- ping；
+- health_check；
+- fetch最小只读样本；
+- 不写缓存；
+- 有超时；
+- 返回AVAILABLE、UNAVAILABLE或TIMEOUT。
+
+4. 没有探针的Provider：
+
+- status=UNSUPPORTED_PROBE；
+- 不应统一显示UNAVAILABLE。
+
+5. Fallback成立条件：
+
+至少两个Provider同时满足：
+
+- configured=true；
+- enabled=true；
+- 支持相同dataset_type；
+- 支持相同frequency；
+- 支持相同price_basis；
+- 能覆盖请求历史范围。
+
+不得只按frequency计数。
+
+6. Sina等实时源不得显示为历史5分钟完整Provider，除非实际适配器明确支持。
+
+7. Provider优先级保存到账户并传给Phase 5。
+
+8. 测试使用真实适配器对象或严格fixture，不访问公网。
+
+七、P1-4：页面刷新必须重新验证Snapshot并恢复真实选择器状态
+
+现有问题：
+
+GET只读内存READY；Watchlist模式仍显示手动框；预设日期仍显示自定义日期；select未恢复选中值。
+
+必须修复：
+
+1. 每次以下页面GET：
+
+- 数据缓存；
+- 回测；
+- DAILY_PAPER；
+
+都必须：
+
+- 从session读取snapshot_id；
+- 调用controller.validate_snapshot；
+- 重新计算当前输入hash；
+- 与snapshot绑定hash比较。
+
+2. 验证失败或不匹配：
+
+- 清除session中的READY状态；
+- 保留snapshot_id仅作历史信息；
+- 禁用Run；
+- 显示“输入已变化，需要重新缓存”。
+
+3. UI选择器必须从session/ViewModel恢复：
+
+- source mode selected；
+- watchlist selected；
+- market scopes selected；
+- date preset selected；
+- custom dates；
+- manual symbols。
+
+4. 条件显示：
+
+- 仅MANUAL或COMBINED包含MANUAL时显示手动输入；
+- 仅CUSTOM显示开始/结束日期；
+- WATCHLIST模式不显示手动框；
+- 预设日期不显示自定义日期。
+
+5. 不允许仅凭：
+
+READY + snapshot_id
+
+启用Run。
+
+6. 测试：
+
+- READY后刷新仍重新验证；
+- Watchlist选中保持；
+- 最近6个月选中保持；
+- 手动框隐藏；
+- 自定义框隐藏；
+- 修改Provider覆盖后旧snapshot失效；
+- 修改账户后旧snapshot失效；
+- 修改price_basis后旧snapshot失效。
+
+八、P1-5：Run筛选和恢复入口必须真正接通
+
+现有问题：
+
+list_runs固定page_size=20，忽略GET参数；恢复处理分支存在但页面没有表单。
+
+必须修复：
+
+1. 运行记录GET解析并校验：
+
+- mode；
+- status；
+- date_from；
+- date_to；
+- account；
+- strategy_version；
+- has_open_positions；
+- degraded；
+- page；
+- page_size。
+
+2. 将筛选参数传给controller.list_runs。
+
+3. page_size设置合理上限，例如100，禁止无限加载。
+
+4. UI必须恢复筛选选中状态。
+
+5. 可恢复FAILED run必须显示恢复按钮。
+
+可恢复条件必须来自Phase 5权威状态，而非字符串猜测。
+
+6. 恢复表单提交到真实路由：
+
+/adaptive-v13-resume
+
+并带：
+
+- run_id；
+- operation_token；
+- CSRF或本地等价请求令牌（如现有框架已有机制则复用）。
+
+7. 重复恢复点击：
+
+- 返回同一个恢复操作；
+- 不发起两个resume。
+
+8. 恢复完成后重定向到Run详情并重新加载状态。
+
+9. 测试：
+
+- mode/status/date筛选实际生效；
+- 页码和page_size实际生效；
+- 恢复按钮只出现在可恢复run；
+- POST路由可达；
+- 双击恢复防重；
+- 不可恢复run不显示按钮。
+
+九、P1-6：所有POST异常必须经过ErrorMapper
+
+现有问题：
+
+web_app.py直接把str(exc)输出到HTML，可能泄露SQL和本地路径。
+
+必须修复：
+
+1. 所有Phase 6 POST处理统一使用：
+
+controller.get_error_view(...)
+或
+Phase6ErrorMapper
+
+2. 禁止：
+
+html_escape(str(exc))
+
+直接作为用户错误正文。
+
+3. ErrorVM只允许展示：
+
+- 稳定code；
+- 中文标题；
+- 用户处理建议；
+- 已清洗详情；
+- correlation_id。
+
+4. 默认清洗：
+
+- SQL语句；
+- C:\路径；
+- /home/...路径；
+- 数据库文件名；
+- Python堆栈；
+- 环境变量；
+- token；
+- Cookie；
+- API key。
+
+5. 原始异常仅写入安全服务端日志，且敏感信息仍需脱敏。
+
+6. GET、POST、下载和恢复路由使用同一错误映射。
+
+7. 未识别异常：
+
+code=UNEXPECTED_ENGINE_ERROR
+
+8. 测试：
+
+- 异常包含SELECT语句；
+- 异常包含Windows路径；
+- 异常包含Linux路径；
+- 异常包含API key和Cookie；
+- HTML不包含原文；
+- 页面包含稳定code、中文标题和处理建议；
+- 技术详情默认折叠。
+
+十、允许修改
+
+允许：
+
+- examples/web_app.py
+- phase6_controller.py
+- phase6_web.py
+- phase6_models.py
+- phase6_provider_registry.py
+- phase6_profile_store.py
+- phase5_service.py，仅限Phase 6所需权威接口
+- Phase 6测试
+- 必要的配置/应用工厂文件
+- V1.3.17规格
+- __init__.py
+
+必要时可新增：
+
+- phase6_app_factory.py
+- phase6_idempotency.py
+- phase6_security.py
+
+十一、禁止修改
+
+不得修改：
+
+- Phase 1—4B冻结算法；
+- Phase 5运行算法和事务语义；
+- 旧恒温器；
+- 旧事件回测；
+- 旧数据库表；
+- QMT或券商；
+- 自动调度；
+- 实盘按钮；
+- 强制期末平仓；
+- 滑点、容量、部分成交、排队或追价。
+
+十二、必须新增综合测试
+
+至少新增：
+
+1. 同输入连续POST两次只创建一个run。
+2. 两线程并发只创建一个run。
+3. 网络重试使用同operation_token返回同run_id。
+4. 默认启动正式装配Phase 6。
+5. DAILY_PAPER初始状态与checkpoint哈希一致。
+6. Provider descriptor来自真实适配器。
+7. Provider只读检测不写缓存。
+8. Fallback按dataset+frequency+price_basis+configured判断。
+9. READY页面刷新重新验证。
+10. Watchlist和日期选中状态恢复。
+11. 条件字段正确隐藏。
+12. Run筛选实际传递。
+13. 恢复按钮和路由可达。
+14. 双恢复防重。
+15. POST异常不泄露SQL或路径。
+16. Phase 1—5测试继续通过。
+17. Phase 6测试明显高于135。
+18. 完整项目明显高于1042。
+19. 不删除或降低旧测试。
+
+十三、运行与暂存
+
+运行：
+
+- Phase 1：80项
+- Phase 2：93项
+- Phase 3：130项
+- Phase 4A：103项
+- Phase 4B：102项
+- Phase 5：216项
+- Phase 6全部测试
+- 完整项目测试
+- python -m compileall -q stock_picker tests
+- git diff --check
+- git diff --cached --check
+- git status --short
+
+暂存：
+
+- 修复代码；
+- 新增/修改测试；
+- 必要配置；
+- V1.3.16；
+- 本V1.3.17。
+
+三个只读验收说明文件继续保持未跟踪，不得提交。
+
+不提交Phase 6，不进入Phase 7。
+
+十四、完成报告
+
+报告必须包含：
+
+1. 修改文件和行号；
+2. submission_fingerprint和operation_token防重；
+3. 并发重复提交结果；
+4. 默认应用工厂装配；
+5. DAILY_PAPER权威初始状态；
+6. 真实Provider descriptor、probe和Fallback；
+7. Snapshot刷新验证和选择器恢复；
+8. Run筛选与恢复路由；
+9. ErrorMapper清洗结果；
+10. 修改的旧测试；
+11. 新增测试函数和pytest实例数；
+12. Phase 1—6测试结果；
+13. 完整项目结果；
+14. compileall和Git检查；
+15. 是否修改禁止模块；
+16. 未解决问题。
+
+完成后停止，等待一次极简最终验收；不提交、不进入Phase 7。

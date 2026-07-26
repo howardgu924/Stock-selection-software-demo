@@ -1,0 +1,685 @@
+T+1软适应中短期趋势系统 V1.3.16
+Phase 6网页端、真实数据接入与运行管理
+一次性完整规格与Codex执行指令
+版本日期：2026-07-25
+
+一、前置检查点
+
+Phase 5已提交：
+- SHA：7f5695cd166cf45027faec057f5455a6c16b0b92
+- 提交信息：feat: add adaptive trend phase5 runtime and persistence
+- 完整测试：907 passed
+- 分支：codex/feature/t1-adaptive-trend-v1.3
+- 已跟踪工作区干净
+
+两个只读验收说明文件继续保持未跟踪，不得加入Phase 6。
+
+本轮一次性完成Phase 6。完成后只暂存，不提交，不进入Phase 7。
+
+二、目标与边界
+
+Phase 6把Phase 1—5接入现有网页应用，形成可实际使用的本地研究和模拟运行系统。
+
+本轮实现：
+1. 新策略导航和统一页面设计；
+2. 账户设置及自选股管理；
+3. Provider注册、能力展示和连接检测；
+4. 统一股票池组件；
+5. 统一日期范围组件；
+6. 一键缓存并验证；
+7. 回测创建、执行、状态和恢复；
+8. DAILY_PAPER手动运行；
+9. Run历史、详情、审计和数据覆盖；
+10. Excel、JSON和JSONL报告下载；
+11. 错误、空状态和加载状态；
+12. 旧系统隔离兼容；
+13. QMT和自动调度接口预留。
+
+不实现：
+- QMT或券商下单；
+- 自动交易和后台调度；
+- 手机审批和推送；
+- 多用户权限；
+- 云部署；
+- 新策略公式或加仓；
+- 强制期末平仓；
+- UI直接访问SQLite；
+- UI复制Phase 1—5逻辑；
+- 滑点、容量、部分成交、排队和追价。
+
+三、强制架构
+
+Web UI
+→ Phase 6 Controller/ViewModel
+→ Phase 5 Service
+→ Phase 1—5和RunStore/MarketCache
+
+禁止UI直接查表或写表。禁止UI自己实现DateRange、Universe、评分、仓位、退出、缓存命中或报告指标。
+
+继续使用现有网页框架。如果当前是Streamlit，继续使用Streamlit和现有测试工具，不迁移React/Vue，不新增前端构建链。
+
+四、建议页面
+
+在“自适应趋势 V1.3”导航组中提供：
+
+1. 总览
+2. 数据缓存
+3. 回测
+4. 每日模拟
+5. 运行记录
+6. 账户与设置
+
+旧恒温器、旧选股和旧回测不删除，归入“旧版/实验功能”。新旧session key、路由和状态命名隔离。
+
+页面切换应保留当前账户、UniverseSpec、DateRangeSpec、READY data_snapshot_id和run_id；业务事实仍从服务和数据库重新读取。
+
+五、统一视觉
+
+要求：
+- 页面整洁，不出现超长纵向表单；
+- 必填星号与标题同行；
+- 帮助优先悬浮提示或行内说明；
+- 普通选择不使用弹窗；
+- 删除、覆盖、重置才确认；
+- 表格允许横向滚动；
+- 最低1024px桌面可用；
+- 设计Token集中管理，不在页面复制CSS。
+
+统一状态：READY、PARTIAL、INVALID、FAILED、RUNNING、DEGRADED、COMPLETED、OPEN_POSITIONS。颜色只能辅助，必须同时显示文字。
+
+六、账户摘要和账户页
+
+所有新策略页面顶部显示紧凑账户摘要栏：
+- 账户名称；
+- 模式；
+- 回测初始资金；
+- 模拟现金；
+- 模拟持仓数；
+- 费用方案；
+- Provider优先级；
+- 数据目录状态；
+- 最近数据准备状态。
+
+账户页按分组或标签显示：
+1. 概览
+2. 资金与费用
+3. 数据源与目录
+4. 自选股组合
+5. 维护与诊断
+
+账户是以下默认值唯一来源：
+backtest_initial_cash、paper_cash、fee_schedule、base_currency、provider_priority、data_directory、report_directory、默认Watchlist/Universe。
+
+回测页只显示“来自账户设置”的只读摘要，不要求全部重填。
+
+允许“本次运行覆盖”，默认关闭，至少可覆盖：
+- 初始现金；
+- Provider优先级；
+- 报告目录。
+
+覆盖不回写账户，除非明确点击“保存为默认”。金额输入按十进制字符串交给控制器，禁止float和bool。
+
+七、自选股组合
+
+自选股管理只放在“账户与设置”。
+
+支持：
+- 新建；
+- 重命名；
+- 批量粘贴；
+- 添加/删除代码；
+- 复制；
+- 删除；
+- 设为默认；
+- 查看规范化结果和无效代码。
+
+使用Phase 5 Universe解析，不在UI实现第二套规范化。历史RunSnapshot不受后来修改影响。
+
+旧恒温器页和回测页不得再出现“保存手动股票池”。
+
+八、统一股票池组件
+
+数据缓存和回测必须复用同一个UniverseSelector和UniverseSpec序列化。
+
+来源：
+1. 手动输入
+2. 自选股组合
+3. 市场范围
+4. 组合来源
+
+手动输入：
+- 只有选择后显示；
+- 支持多行、逗号、空格和分号；
+- 显示原始、规范化、重复和无效数量。
+
+自选股：
+- 显示现有组合名称和证券数量；
+- 不要求输入组合ID。
+
+市场范围：
+- 必须多选；
+- 选项从市场主数据或服务读取，不在页面写死重复业务逻辑。
+
+组合来源：
+- 可组合手动、自选股和市场范围；
+- 最终交给resolve_universe。
+
+提供“预览股票池”，显示candidate、required、自动加入持仓、自动加入基准、无效和冲突。用户不得直接编辑required_symbols。
+
+九、统一日期组件
+
+数据缓存和回测复用同一个DateRangeSelector和DateRangeSpec。
+
+预设：
+- 最近1个月；
+- 最近3个月；
+- 最近6个月；
+- 最近1年；
+- 最近2年；
+- 最近3年；
+- 最近5年；
+- 自定义。
+
+只有自定义显示开始和结束日期。
+
+展示：
+- 请求范围；
+- 实际交易日范围；
+- 320交易日预热范围；
+- 预计交易日数量。
+
+必须调用Phase 5 resolve_date_range，缓存页和回测页不得分别计算。
+
+十、Provider注册与检测
+
+把现有Provider接入ProviderRegistry。
+
+每个Provider展示：
+- 名称和source_version；
+- 可用状态；
+- 支持数据类型和频率；
+- 历史范围；
+- 时区和price_basis；
+- 是否支持日线、5分钟、停牌、涨跌停、行业和规则；
+- 最近检测时间和错误。
+
+检查并复用现有BaoStock、AkShare、Sina及其他适配器，但不得假设每个Provider支持全部频率。实时源不得冒充历史源。
+
+Fallback只有在实际配置两个以上支持同一分区的Provider时才显示。缓存回退仍由Phase 5执行。
+
+账户页提供“检测数据源”：
+- 有超时；
+- 不写缓存；
+- 返回结构化结果；
+- 不记录密钥、Cookie或凭证。
+
+测试全部使用fixture/mock，不访问真实网络。
+
+十一、数据缓存页面
+
+区域：
+1. 股票池
+2. 日期范围
+3. 数据需求摘要
+4. 缓存操作
+5. DataReadiness
+6. Provider和分区详情
+
+按钮：
+- 预览数据需求
+- 缓存并验证数据
+
+不得同时出现“时间范围”和重复的开始/结束日期。
+
+点击缓存：
+1. resolve_run_inputs；
+2. prepare_market_cache；
+3. 显示进度阶段；
+4. 取得data_snapshot_id；
+5. 展示READY/PARTIAL/INVALID/FAILED；
+6. READY snapshot保存到页面状态；
+7. 可跳转回测并复用相同输入和snapshot。
+
+DataReadiness摘要：
+candidate数、required数、交易日、预热日、完整/部分/非法/失败分区、Provider、price_basis、snapshot。
+
+详细表：
+symbol、dataset_type、请求范围、覆盖范围、缺失日、row_count、completeness、Provider、reason。
+
+snapshot ID仅在高级信息显示。
+
+相同输入重新打开时必须通过服务重新验证。输入变化后旧snapshot立即标记不匹配。
+
+十二、回测页面
+
+区域：
+1. 账户摘要
+2. 股票池
+3. 日期范围
+4. 数据状态
+5. 本次运行设置
+6. 运行操作
+7. 最近结果
+
+运行按钮仅在以下全部成立时启用：
+- DataReadiness=READY；
+- snapshot与当前UniverseSpec、DateRangeSpec和AccountSnapshot一致；
+- price_basis一致。
+
+未READY时提供“缓存并验证数据”，禁止运行时临时联网补数据。
+
+默认继承账户的资金、费用、Provider、数据和报告目录。
+
+点击运行：
+1. 重新验证输入hash；
+2. 创建RunConfig；
+3. create_run；
+4. execute_run；
+5. 展示run_id和状态；
+6. 完成后进入Run详情。
+
+本阶段同步执行。运行中禁止重复点击；UI锁和Phase 5防重同时生效。
+
+FAILED时显示error code、可读message、失败事件、时间、可恢复状态和恢复按钮。默认不显示完整堆栈。
+
+十三、每日模拟
+
+只实现手动DAILY_PAPER，不实现调度。
+
+显示：
+- 模拟现金；
+- 当前持仓；
+- sellable_qty；
+- today_bought_qty；
+- PendingSell；
+- Cooldown；
+- 数据状态；
+- 交易日；
+- 最近run。
+
+按钮：
+- 准备当日数据
+- 运行当日模拟
+- 恢复失败运行
+- 查看结果
+
+当前持仓自动加入required_symbols。使用paper_cash和模拟持仓。页面明确显示“模拟运行，不会向券商发送订单”。
+
+不得显示实盘下单或连接券商按钮。
+
+十四、运行记录
+
+通过Phase 5 list_runs。
+
+筛选：
+- 模式；
+- 状态；
+- 日期；
+- 账户；
+- 策略版本；
+- 是否开放持仓；
+- 是否DEGRADED。
+
+列表：
+run ID短显示、模式、日期范围、创建/完成时间、状态、总收益、最大回撤、成交数、开放持仓数、数据警告、报告状态。
+
+使用分页或分段加载。
+
+十五、Run详情
+
+顶部：
+状态、策略版本、Git SHA、模式、日期范围、账户、data snapshot、price_basis、开始/完成时间。
+
+摘要指标：
+Starting/Ending Equity、Total/Annualized Return、Max Drawdown、Sharpe、Average Exposure、Total Fees、买卖次数、开放持仓数。
+
+标签页：
+1. 权益与基准
+2. 成交
+3. 订单与失败
+4. 每日持仓
+5. 候选与评分
+6. 退出与Pending
+7. 冷却期
+8. 数据覆盖
+9. 审计与警告
+10. 报告下载
+
+图表：
+- 权益；
+- 40/40/20基准；
+- 回撤；
+- 实际仓位；
+- 持仓数量。
+
+UI只展示Phase 5数据，不重新计算指标。
+
+十六、报告下载
+
+提供：
+- backtest_report.xlsx
+- run_manifest.json
+- run_config.json
+- audit_log.jsonl
+- data_readiness.json
+
+必须从report manifest读取。文件缺失、SHA不符或路径不在白名单时禁止下载。
+
+禁止`../`路径穿越。下载不得任意读取报告目录外文件。
+
+十七、恢复
+
+可恢复FAILED run显示“恢复运行”。
+
+恢复时：
+- 不要求用户重新输入snapshot；
+- 调用Phase 5 resume_run；
+- 显示恢复起点；
+- 防止重复点击；
+- 成功后刷新状态；
+- 失败时保留真实FAILED状态。
+
+十八、错误映射
+
+建立统一中文ErrorMapper，覆盖：
+INVALID_CONFIG、INVALID_UNIVERSE、INVALID_DATE_RANGE、INSUFFICIENT_WARMUP、DATA_NOT_READY、PARTIAL_CACHE、INVALID_PARTITION、PROVIDER_FAILED、RULE_SNAPSHOT_MISSING、FEE_SNAPSHOT_MISSING、PRICE_BASIS_MISMATCH、LOOKAHEAD_ACCESS、DUPLICATE_EVENT、DUPLICATE_FILL、LEDGER_CONFLICT、STATE_VERSION_CONFLICT、SCHEMA_VERSION_MISMATCH、RUN_FINGERPRINT_MISMATCH、REPORT_WRITE_FAILED、MISSING_MARK_PRICE、UNEXPECTED_ENGINE_ERROR。
+
+每个错误显示：
+- 标题；
+- 用户处理方法；
+- 技术code；
+- 可展开详情。
+
+默认不得暴露SQL、内部路径和完整堆栈。
+
+十九、状态与安全
+
+每个页面必须有空状态、加载状态和失败状态。刷新后事实从服务重新加载。
+
+不得在页面、日志和下载中暴露密码、API密钥、Cookie、券商凭证或敏感环境变量。
+
+本地应用不新增登录系统。
+
+二十、QMT和调度预留
+
+可新增：
+ExecutionBackend.PAPER
+ExecutionBackend.FUTURE_QMT
+
+当前只能选择PAPER。FUTURE_QMT不显示为可用，不连接、不发送订单、不要求账号。
+
+自动运行本阶段不实现，不提供假可用开关。
+
+二十一、旧系统兼容
+
+必须保证：
+- 旧页面继续打开；
+- 旧恒温器参数不变；
+- 旧数据库表不改；
+- 新CSS不破坏旧页面；
+- 新账户设置不静默覆盖旧语义；
+- 新页面不调用旧策略；
+- session key隔离。
+
+二十二、控制器接口
+
+至少封装：
+load_account_summary
+save_account_settings
+list_watchlists
+save_watchlist
+delete_watchlist
+preview_universe
+resolve_date_range
+inspect_provider_status
+test_provider_connections
+prepare_cache
+validate_snapshot
+create_backtest
+execute_run
+create_daily_paper_run
+resume_run
+list_runs
+load_run_detail
+generate_report
+list_report_files
+validate_report_file
+get_error_view
+
+页面不得直接SQL。
+
+二十三、冻结ViewModel
+
+至少：
+AccountSummaryVM
+UniverseSelectionVM
+DateRangeVM
+ProviderStatusVM
+CacheProgressVM
+DataReadinessVM
+RunListItemVM
+RunSummaryVM
+RunDetailVM
+ReportFileVM
+ErrorVM
+
+不得持有数据库连接或外部可变DataFrame。列表使用tuple，金额Decimal或格式化字符串，时间明确时区。
+
+二十四、缓存和回测输入一致性
+
+关键验收：
+
+1. 缓存和回测使用同一UniverseSpec；
+2. 使用同一DateRangeSpec；
+3. 使用同一AccountProfile；
+4. READY后获得data_snapshot_id；
+5. 回测复用snapshot；
+6. 运行前重新计算输入hash；
+7. hash必须与snapshot匹配。
+
+股票池、日期、账户、Provider覆盖或price_basis任一变化：
+- 旧snapshot显示不匹配；
+- Run按钮禁用；
+- 必须重新缓存。
+
+二十五、测试要求
+
+不得访问真实网络。使用fixture Provider、临时SQLite、临时目录、Phase 5真实Service和现有UI测试客户端。
+
+至少覆盖以下类别：
+
+A 导航/布局
+- 六个新页面；
+- 旧页面可用；
+- session隔离；
+- 账户摘要栏；
+- 账户分组；
+- 统一Token；
+- 动态表单；
+- 非必要弹窗不存在。
+
+B Universe
+- 手动输入动态显示；
+- Watchlist名称选项；
+- MarketScope多选；
+- Combined；
+- 规范化、别名、无效项；
+- 持仓只加入required；
+- 基准自动加入；
+- 缓存和回测序列化一致。
+
+C 日期
+- 1/3/6个月、1/2/3/5年和自定义；
+- 自定义日期框条件显示；
+- 反向日期；
+- 320日预热；
+- 两页面一致。
+
+D 账户/Watchlist
+- 默认值；
+- 回测不重复填账户参数；
+- 单次覆盖；
+- 覆盖不回写；
+- Watchlist CRUD、复制、默认和批量粘贴；
+- 历史snapshot不受修改影响；
+- 旧页面不出现新保存入口。
+
+E Provider
+- 能力展示；
+- 日线/5分钟区分；
+- 实时源不冒充历史源；
+- Fallback真实性；
+- 成功/失败/超时；
+- 检测不写缓存；
+- 无真实网络。
+
+F 缓存
+- preview；
+- Phase 5服务调用；
+- READY/PARTIAL/INVALID/FAILED；
+- 进度；
+- 分区和Provider表；
+- 缺失日；
+- 同输入复用；
+- 输入变化失效；
+- 跳转回测复用；
+- 刷新重新验证。
+
+G 回测
+- 未READY禁用；
+- hash一致启用；
+- 账户/Universe/Date不匹配禁用；
+- 默认摘要；
+- FORBID显示；
+- create/execute；
+- 防重复；
+- 成功跳转；
+- FAILED和恢复；
+- 无直接SQLite和无策略重算。
+
+H DAILY_PAPER
+- 模拟标识；
+- paper_cash；
+- 持仓和sellable；
+- 当前持仓加入required；
+- 数据门禁；
+- 无实盘按钮；
+- Pending/Cooldown；
+- 无调度。
+
+I Run详情
+- 筛选、分页；
+- 指标；
+- 五类图表；
+- 成交、失败、持仓、评分、Pending、Cooldown、数据、审计表；
+- 开放持仓和DEGRADED。
+
+J 下载
+- 五类文件；
+- manifest来源；
+- 文件缺失、SHA错误和路径穿越；
+- Excel/JSON/JSONL。
+
+K 恢复/错误
+- resume；
+- 防双击；
+- 不要求snapshot；
+- 成功刷新；
+- 失败不假完成；
+- 所有错误码；
+- 空/加载/失败状态；
+- 刷新来自服务。
+
+L 安全/兼容
+- 凭证不显示；
+- 任意SQL禁止；
+- 旧表不变；
+- CSS兼容；
+- FUTURE_QMT不可选；
+- 无自动交易。
+
+M 端到端
+1. 创建账户；
+2. 创建Watchlist；
+3. 选择最近6个月；
+4. 缓存READY；
+5. 跳转回测复用输入；
+6. 完成BACKTEST；
+7. 查看摘要和交易；
+8. 下载Excel和manifest；
+9. FAILED恢复；
+10. 刷新后仍能读取；
+11. DAILY_PAPER手动运行；
+12. 输入变化强制重新缓存；
+13. Provider回退展示；
+14. SHA错误阻止下载；
+15. 全流程UI不直接访问数据库。
+
+回归：
+- Phase 1：80 passed
+- Phase 2：93 passed
+- Phase 3：130 passed
+- Phase 4A：103 passed
+- Phase 4B：102 passed
+- Phase 5：216 passed
+- 当前完整项目907项不得回归
+- Phase 6至少新增110个pytest实例
+- compileall、diff和禁止模块检查通过
+
+二十六、Codex执行要求
+
+1. 读取V1.3至V1.3.16全部规格和当前代码。
+2. 识别现有网页框架、入口、账户、Watchlist和Provider。
+3. 继续使用现有技术栈。
+4. 不重写Phase 5。
+5. UI不直接访问数据库。
+6. 不复制Universe和DateRange逻辑。
+7. 不在UI重新计算策略指标。
+8. Provider测试不联网。
+9. 不删除或降低Phase 1—5测试。
+10. 不新增不必要依赖。
+11. 一次性完成全部范围，不中途交半套。
+12. 完成全部实现、测试和暂存后统一汇报。
+
+二十七、运行与暂存
+
+运行：
+- Phase 1—6各阶段测试；
+- 完整项目测试；
+- python -m compileall -q stock_picker tests；
+- git diff --check；
+- git diff --cached --check；
+- git status --short。
+
+暂存：
+- Phase 6代码；
+- 必要迁移；
+- Phase 6测试；
+- 本V1.3.16规格。
+
+不得暂存两个只读验收说明。不得提交Phase 6，不进入Phase 7。
+
+二十八、完成报告
+
+必须包含：
+1. 网页框架和入口；
+2. 文件和行号；
+3. 导航和页面；
+4. Universe和Date组件；
+5. 账户与Watchlist；
+6. Provider；
+7. 缓存页；
+8. 回测；
+9. DAILY_PAPER；
+10. Run列表与详情；
+11. 下载和SHA；
+12. 错误映射；
+13. 安全与兼容；
+14. 新测试函数和pytest实例；
+15. Phase 1—6结果；
+16. 完整项目；
+17. compileall和Git检查；
+18. 禁止模块；
+19. 未解决问题。
+
+完成后停止，等待只读验收；不提交、不进入Phase 7。

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
+import json
 from pathlib import Path
 import subprocess
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -26,7 +28,7 @@ from .run_orchestrator import (
 )
 from .run_recovery import resume_run as resume_runtime_run
 from .run_reporting import generate_run_report as build_report
-from .run_store import RunStore, stable_hash
+from .run_store import RunStore, canonical_json, stable_hash
 from .universe_resolver import resolve_universe
 
 
@@ -243,7 +245,7 @@ class Phase5Service:
         self, *, profile_id: str, mode: RunMode | str,
         universe_snapshot: UniverseSnapshot, data_snapshot: DataSnapshot,
         date_range, initial_position_policy: str = "EMPTY", paper_positions=(),
-        initial_portfolio=None,
+        initial_portfolio=None, initial_runtime_state: Mapping[str, Any] | None = None,
     ) -> tuple[str, RunConfig, Any]:
         profile = self._profile(profile_id)
         data_directory,report_directory = validate_profile_paths(profile)
@@ -271,10 +273,94 @@ class Phase5Service:
             self.run_store,config,
             {"account":account,"universe":universe_snapshot,"data":data_snapshot},
         )
+        if initial_runtime_state is not None:
+            state = self._canonical_initial_runtime_state(account, initial_runtime_state)
+            with self.run_store.transaction() as connection:
+                cursor = connection.execute(
+                    """UPDATE adaptive_v13_run_checkpoints
+                    SET state_json=?,state_hash=?
+                    WHERE run_id=? AND event_id='__INITIAL__'""",
+                    (canonical_json(state),stable_hash(state),run_id),
+                )
+                if cursor.rowcount != 1:
+                    raise Phase5Error("STATE_VERSION_CONFLICT", "initial_checkpoint_missing")
         self.run_store.import_cache_audits(
             run_id,self.cache.audit_rows(data_snapshot.preparation_id)
         )
         return run_id,config,account
+
+    @staticmethod
+    def _canonical_initial_runtime_state(account, source: Mapping[str, Any]) -> dict[str, Any]:
+        """Phase 5 owns the one canonical normalization used by checkpoint and caller."""
+        positions = dict(account.positions)
+        return {
+            "cash": account.cash,
+            "positions": positions,
+            "pending_sells": dict(source.get("pending_sells") or {}),
+            "exit_controls": dict(source.get("exit_controls") or {}),
+            "cooldowns": dict(source.get("cooldowns") or {}),
+            "fill_requests": tuple(source.get("fill_requests") or ()),
+        }
+
+    def preview_account_snapshot(
+        self, *, profile_id: str, mode: RunMode | str,
+        paper_positions=(), initial_portfolio=None,
+    ):
+        """Return the same immutable account snapshot used by ``create_run``."""
+        profile = self._profile(profile_id)
+        validate_profile_paths(profile)
+        return create_account_snapshot(
+            profile, mode, paper_positions=paper_positions,
+            initial_portfolio=initial_portfolio,
+        )
+
+    def load_initial_runtime_state(self, run_id: str) -> dict[str, Any]:
+        """Load and verify the authoritative initial checkpoint created by Phase 5."""
+        checkpoint = self.run_store.last_checkpoint(run_id)
+        if checkpoint is None or checkpoint["event_id"] != "__INITIAL__":
+            raise Phase5Error("STATE_VERSION_CONFLICT", "initial_checkpoint_missing")
+        state = json.loads(checkpoint["state_json"])
+        if stable_hash(state) != checkpoint["state_hash"]:
+            raise Phase5Error("RUN_FINGERPRINT_MISMATCH", "initial_checkpoint_corrupt")
+        from .run_recovery import (
+            _hydrate_control, _hydrate_cooldown, _hydrate_pending, _hydrate_state,
+        )
+        hydrated = _hydrate_state(state)
+        hydrated["pending_sells"] = {
+            symbol:_hydrate_pending(value)
+            for symbol,value in dict(state.get("pending_sells",{})).items()
+        }
+        hydrated["exit_controls"] = {
+            symbol:_hydrate_control(value)
+            for symbol,value in dict(state.get("exit_controls",{})).items()
+        }
+        hydrated["cooldowns"] = {
+            symbol:_hydrate_cooldown(value)
+            for symbol,value in dict(state.get("cooldowns",{})).items()
+        }
+        if stable_hash(hydrated) != checkpoint["state_hash"]:
+            raise Phase5Error("RUN_FINGERPRINT_MISMATCH", "initial_hydration_changed_state")
+        return hydrated
+
+    def load_initial_runtime_context(self, run_id: str) -> dict[str, Any]:
+        """Return canonical state plus the immutable snapshot/cursor identifiers."""
+        state = self.load_initial_runtime_state(run_id)
+        bundle = self.run_store.load_snapshot_bundle(run_id)
+        config = bundle["config"]
+        checkpoint = self.run_store.last_checkpoint(run_id)
+        return {
+            "state": state,
+            "state_hash": stable_hash(state),
+            "account_snapshot_id": config["account_snapshot_id"],
+            "universe_snapshot_id": config["universe_snapshot_id"],
+            "data_snapshot_id": config["data_snapshot_id"],
+            "price_basis_id": config["price_basis_id"],
+            "event_cursor": {
+                "event_id": checkpoint["event_id"],
+                "sequence_number": checkpoint["sequence_number"],
+                "next_event_id": checkpoint["next_event_id"],
+            },
+        }
 
     def execute_run(
         self, run_id: str, config: RunConfig, initial_state: Mapping[str, Any], *,
@@ -300,6 +386,19 @@ class Phase5Service:
         if row is None: raise Phase5Error("INVALID_CONFIG","run_not_found")
         return str(row["status"])
 
+    def get_run_recovery_status(self, run_id: str) -> dict[str, Any]:
+        """Expose Phase 5's persisted recovery eligibility without UI guessing."""
+        row = self.run_store.get_run(run_id)
+        if row is None:
+            raise Phase5Error("INVALID_CONFIG", "run_not_found")
+        checkpoint = self.run_store.last_checkpoint(run_id)
+        recoverable = row["status"] == "FAILED" and checkpoint is not None
+        return {
+            "status": str(row["status"]),
+            "recoverable": recoverable,
+            "failure_reason": str(row.get("failure_reason", "")),
+        }
+
     def generate_run_report(self, run_id: str, report_directory: str | Path | None = None) -> Path:
         row = self.run_store.get_run(run_id)
         if row is None: raise Phase5Error("REPORT_WRITE_FAILED","run_not_found")
@@ -307,13 +406,136 @@ class Phase5Service:
         return build_report(self.run_store,run_id,report_directory or config["report_directory"])
 
     def list_runs(self):
-        return self.run_store.list_runs()
+        result = []
+        for row in self.run_store.list_runs():
+            bundle = self.run_store.load_snapshot_bundle(row["run_id"])
+            account = json.loads(bundle["account"]["content_json"])
+            positions = self.run_store.latest_position_rows(row["run_id"])
+            fills = self.run_store.rows("adaptive_v13_fills",row["run_id"])
+            result.append({
+                **row,
+                "account_profile_id":account.get("account_profile_id",""),
+                "fill_count":len(fills),
+                "open_position_count":sum(
+                    1 for item in positions
+                    if json.loads(item["state_json"]).get("total_qty",0) > 0
+                ),
+                "report_status":(
+                    "READY" if self.list_report_files(row["run_id"]) else "NOT_GENERATED"
+                ),
+            })
+        return tuple(result)
 
     def load_run_summary(self, run_id: str) -> dict[str, Any]:
         row = self.run_store.get_run(run_id)
         if row is None: raise Phase5Error("INVALID_CONFIG","run_not_found")
         daily = self.run_store.rows("adaptive_v13_daily_account_snapshots",run_id)
         return {**row,"daily_count":len(daily),"last_daily":daily[-1] if daily else None}
+
+    def upsert_account_profile(self, profile: AccountProfile) -> None:
+        """Update an in-process profile used by later service calls."""
+        self.account_profiles[profile.account_profile_id] = profile
+
+    def create_universe_snapshot(
+        self, universe_spec: UniverseSpec, account_profile_id: str,
+        mode: RunMode | str, *, date_range_spec: DateRangeSpec,
+        current_positions: Iterable[str] = (),
+    ) -> tuple[UniverseSnapshot, Any, AccountProfile, RunMode]:
+        universe,date_range,profile,run_mode = self.resolve_run_inputs(
+            universe_spec,date_range_spec,account_profile_id,mode,
+            current_positions=current_positions,
+        )
+        created_at = datetime.now().astimezone().isoformat()
+        raw = {
+            "candidate_symbols": universe.candidate_symbols,
+            "required_symbols": universe.required_symbols,
+            "current_holding_symbols": tuple(sorted(set(map(str,current_positions)))),
+            "benchmark_symbols": universe.benchmark_symbols,
+            "source_specification": universe.sources,
+        }
+        snapshot_hash = stable_hash(raw)
+        snapshot = UniverseSnapshot(
+            universe_snapshot_id=f"universe_{snapshot_hash}",
+            candidate_symbols=universe.candidate_symbols,
+            required_symbols=universe.required_symbols,
+            current_holding_symbols=raw["current_holding_symbols"],
+            benchmark_symbols=universe.benchmark_symbols,
+            source_specification=universe.sources,
+            snapshot_hash=snapshot_hash,
+            created_at=created_at,
+        )
+        return snapshot,date_range,profile,run_mode
+
+    def load_data_snapshot(self, data_snapshot_id: str) -> DataSnapshot:
+        snapshot = self.cache.load_snapshot(data_snapshot_id)
+        self.cache.verify_snapshot(snapshot)
+        return snapshot
+
+    def load_run_detail(self, run_id: str) -> dict[str, Any]:
+        bundle = self.run_store.load_snapshot_bundle(run_id)
+        tables = {
+            name: self.run_store.rows(table,run_id)
+            for name,table in {
+                "events":"adaptive_v13_run_events",
+                "decisions":"adaptive_v13_decisions",
+                "fill_requests":"adaptive_v13_fill_requests",
+                "fills":"adaptive_v13_fills",
+                "ledger":"adaptive_v13_ledger_events",
+                "positions":"adaptive_v13_position_state_versions",
+                "pending_sells":"adaptive_v13_pending_sell_versions",
+                "cooldowns":"adaptive_v13_cooldown_records",
+                "daily":"adaptive_v13_daily_account_snapshots",
+                "audits":"adaptive_v13_audit_events",
+            }.items()
+        }
+        return {**bundle,"tables":tables}
+
+    def list_report_files(self, run_id: str) -> tuple[dict[str, Any], ...]:
+        row = self.run_store.get_run(run_id)
+        if row is None:
+            raise Phase5Error("REPORT_WRITE_FAILED","run_not_found")
+        config = json.loads(row["config_json"])
+        root = (Path(config["report_directory"]).expanduser().resolve() / run_id).resolve()
+        manifest_path = root / "run_manifest.json"
+        if not manifest_path.is_file():
+            return ()
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError,ValueError) as exc:
+            raise Phase5Error("REPORT_WRITE_FAILED","manifest_invalid") from exc
+        allowed = {"backtest_report.xlsx","run_manifest.json","run_config.json",
+                   "audit_log.jsonl","data_readiness.json"}
+        manifest_files = {
+            item["name"]: item["sha256"] for item in manifest.get("files",())
+            if isinstance(item,dict) and item.get("name") in allowed
+        }
+        manifest_files["run_manifest.json"] = sha256(manifest_path.read_bytes()).hexdigest()
+        result = []
+        for name,digest in sorted(manifest_files.items()):
+            path = (root / name).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError:
+                raise Phase5Error("REPORT_WRITE_FAILED","report_path_outside_whitelist") from None
+            result.append({
+                "name":name,"path":str(path),"sha256":str(digest),
+                "size_bytes":path.stat().st_size if path.is_file() else 0,
+                "exists":path.is_file(),
+            })
+        return tuple(result)
+
+    def validate_report_file(self, run_id: str, name: str) -> Path:
+        if Path(name).name != name or name in {"",".",".."}:
+            raise Phase5Error("REPORT_WRITE_FAILED","report_path_outside_whitelist")
+        rows = {item["name"]:item for item in self.list_report_files(run_id)}
+        item = rows.get(name)
+        if item is None or not item["exists"]:
+            raise Phase5Error("REPORT_WRITE_FAILED","report_file_missing")
+        path = Path(item["path"])
+        actual = sha256(path.read_bytes()).hexdigest()
+        if actual != item["sha256"]:
+            raise Phase5Error("REPORT_WRITE_FAILED","report_sha_mismatch")
+        return path
 
     def _profile(self, identifier: str) -> AccountProfile:
         try:
