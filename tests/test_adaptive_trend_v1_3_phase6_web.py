@@ -2,9 +2,20 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import threading
 from types import SimpleNamespace
+from urllib.request import Request, urlopen
 
 import pytest
+
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_profile_store import (
+    Phase6PreferenceStore,
+)
+from stock_picker.strategies.adaptive_trend_v1_3.phase6_web import (
+    PHASE6_LABELS,
+    Phase6WebState,
+    handle_phase6_action,
+)
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -16,14 +27,190 @@ SPEC.loader.exec_module(web_app)
 
 
 @pytest.mark.parametrize("page", [
-    "thermostat","backtest","portfolio",
     "adaptive-v13-overview","adaptive-v13-cache","adaptive-v13-backtest",
     "adaptive-v13-paper","adaptive-v13-runs","adaptive-v13-account",
 ])
-def test_legacy_and_phase6_routes_render(page):
+def test_default_navigation_renders_each_phase6_route(page):
     body = web_app.render_page(page=page,form={})
     assert "<!doctype html>" in body
     assert f'href="/{page}"' in body
+
+
+@pytest.mark.parametrize("page", ["thermostat","backtest","portfolio"])
+def test_legacy_pages_remain_renderable_when_explicitly_enabled(page):
+    body = web_app.render_page(
+        page=page, form={}, legacy_features_visible=True,
+    )
+    assert "<!doctype html>" in body
+    assert f'href="/{page}"' in body
+    assert "旧版/实验功能" in body
+
+
+def test_default_navigation_contains_exactly_six_adaptive_pages():
+    body = web_app.render_page(page="adaptive-v13-overview",form={})
+    assert body.count('<div class="nav-group">') == 1
+    for page,label in PHASE6_LABELS:
+        assert body.count(f'href="/{page}"') == 1
+        assert label in body
+    for page in ("thermostat","backtest","portfolio"):
+        assert f'href="/{page}"' not in body
+    assert "旧版/实验功能" not in body
+
+
+def test_enabled_navigation_keeps_legacy_links_in_independent_group():
+    body = web_app.render_page(
+        page="adaptive-v13-overview",form={},legacy_features_visible=True,
+    )
+    assert '<div class="nav-group legacy-nav">' in body
+    assert '<span class="nav-title">旧版/实验功能</span>' in body
+    for page in ("thermostat","backtest","portfolio"):
+        assert body.count(f'href="/{page}"') == 1
+
+
+def test_unknown_page_falls_back_to_adaptive_overview():
+    body = web_app.render_page(page="unknown",form={})
+    assert 'data-page="adaptive-v13-overview"' in body
+    assert 'action="/thermostat-job"' not in body
+
+
+def test_preference_defaults_false_for_every_new_account(tmp_path):
+    store = Phase6PreferenceStore(tmp_path / "preferences.json")
+    assert store.show_legacy_experimental("default") is False
+    assert store.show_legacy_experimental("new-account") is False
+    assert not store.path.exists()
+
+
+def test_preference_persists_and_is_account_scoped(tmp_path):
+    path = tmp_path / "preferences.json"
+    Phase6PreferenceStore(path).set_show_legacy_experimental("default",True)
+    recreated = Phase6PreferenceStore(path)
+    assert recreated.show_legacy_experimental("default") is True
+    assert recreated.show_legacy_experimental("other") is False
+    recreated.set_show_legacy_experimental("default",False)
+    assert Phase6PreferenceStore(path).show_legacy_experimental("default") is False
+
+
+def test_account_page_places_persisted_switch_under_maintenance():
+    class Controller:
+        def load_account_summary(self, *_args, **_kwargs): raise RuntimeError
+        def list_watchlists(self): return ()
+        def inspect_provider_status(self, *_args): return ()
+        def show_legacy_experimental(self, _account): return True
+
+    from stock_picker.strategies.adaptive_trend_v1_3.phase6_web import render_phase6_page
+    body = render_phase6_page(
+        "adaptive-v13-account",Controller(),Phase6WebState(),
+    )
+    maintenance = body[body.index("维护与诊断"):]
+    assert 'action="/adaptive-v13-legacy-settings"' in maintenance
+    assert 'name="show_legacy_experimental"' in maintenance
+    assert 'value="true" checked' in maintenance
+    assert "旧版功能仅用于兼容和排查，不属于当前自适应趋势 V1.3 工作流。默认隐藏。" in maintenance
+
+
+@pytest.mark.parametrize(("submitted","expected"), [
+    ("true",True),("",False),
+])
+def test_visibility_action_persists_without_changing_session_state(
+    submitted,expected,
+):
+    class Controller:
+        captured = None
+        def set_show_legacy_experimental(self, account, enabled):
+            self.captured = (account,enabled)
+
+    controller = Controller()
+    state = Phase6WebState(
+        account_profile_id="paper",data_snapshot_id="snapshot",
+        run_id="run",readiness_status="READY",
+    )
+    page,_ = handle_phase6_action(
+        "/adaptive-v13-legacy-settings",
+        {"show_legacy_experimental":submitted},
+        controller,state,
+    )
+    assert page == "adaptive-v13-account"
+    assert controller.captured == ("paper",expected)
+    assert (state.data_snapshot_id,state.run_id,state.readiness_status) == (
+        "snapshot","run","READY",
+    )
+
+
+class _VisibilityController:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def show_legacy_experimental(self, _account: str) -> bool:
+        return self.enabled
+
+    def list_runs(self, **_kwargs):
+        return ()
+
+
+def _request_web_app(path: str, *, method: str = "GET") -> tuple[int,str]:
+    server = web_app.ThreadingHTTPServer(("127.0.0.1",0),web_app.WebAppHandler)
+    thread = threading.Thread(target=server.serve_forever,daemon=True)
+    thread.start()
+    try:
+        request = Request(
+            f"http://127.0.0.1:{server.server_address[1]}{path}",
+            data=b"" if method == "POST" else None,
+            method=method,
+        )
+        with urlopen(request,timeout=10) as response:
+            return response.status,response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("path", [
+    "/thermostat","/backtest","/portfolio","/job?id=missing",
+    "/thermostat-report?id=missing",
+])
+def test_hidden_legacy_get_routes_are_not_404_and_do_not_enable_feature(
+    monkeypatch,path,
+):
+    controller = _VisibilityController(False)
+    monkeypatch.setattr(web_app,"PHASE6_CONTROLLER",controller)
+    status,body = _request_web_app(path)
+    assert status == 200
+    assert 'data-page="adaptive-v13-overview"' in body
+    assert "旧版/实验功能当前已隐藏" in body
+    assert controller.enabled is False
+    assert 'href="/thermostat"' not in body
+
+
+@pytest.mark.parametrize("path", [
+    "/thermostat","/thermostat-backtest","/portfolio-summary",
+    "/watchlist-create",
+])
+def test_hidden_legacy_post_routes_do_not_execute_and_are_not_404(
+    monkeypatch,path,
+):
+    controller = _VisibilityController(False)
+    monkeypatch.setattr(web_app,"PHASE6_CONTROLLER",controller)
+    status,body = _request_web_app(path,method="POST")
+    assert status == 200
+    assert "旧版/实验功能当前已隐藏" in body
+    assert controller.enabled is False
+
+
+def test_root_route_is_adaptive_overview_even_when_legacy_enabled(monkeypatch):
+    monkeypatch.setattr(web_app,"PHASE6_CONTROLLER",_VisibilityController(True))
+    status,body = _request_web_app("/")
+    assert status == 200
+    assert 'data-page="adaptive-v13-overview"' in body
+    assert "旧版/实验功能" in body
+
+
+def test_v1318_spec_is_present_in_root():
+    path = (
+        Path(web_app.__file__).parents[1]
+        / "T1软适应中短期趋势系统_V1.3.18_Phase6旧版功能默认隐藏修复与Codex执行指令.txt"
+    )
+    assert path.is_file()
+    assert path.stat().st_size > 4000
 
 
 @pytest.mark.parametrize("token", [

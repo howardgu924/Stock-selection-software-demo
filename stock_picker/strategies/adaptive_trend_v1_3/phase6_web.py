@@ -204,6 +204,15 @@ def handle_phase6_action(
             "default_universe":state.universe_spec,
         })
         return "adaptive-v13-account","账户默认设置已保存"
+    if path == "/adaptive-v13-legacy-settings":
+        enabled = form.get("show_legacy_experimental", "") == "true"
+        controller.set_show_legacy_experimental(
+            state.account_profile_id, enabled,
+        )
+        return (
+            "adaptive-v13-account",
+            "旧版/实验功能已显示" if enabled else "旧版/实验功能已隐藏",
+        )
     if path == "/adaptive-v13-watchlist":
         action = form.get("watchlist_action","")
         if action == "delete":
@@ -343,6 +352,14 @@ def _runs_v1316(controller: Phase6Controller | None, state: Phase6WebState) -> s
 
 def _account(controller: Phase6Controller | None, state: Phase6WebState) -> str:
     watches = controller.list_watchlists() if controller else ()
+    try:
+        legacy_enabled = (
+            controller.show_legacy_experimental(state.account_profile_id)
+            if controller else False
+        )
+    except Exception:
+        legacy_enabled = False
+    legacy_checked = " checked" if legacy_enabled else ""
     watch_rows = "".join(
         f"<tr><td>{html.escape(item.name)}</td><td>{item.count}</td><td>{html.escape(item.updated_at)}</td></tr>"
         for item in watches
@@ -377,7 +394,16 @@ def _account(controller: Phase6Controller | None, state: Phase6WebState) -> str:
       <label class="span-2">证券代码<textarea name="symbols"></textarea></label>
       <button>保存</button></form><div class="table-scroll"><table><thead><tr>
       <th>名称</th><th>证券数</th><th>更新时间</th></tr></thead><tbody>{watch_rows}</tbody></table></div></section>
-      <section class="panel"><h3>维护与诊断</h3><p>报告 SHA、缓存覆盖及运行审计均从 Phase 5 权威数据读取。</p></section>
+      <section class="panel"><h3>维护与诊断</h3>
+      <p>报告 SHA、缓存覆盖及运行审计均从 Phase 5 权威数据读取。</p>
+      <form method="post" action="/adaptive-v13-legacy-settings">
+      <input type="hidden" name="account_profile_id"
+      value="{html.escape(state.account_profile_id)}">
+      <label class="checkbox-row"><input type="checkbox" name="show_legacy_experimental"
+      value="true"{legacy_checked}> 显示旧版/实验功能</label>
+      <button>保存显示设置</button>
+      <p class="hint">旧版功能仅用于兼容和排查，不属于当前自适应趋势 V1.3 工作流。默认隐藏。</p>
+      </form></section>
     </div>"""
 
 

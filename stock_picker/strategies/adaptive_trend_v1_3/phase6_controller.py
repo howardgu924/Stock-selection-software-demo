@@ -25,7 +25,9 @@ from .phase6_models import (
     RunListItemVM, RunSummaryVM, SubmissionResult, UniverseSelectionVM,
 )
 from .phase6_idempotency import Phase6IdempotencyStore
-from .phase6_profile_store import AccountProfileStore, validate_decimal_text
+from .phase6_profile_store import (
+    AccountProfileStore, Phase6PreferenceStore, validate_decimal_text,
+)
 from .phase6_provider_registry import ProviderRegistry
 from .run_store import canonical_json, stable_hash
 
@@ -65,6 +67,7 @@ class Phase6Controller:
         dependency_factory: Callable[[str], Any] | None = None,
         paper_state_loader: Callable[[str], Mapping[str, Any]] | None = None,
         idempotency_store: Phase6IdempotencyStore | None = None,
+        preference_store: Phase6PreferenceStore | None = None,
     ) -> None:
         self.service = service
         self.profile_store = profile_store
@@ -72,6 +75,9 @@ class Phase6Controller:
         self.provider_registry = provider_registry
         self.dependency_factory = dependency_factory
         self.paper_state_loader = paper_state_loader or (lambda _profile_id: {})
+        self.preference_store = preference_store or Phase6PreferenceStore(
+            profile_store.path.with_name("phase6_preferences.json")
+        )
         db_path = getattr(getattr(service, "run_store", None), "db_path", None)
         self.idempotency_store = idempotency_store or (
             Phase6IdempotencyStore(db_path) if db_path is not None else None
@@ -130,6 +136,20 @@ class Phase6Controller:
         self.profile_store.save(profile)
         self.service.upsert_account_profile(profile)
         return self.load_account_summary(identifier)
+
+    def show_legacy_experimental(self, account_profile_id: str) -> bool:
+        """Return the persisted legacy-navigation preference for one account."""
+        return self.preference_store.show_legacy_experimental(account_profile_id)
+
+    def set_show_legacy_experimental(
+        self, account_profile_id: str, enabled: bool,
+    ) -> bool:
+        """Persist the legacy-navigation preference without touching run state."""
+        self._profile(account_profile_id)
+        self.preference_store.set_show_legacy_experimental(
+            account_profile_id, enabled,
+        )
+        return enabled
 
     def list_watchlists(self):
         return tuple(self.watchlist_store.list())

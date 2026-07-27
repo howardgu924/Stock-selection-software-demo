@@ -211,13 +211,14 @@ def test_web_app_parses_symbols_and_marks() -> None:
     assert web_app._marks(form) == {"600519": 1500.5, "000001": 12.3}
 
 
-def test_web_default_path_is_thermostat_and_hides_old_entries() -> None:
+def test_web_default_path_is_adaptive_overview_and_hides_legacy_entries() -> None:
     html = web_app.render_page(page="unknown")
 
-    assert "恒温器策略" in html
-    assert 'action="/thermostat-job"' in html
-    assert 'href="/thermostat"' in html
-    assert 'href="/portfolio"' in html
+    assert "自适应趋势 V1.3" in html
+    assert 'data-page="adaptive-v13-overview"' in html
+    assert 'action="/thermostat-job"' not in html
+    assert 'href="/thermostat"' not in html
+    assert 'href="/portfolio"' not in html
     assert 'action="/turtle"' not in html
     assert 'action="/turtle-backtest"' not in html
     assert 'href="/turtle"' not in html
@@ -761,7 +762,7 @@ def test_web_thermostat_job_result_shows_report_export_failure() -> None:
     assert "下载新版 T+1 恒温器报告" not in job.result_html
 
 
-def test_web_thermostat_report_route_downloads_current_t1_excel(tmp_path) -> None:
+def test_web_thermostat_report_route_downloads_current_t1_excel(tmp_path,monkeypatch) -> None:
     report = build_t1_thermostat_report(_sample_trigger_plan(), pd.DataFrame())
     output = tmp_path / "t1_thermostat_report_20260708.xlsx"
     export_t1_thermostat_excel(report, output)
@@ -770,6 +771,10 @@ def test_web_thermostat_report_route_downloads_current_t1_excel(tmp_path) -> Non
     job.report_path = str(output)
     job.report_filename = output.name
     web_app.JOBS["download-job"] = job
+    monkeypatch.setattr(
+        web_app,"PHASE6_CONTROLLER",
+        SimpleNamespace(show_legacy_experimental=lambda _account: True),
+    )
     server = web_app.ThreadingHTTPServer(("127.0.0.1", 0), web_app.WebAppHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

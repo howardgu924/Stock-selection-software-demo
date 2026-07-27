@@ -6,6 +6,7 @@ from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
+from threading import RLock
 from typing import Any, Mapping
 
 from .phase5_models import AccountProfile, Phase5Error, UniverseSpec
@@ -35,6 +36,70 @@ class AccountProfileStore:
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.path)
+
+
+class Phase6PreferenceStore:
+    """Persist per-account Phase 6 presentation preferences outside run snapshots."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._lock = RLock()
+
+    def show_legacy_experimental(self, account_profile_id: str) -> bool:
+        identifier = _preference_identifier(account_profile_id)
+        with self._lock:
+            raw = self._load()
+            value = raw.get(identifier, {}).get("show_legacy_experimental", False)
+        if type(value) is not bool:
+            raise Phase5Error("INVALID_CONFIG", "invalid_show_legacy_experimental")
+        return value
+
+    def set_show_legacy_experimental(
+        self, account_profile_id: str, enabled: bool,
+    ) -> None:
+        identifier = _preference_identifier(account_profile_id)
+        if type(enabled) is not bool:
+            raise Phase5Error("INVALID_CONFIG", "invalid_show_legacy_experimental")
+        with self._lock:
+            raw = self._load()
+            raw[identifier] = {"show_legacy_experimental": enabled}
+            payload = {
+                key: raw[key]
+                for key in sorted(raw)
+            }
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(self.path)
+
+    def _load(self) -> dict[str, dict[str, bool]]:
+        if not self.path.exists():
+            return {}
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise TypeError
+            result: dict[str, dict[str, bool]] = {}
+            for key, value in raw.items():
+                if not isinstance(key, str) or not isinstance(value, dict):
+                    raise TypeError
+                enabled = value.get("show_legacy_experimental", False)
+                if type(enabled) is not bool:
+                    raise TypeError
+                result[key] = {"show_legacy_experimental": enabled}
+            return result
+        except (OSError, ValueError, TypeError) as exc:
+            raise Phase5Error("INVALID_CONFIG", "phase6_preference_store_invalid") from exc
+
+
+def _preference_identifier(value: object) -> str:
+    identifier = str(value).strip()
+    if not identifier:
+        raise Phase5Error("INVALID_CONFIG", "account_profile_id_required")
+    return identifier
 
 
 def validate_decimal_text(value: object, field: str) -> Decimal:

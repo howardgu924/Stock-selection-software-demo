@@ -60,6 +60,17 @@ LAST_FORM: dict[str, str] = {}
 JOBS: dict[str, "ThermostatJob"] = {}
 JOBS_LOCK = threading.Lock()
 PAGES = {"thermostat", "backtest", "portfolio", *PHASE6_PAGES}
+LEGACY_GET_PATHS = {
+    "/thermostat", "/backtest", "/portfolio", "/job", "/thermostat-report",
+}
+LEGACY_POST_PATHS = {
+    "/thermostat", "/thermostat-lhb-preview", "/thermostat-job",
+    "/thermostat-backtest", "/thermostat-backtest-job",
+    "/portfolio-init", "/portfolio-buy", "/portfolio-sell",
+    "/portfolio-adjust-cost", "/portfolio-summary",
+    "/watchlist-save-manual", "/watchlist-create", "/watchlist-add-symbol",
+    "/watchlist-remove-symbol", "/watchlist-rename", "/watchlist-delete",
+}
 PHASE6_CONTROLLER: Phase6Controller | None = None
 PHASE6_STARTUP_ERROR: ErrorVM | None = None
 PHASE6_STATE = Phase6WebState()
@@ -717,6 +728,9 @@ class WebAppHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send_text("ok")
             return
+        if path in LEGACY_GET_PATHS and not self._legacy_features_enabled():
+            self._send_legacy_hidden()
+            return
         if path == "/job":
             job_id = parse_qs(parsed.query).get("id", [""])[-1]
             self._send_json(job_status_payload(job_id))
@@ -741,7 +755,11 @@ class WebAppHandler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.BAD_REQUEST, f"{view.title} [{view.code}]")
             return
         if path == "/":
-            self._send_page(render_page(page="thermostat", form=_display_form_for_page("thermostat", LAST_FORM)))
+            self._send_page(render_page(
+                page="adaptive-v13-overview", form={},
+                phase6_state=self._phase6_state(),
+                phase6_error=PHASE6_STARTUP_ERROR,
+            ))
             return
         page = path.strip("/")
         if page not in PAGES:
@@ -783,11 +801,17 @@ class WebAppHandler(BaseHTTPRequestHandler):
                 result = handle_portfolio_summary({"path": display_form.get("path", DEFAULT_USER_PATH)})
             except Exception:
                 result = None
-        self._send_page(render_page(page=page, result=result, form=display_form))
+        self._send_page(render_page(
+            page=page, result=result, form=display_form,
+            legacy_features_visible=True,
+        ))
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         form: dict[str, str] = {}
+        if path in LEGACY_POST_PATHS and not self._legacy_features_enabled():
+            self._send_legacy_hidden()
+            return
         try:
             form = self._read_form()
             display_form = form
@@ -847,7 +871,10 @@ class WebAppHandler(BaseHTTPRequestHandler):
             display_form = _display_form_after_success(path, form)
             LAST_FORM.clear()
             LAST_FORM.update(display_form)
-            self._send_page(render_page(page=page, result=result, form=display_form))
+            self._send_page(render_page(
+                page=page, result=result, form=display_form,
+                legacy_features_visible=True,
+            ))
         except Exception as exc:
             failed_page = _page_for_path(path)
             failed_state = (
@@ -870,6 +897,25 @@ class WebAppHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"[web] {self.address_string()} - {fmt % args}", file=sys.stderr)
+
+    def _legacy_features_enabled(self) -> bool:
+        if PHASE6_CONTROLLER is None:
+            return False
+        try:
+            return PHASE6_CONTROLLER.show_legacy_experimental(
+                self._phase6_state().account_profile_id
+            )
+        except Exception:
+            return False
+
+    def _send_legacy_hidden(self) -> None:
+        self._send_page(render_page(
+            page="adaptive-v13-overview",
+            result=RenderResult("旧版/实验功能当前已隐藏"),
+            form={},
+            phase6_state=self._phase6_state(),
+            phase6_error=PHASE6_STARTUP_ERROR,
+        ))
 
     def _read_form(self) -> dict[str, str]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -1710,15 +1756,20 @@ def handle_portfolio_summary(form: dict[str, str]) -> RenderResult:
 
 
 def render_page(
-    page: str = "thermostat",
+    page: str = "adaptive-v13-overview",
     result: RenderResult | None = None,
     error: str | None = None,
     form: dict[str, str] | None = None,
     phase6_state: Phase6WebState | None = None,
     phase6_error: ErrorVM | None = None,
+    legacy_features_visible: bool | None = None,
 ) -> str:
     form = form or {}
-    page = page if page in PAGES else "thermostat"
+    page = page if page in PAGES else "adaptive-v13-overview"
+    if legacy_features_visible is None:
+        legacy_features_visible = _legacy_features_enabled(
+            phase6_state or PHASE6_STATE
+        )
     if page in PHASE6_PAGES:
         page_body = render_phase6_page(
             page, PHASE6_CONTROLLER, phase6_state or PHASE6_STATE,
@@ -1743,15 +1794,13 @@ def render_page(
   <header>
     <div>
       <h1>{APP_NAME}</h1>
-      <p>恒温器策略、回测诊断和手动账户工作台</p>
+      <p>自适应趋势 V1.3 数据、运行与账户工作台</p>
     </div>
     <div class="status">本地运行 · {html.escape(datetime.now().strftime("%Y-%m-%d %H:%M"))}</div>
   </header>
   <nav>
     {phase6_nav(page)}
-    {nav_link("thermostat", "恒温器策略", page)}
-    {nav_link("backtest", "回测诊断", page)}
-    {nav_link("portfolio", "账户", page)}
+    {legacy_nav(page) if legacy_features_visible else ""}
   </nav>
   <main>
     {render_message(result, error)}
@@ -1794,6 +1843,30 @@ def render_page(
 def nav_link(target: str, label: str, current: str) -> str:
     active = ' class="active"' if target == current else ""
     return f'<a href="/{target}"{active}>{html.escape(label)}</a>'
+
+
+def legacy_nav(current: str) -> str:
+    links = "".join((
+        nav_link("thermostat", "恒温器策略", current),
+        nav_link("backtest", "旧回测诊断", current),
+        nav_link("portfolio", "旧选股与账户", current),
+    ))
+    return (
+        '<div class="nav-group legacy-nav">'
+        '<span class="nav-title">旧版/实验功能</span>'
+        f"{links}</div>"
+    )
+
+
+def _legacy_features_enabled(state: Phase6WebState) -> bool:
+    if PHASE6_CONTROLLER is None:
+        return False
+    try:
+        return PHASE6_CONTROLLER.show_legacy_experimental(
+            state.account_profile_id
+        )
+    except Exception:
+        return False
 
 
 def render_source_refresh_script(page: str) -> str:
@@ -3062,6 +3135,7 @@ def _page_for_path(path: str) -> str:
         "/adaptive-v13-report":"adaptive-v13-runs",
         "/adaptive-v13-provider-test":"adaptive-v13-account",
         "/adaptive-v13-account-save":"adaptive-v13-account",
+        "/adaptive-v13-legacy-settings":"adaptive-v13-account",
         "/adaptive-v13-watchlist":"adaptive-v13-account",
     }
     if path in phase6_paths:
@@ -3514,6 +3588,7 @@ button {
 h3 span { color: var(--muted); font-weight: 400; }
 .nav-group { display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
 .nav-title { color:var(--muted); font-size:11px; text-transform:uppercase; margin-right:4px; }
+.legacy-nav { margin-left:auto; padding-left:12px; border-left:1px solid var(--border); }
 .adaptive-v13 { --ready:#197047; --partial:#9a6700; --failed:#b42318; }
 .strategy-heading { display:flex; justify-content:space-between; align-items:end; margin-bottom:12px; }
 .strategy-heading h2 { margin:2px 0 0; }
