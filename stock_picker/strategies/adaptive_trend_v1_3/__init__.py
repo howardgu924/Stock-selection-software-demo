@@ -270,6 +270,7 @@ from stock_picker.strategies.adaptive_trend_v1_3.phase6_controller import (
     Phase6Controller,
 )
 from stock_picker.strategies.adaptive_trend_v1_3.phase6_models import (
+    AccountSettingsVM,
     AccountSummaryVM,
     CacheProgressVM,
     DataReadinessVM,
@@ -293,6 +294,7 @@ from stock_picker.strategies.adaptive_trend_v1_3.phase6_idempotency import (
 )
 from stock_picker.strategies.adaptive_trend_v1_3.phase6_profile_store import (
     AccountProfileStore,
+    Phase6PreparedInputStore,
 )
 from stock_picker.strategies.adaptive_trend_v1_3.phase6_provider_registry import (
     ProviderDescriptor,
@@ -491,6 +493,7 @@ __all__ = [
     "validate_partition",
     "verify_data_snapshot",
     "AccountProfileStore",
+    "AccountSettingsVM",
     "AccountSummaryVM",
     "CacheProgressVM",
     "DataReadinessVM",
@@ -499,6 +502,7 @@ __all__ = [
     "ExecutionBackend",
     "Phase6Controller",
     "Phase6IdempotencyStore",
+    "Phase6PreparedInputStore",
     "ProviderDescriptor",
     "ProviderRegistry",
     "ProviderStatusVM",

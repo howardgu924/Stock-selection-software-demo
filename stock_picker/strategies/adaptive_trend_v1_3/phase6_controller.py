@@ -20,13 +20,14 @@ from .phase5_models import (
 )
 from .phase5_service import Phase5Service
 from .phase6_models import (
-    AccountSummaryVM, CacheProgressVM, DataReadinessVM, DateRangeVM, ErrorVM,
+    AccountSettingsVM, AccountSummaryVM, CacheProgressVM, DataReadinessVM, DateRangeVM, ErrorVM,
     PreparedInputState, ProviderStatusVM, ReportFileVM, RunDetailVM,
     RunListItemVM, RunSummaryVM, SubmissionResult, UniverseSelectionVM,
 )
 from .phase6_idempotency import Phase6IdempotencyStore
 from .phase6_profile_store import (
-    AccountProfileStore, Phase6PreferenceStore, validate_decimal_text,
+    AccountProfileStore, Phase6PreferenceStore, Phase6PreparedInputStore,
+    validate_decimal_text,
 )
 from .phase6_provider_registry import ProviderRegistry
 from .run_store import canonical_json, stable_hash
@@ -68,6 +69,7 @@ class Phase6Controller:
         paper_state_loader: Callable[[str], Mapping[str, Any]] | None = None,
         idempotency_store: Phase6IdempotencyStore | None = None,
         preference_store: Phase6PreferenceStore | None = None,
+        prepared_input_store: Phase6PreparedInputStore | None = None,
     ) -> None:
         self.service = service
         self.profile_store = profile_store
@@ -78,15 +80,19 @@ class Phase6Controller:
         self.preference_store = preference_store or Phase6PreferenceStore(
             profile_store.path.with_name("phase6_preferences.json")
         )
+        self.prepared_input_store = prepared_input_store or Phase6PreparedInputStore(
+            profile_store.path.with_name("phase6_prepared_inputs.json")
+        )
         db_path = getattr(getattr(service, "run_store", None), "db_path", None)
         self.idempotency_store = idempotency_store or (
             Phase6IdempotencyStore(db_path) if db_path is not None else None
         )
-        self._prepared: dict[str, PreparedInputState] = {}
+        self._prepared = self._load_prepared_inputs()
         self._active_runs: set[str] = set()
         self._lock = RLock()
         for profile in profile_store.load().values():
             self.service.upsert_account_profile(profile)
+        self._restore_prepared_from_completed_runs()
 
     def load_account_summary(
         self, account_profile_id: str, mode: RunMode | str = RunMode.BACKTEST,
@@ -105,6 +111,19 @@ class Phase6Controller:
             validate_decimal_text(profile.paper_cash, "paper_cash"),
             len(positions), profile.fee_schedule_id, profile.base_currency,
             tuple(profile.provider_priority), data_status, latest,
+        )
+
+    def load_account_settings(self, account_profile_id: str) -> AccountSettingsVM:
+        profile = self._profile(account_profile_id)
+        return AccountSettingsVM(
+            profile.account_profile_id,
+            str(profile.backtest_initial_cash),
+            str(profile.paper_cash),
+            profile.fee_schedule_id,
+            profile.base_currency,
+            ",".join(profile.provider_priority),
+            profile.data_directory,
+            profile.report_directory,
         )
 
     def save_account_settings(self, values: Mapping[str, object]) -> AccountSummaryVM:
@@ -264,11 +283,13 @@ class Phase6Controller:
             report.status == "READY",
         )
         if report.status == "READY":
-            self._prepared[signature] = PreparedInputState(
+            prepared = PreparedInputState(
                 signature,account_profile_id,run_mode.value,universe_spec,date_range_spec,
                 report.data_snapshot_id,report.price_basis_id,
                 universe_snapshot.universe_snapshot_id,
             )
+            self._prepared[signature] = prepared
+            self.prepared_input_store.save(signature, _prepared_payload(prepared))
         return (
             CacheProgressVM("RESOLVE_INPUTS","COMPLETED","股票池和日期已解析",1,3),
             CacheProgressVM("PREPARE_PARTITIONS",report.status,"缓存分区已验证",2,3),
@@ -294,6 +315,24 @@ class Phase6Controller:
         except (AttributeError, Phase5Error, OSError, ValueError):
             return False
         return snapshot.price_basis_id == RAW_PRICE_BASIS
+
+    def restore_prepared_snapshot(
+        self, universe_spec: UniverseSpec, date_range_spec: DateRangeSpec,
+        account_profile_id: str, mode: RunMode | str,
+        *, current_positions: Iterable[str] = (),
+    ) -> PreparedInputState | None:
+        signature = self._input_hash(
+            universe_spec,date_range_spec,account_profile_id,RunMode(mode),current_positions,
+        )
+        prepared = self._prepared.get(signature)
+        if prepared is None:
+            return None
+        if not self.validate_snapshot(
+            prepared.data_snapshot_id,universe_spec,date_range_spec,
+            account_profile_id,mode,current_positions=current_positions,
+        ):
+            return None
+        return prepared
 
     def create_backtest(
         self, universe_spec: UniverseSpec, date_range_spec: DateRangeSpec,
@@ -471,7 +510,9 @@ class Phase6Controller:
             config.get("account_snapshot_id",""),config.get("data_snapshot_id",""),
             config.get("price_basis_id",""),run["created_at"],run["updated_at"],
             tuple(sorted((str(key),str(value)) for key,value in last.items()
-                         if key not in {"run_id","snapshot_id"})),
+                         if key not in {
+                             "run_id","snapshot_id","daily_snapshot_id","payload_json",
+                         })),
             len({row.get("symbol","") for row in tables["positions"] if row.get("symbol")}),
             tuple(filter(None, (str(run.get("failure_reason", "")),))),
         )
@@ -516,7 +557,104 @@ class Phase6Controller:
         correlation_id = sha256(
             f"{type(error).__name__}:{code}".encode("utf-8")
         ).hexdigest()[:16]
-        return ErrorVM(title,action,code,"",recoverable,correlation_id)
+        detail = str(error) if isinstance(error, Phase5Error) else ""
+        if isinstance(error, Phase5Error) and detail.startswith("data_max_date:"):
+            detail = f"当前数据最多支持到 {detail.split(':', 1)[1]}"
+        detail = {
+            "invalid_backtest_initial_cash": "回测初始资金必须是有效的非负数字",
+            "invalid_paper_cash": "模拟现金必须是有效的非负数字",
+            "provider_priority_required": "Provider 优先级不能为空",
+            "account_required_field_missing": "账户必填字段不能为空",
+            "watchlist_not_found": "没有找到指定的自选股组合",
+        }.get(detail, detail)
+        return ErrorVM(title,action,code,detail,recoverable,correlation_id)
+
+    def _load_prepared_inputs(self) -> dict[str, PreparedInputState]:
+        result: dict[str, PreparedInputState] = {}
+        for signature, raw in self.prepared_input_store.load().items():
+            try:
+                universe = raw["universe_spec"]
+                dates = raw["date_range_spec"]
+                prepared = PreparedInputState(
+                    input_hash=signature,
+                    account_profile_id=str(raw["account_profile_id"]),
+                    mode=str(raw["mode"]),
+                    universe_spec=UniverseSpec(
+                        universe["kind"],
+                        tuple(universe.get("manual_symbols", ())),
+                        tuple(universe.get("watchlist_names", ())),
+                        tuple(universe.get("market_scopes", ())),
+                    ),
+                    date_range_spec=DateRangeSpec(
+                        dates["kind"], dates.get("value"),
+                        dates.get("start_date"), dates.get("end_date"),
+                    ),
+                    data_snapshot_id=str(raw["data_snapshot_id"]),
+                    price_basis_id=str(raw["price_basis_id"]),
+                    universe_snapshot_id=str(raw["universe_snapshot_id"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            result[signature] = prepared
+        return result
+
+    def _restore_prepared_from_completed_runs(self) -> None:
+        """Backfill READY associations created before prepared-input persistence existed."""
+        run_store = getattr(self.service,"run_store",None)
+        if run_store is None:
+            return
+        try:
+            runs = run_store.list_runs()
+        except Exception:
+            return
+        for run in runs:
+            if str(run.get("status","")) not in {"COMPLETED","DEGRADED"}:
+                continue
+            try:
+                bundle = run_store.load_snapshot_bundle(str(run["run_id"]))
+                config = bundle["config"]
+                account = json.loads(bundle["account"]["content_json"])
+                universe_raw = json.loads(bundle["universe"]["content_json"])
+                profile_id = str(account["account_profile_id"])
+                mode = RunMode(config["run_mode"])
+                universe = _universe_spec_from_snapshot(universe_raw)
+                current_positions = tuple(universe_raw.get("current_holding_symbols",()))
+                requested = (
+                    str(config["date_range"]["requested_start_date"]),
+                    str(config["date_range"]["requested_end_date"]),
+                )
+                candidates = (
+                    *(DateRangeSpec("RECENT_MONTHS",value=value) for value in (1,3,6)),
+                    *(DateRangeSpec("RECENT_YEARS",value=value) for value in (1,2,3,5)),
+                    DateRangeSpec("CUSTOM",start_date=requested[0],end_date=requested[1]),
+                )
+                for dates in candidates:
+                    try:
+                        _,resolved,_,_ = self.service.resolve_run_inputs(
+                            universe,dates,profile_id,mode,
+                            current_positions=current_positions,
+                        )
+                    except Exception:
+                        continue
+                    if (
+                        resolved.requested_start_date.isoformat(),
+                        resolved.requested_end_date.isoformat(),
+                    ) != requested:
+                        continue
+                    signature = self._input_hash(
+                        universe,dates,profile_id,mode,current_positions,
+                    )
+                    if signature in self._prepared:
+                        continue
+                    prepared = PreparedInputState(
+                        signature,profile_id,mode.value,universe,dates,
+                        str(config["data_snapshot_id"]),str(config["price_basis_id"]),
+                        str(config["universe_snapshot_id"]),
+                    )
+                    self._prepared[signature] = prepared
+                    self.prepared_input_store.save(signature,_prepared_payload(prepared))
+            except (KeyError,TypeError,ValueError,Phase5Error,OSError):
+                continue
 
     def _profile(self, identifier: str) -> AccountProfile:
         try:
@@ -660,6 +798,45 @@ def _text_tuple(value: object) -> tuple[str, ...]:
 
 def _freeze_rows(rows: Iterable[Mapping[str,Any]]) -> tuple[tuple[tuple[str,Any],...],...]:
     return tuple(tuple(sorted((str(key),value) for key,value in row.items())) for row in rows)
+
+
+def _prepared_payload(prepared: PreparedInputState) -> dict[str, Any]:
+    return json.loads(canonical_json({
+        "account_profile_id": prepared.account_profile_id,
+        "mode": prepared.mode,
+        "universe_spec": asdict(prepared.universe_spec),
+        "date_range_spec": asdict(prepared.date_range_spec),
+        "data_snapshot_id": prepared.data_snapshot_id,
+        "price_basis_id": prepared.price_basis_id,
+        "universe_snapshot_id": prepared.universe_snapshot_id,
+    }))
+
+
+def _universe_spec_from_snapshot(raw: Mapping[str, Any]) -> UniverseSpec:
+    sources = tuple(map(str,raw.get("source_specification",())))
+    manual_enabled = "MANUAL" in sources
+    watchlists = tuple(
+        item.split(":",1)[1] for item in sources if item.startswith("WATCHLIST:")
+    )
+    scopes = tuple(
+        item.split(":",1)[1] for item in sources if item.startswith("MARKET_SCOPE:")
+    )
+    kinds = sum((manual_enabled,bool(watchlists),bool(scopes)))
+    if kinds > 1:
+        kind = "COMBINED"
+    elif watchlists:
+        kind = "WATCHLIST"
+    elif scopes:
+        kind = "MARKET_SCOPE"
+    else:
+        kind = "MANUAL"
+        manual_enabled = True
+    return UniverseSpec(
+        kind,
+        tuple(map(str,raw.get("candidate_symbols",()))) if manual_enabled else (),
+        watchlists,
+        scopes,
+    )
 
 
 def _nested_date(config: Mapping[str,Any], key: str) -> str:

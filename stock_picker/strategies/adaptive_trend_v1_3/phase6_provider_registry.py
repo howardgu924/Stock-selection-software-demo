@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from importlib import metadata
 import inspect
 from typing import Callable, Iterable, Mapping
@@ -188,10 +188,13 @@ class ProviderRegistry:
         )
 
     def test_connections(
-        self, timeout_seconds: float = 3.0, *,
+        self, timeout_seconds: float = 10.0, *,
         priorities: Iterable[str] = (),
     ) -> tuple[ProviderStatusVM, ...]:
+        selected = {str(item) for item in priorities if str(item)}
         for item in self._providers:
+            if selected and item.provider_id not in selected:
+                continue
             checked = datetime.now().astimezone().isoformat()
             if item.probe is None:
                 self._last_results[item.provider_id] = (
@@ -295,6 +298,12 @@ def _read_only_probe(provider: object) -> Callable[[], object] | None:
     realtime = getattr(provider, "get_realtime_quotes", None)
     if callable(realtime):
         return lambda: realtime(("000001.SZ",))
+    trade_dates = getattr(provider, "get_trade_dates", None)
+    if callable(trade_dates):
+        return lambda: trade_dates(
+            (datetime.now().date() - timedelta(days=10)).strftime("%Y%m%d"),
+            datetime.now().date().strftime("%Y%m%d"),
+        )
     stock = getattr(provider, "get_stock_symbols", None)
     if callable(stock):
         return stock

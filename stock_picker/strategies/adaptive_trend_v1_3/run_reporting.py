@@ -139,7 +139,12 @@ def _validate_manifest_sources(config, account, universe, data) -> None:
         "partition_metadata","rule_snapshot_ids","fee_snapshot_ids",
         "price_basis_id","required_trade_dates","readiness_status",
     )
-    if any(not data.get(name) for name in required_data):
+    if any(name not in data for name in required_data):
+        raise Phase5Error("REPORT_WRITE_FAILED", "manifest_data_metadata_missing")
+    required_non_empty = (
+        "partition_metadata","price_basis_id","required_trade_dates","readiness_status",
+    )
+    if any(not data.get(name) for name in required_non_empty):
         raise Phase5Error("REPORT_WRITE_FAILED", "manifest_data_metadata_missing")
 
 

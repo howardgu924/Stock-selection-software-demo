@@ -335,6 +335,69 @@ def test_recoverable_failed_run_has_real_resume_form():
     assert 'name="operation_token"' in body
 
 
+def test_completed_run_detail_renders_results_and_report_action():
+    from stock_picker.strategies.adaptive_trend_v1_3.phase6_web import (
+        Phase6WebState, render_phase6_page,
+    )
+
+    class Controller:
+        def load_account_summary(self, *_args, **_kwargs): raise RuntimeError
+        def list_runs(self, **_kwargs): return ()
+        def can_resume_run(self, _run_id): return False
+        def list_report_files(self, _run_id): return ()
+        def load_run_detail(self, _run_id):
+            summary = SimpleNamespace(
+                status="COMPLETED",mode="DAILY_PAPER",strategy_version="V1.3.13",
+                date_range=("2026-05-06","2026-08-06"),
+                price_basis_id="RAW_UNADJUSTED_V1",
+                metrics=(("cash","100000"),("equity","100000")),
+            )
+            return SimpleNamespace(
+                summary=summary,decisions=((),()),orders=(),fills=(),positions=(),
+            )
+
+    state = Phase6WebState(run_id="run-completed")
+    body = render_phase6_page("adaptive-v13-runs",Controller(),state)
+    assert "运行结果" in body
+    assert "DAILY_PAPER" in body
+    assert "模拟现金" in body and "100000" in body
+    assert "决策" in body and ">2<" in body
+    assert 'action="/adaptive-v13-report"' in body
+    assert 'name="run_id" value="run-completed"' in body
+    assert "决策结果汇总" in body
+    assert "本次没有生成订单" in body
+    assert "最近日终权益" in body
+
+
+def test_phase6_selectors_have_immediate_refresh_hooks():
+    from stock_picker.strategies.adaptive_trend_v1_3.phase6_web import (
+        Phase6WebState, render_phase6_page,
+    )
+    body = render_phase6_page("adaptive-v13-cache",None,Phase6WebState())
+    assert body.count('onchange="refreshPhase6Selectors(this)"') >= 4
+    assert 'window.location.href = "/adaptive-v13-cache"' in body
+
+
+def test_account_page_has_single_authoritative_cash_fields_and_copy_source():
+    from stock_picker.strategies.adaptive_trend_v1_3.phase6_web import (
+        Phase6WebState, render_phase6_page,
+    )
+    body = render_phase6_page("adaptive-v13-account",None,Phase6WebState())
+    assert body.count('name="backtest_initial_cash"') == 1
+    assert body.count('name="paper_cash"') == 1
+    assert 'name="source_name"' in body
+
+
+def test_long_running_forms_show_immediate_progress_feedback():
+    from stock_picker.strategies.adaptive_trend_v1_3.phase6_web import (
+        Phase6WebState, render_phase6_page,
+    )
+    for page in ("adaptive-v13-cache","adaptive-v13-backtest","adaptive-v13-paper"):
+        body = render_phase6_page(page,None,Phase6WebState())
+        assert 'data-long-running="true"' in body
+        assert "正在处理，请勿重复点击" in body
+
+
 def test_phase6_post_exceptions_never_render_raw_exception_text():
     source = Path(web_app.__file__).read_text(encoding="utf-8")
     start = source.index("if failed_page in PHASE6_PAGES:")

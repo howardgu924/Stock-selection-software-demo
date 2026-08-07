@@ -108,26 +108,41 @@ class RunStore:
         universe_hash = stable_hash(json.loads(universe_json))
         data_hash = stable_hash(json.loads(data_json))
         with self.transaction() as connection:
-            connection.execute(
-                "INSERT INTO adaptive_v13_account_snapshots VALUES(?,?,?,?)",
-                (account_id,account_json,account_hash,created_at),
+            _reuse_or_insert_snapshot(
+                connection,"adaptive_v13_account_snapshots","account_snapshot_id",
+                account_id,account_json,account_hash,created_at,
             )
-            connection.execute(
-                "INSERT INTO adaptive_v13_universe_snapshots VALUES(?,?,?,?)",
-                (universe_id,universe_json,universe_hash,created_at),
+            _reuse_or_insert_snapshot(
+                connection,"adaptive_v13_universe_snapshots","universe_snapshot_id",
+                universe_id,universe_json,universe_hash,created_at,
             )
             price_basis = str(_field(data_snapshot,"price_basis_id",""))
-            connection.execute(
-                "INSERT INTO adaptive_v13_data_snapshots VALUES(?,?,?,?,?)",
-                (data_id,data_json,data_hash,price_basis,created_at),
+            _reuse_or_insert_snapshot(
+                connection,"adaptive_v13_data_snapshots","data_snapshot_id",
+                data_id,data_json,data_hash,created_at,price_basis=price_basis,
             )
             partition_hashes = _field(data_snapshot,"partition_hashes",())
             coverage = _field(data_snapshot,"required_trade_dates",())
+            link_rows = [
+                (data_id,partition_id,content_hash,canonical_json(coverage))
+                for partition_id,content_hash in partition_hashes
+            ]
             connection.executemany(
-                """INSERT INTO adaptive_v13_data_snapshot_partition_links
+                """INSERT OR IGNORE INTO adaptive_v13_data_snapshot_partition_links
                 (data_snapshot_id,partition_id,content_hash,coverage_json) VALUES(?,?,?,?)""",
-                [(data_id,partition_id,content_hash,canonical_json(coverage)) for partition_id,content_hash in partition_hashes],
+                link_rows,
             )
+            for expected in link_rows:
+                actual = connection.execute(
+                    """SELECT data_snapshot_id,partition_id,content_hash,coverage_json
+                    FROM adaptive_v13_data_snapshot_partition_links
+                    WHERE data_snapshot_id=? AND partition_id=?""",
+                    expected[:2],
+                ).fetchone()
+                if actual is None or tuple(actual) != expected:
+                    raise Phase5Error(
+                        "RUN_FINGERPRINT_MISMATCH", "snapshot_partition_link_mismatch"
+                    )
             connection.execute(
                 """INSERT INTO adaptive_v13_runs
                 (run_id,run_fingerprint,status,config_json,data_snapshot_id,created_at,updated_at)
@@ -416,3 +431,52 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value,dict):
         return value.get(name,default)
     return getattr(value,name,default)
+
+
+def _reuse_or_insert_snapshot(
+    connection: sqlite3.Connection, table: str, id_column: str,
+    snapshot_id: str, content_json: str, content_hash: str, created_at: str,
+    *, price_basis: str | None = None,
+) -> None:
+    allowed = {
+        "adaptive_v13_account_snapshots": "account_snapshot_id",
+        "adaptive_v13_universe_snapshots": "universe_snapshot_id",
+        "adaptive_v13_data_snapshots": "data_snapshot_id",
+    }
+    if allowed.get(table) != id_column:
+        raise Phase5Error("INVALID_CONFIG", "unsupported_snapshot_table")
+    if price_basis is None:
+        connection.execute(
+            f"INSERT OR IGNORE INTO {table} VALUES(?,?,?,?)",
+            (snapshot_id,content_json,content_hash,created_at),
+        )
+        row = connection.execute(
+            f"SELECT content_json,content_hash FROM {table} WHERE {id_column}=?",
+            (snapshot_id,),
+        ).fetchone()
+    else:
+        connection.execute(
+            f"INSERT OR IGNORE INTO {table} VALUES(?,?,?,?,?)",
+            (snapshot_id,content_json,content_hash,price_basis,created_at),
+        )
+        row = connection.execute(
+            f"""SELECT content_json,content_hash,price_basis_id
+            FROM {table} WHERE {id_column}=?""",
+            (snapshot_id,),
+        ).fetchone()
+    if row is None:
+        raise Phase5Error("RUN_FINGERPRINT_MISMATCH", "snapshot_identity_conflict")
+    existing_identity = _snapshot_identity_hash(row["content_json"], row["content_hash"])
+    supplied_identity = _snapshot_identity_hash(content_json, content_hash)
+    if existing_identity != supplied_identity:
+        raise Phase5Error("RUN_FINGERPRINT_MISMATCH", "snapshot_content_mismatch")
+    if price_basis is not None and row["price_basis_id"] != price_basis:
+        raise Phase5Error("PRICE_BASIS_MISMATCH", "snapshot_price_basis_mismatch")
+
+
+def _snapshot_identity_hash(content_json: str, fallback: str) -> str:
+    try:
+        parsed = json.loads(content_json)
+    except (TypeError, ValueError):
+        return fallback
+    return str(parsed.get("snapshot_hash") or fallback)

@@ -49,6 +49,7 @@ from stock_picker.strategies.adaptive_trend_v1_3.phase6_web import (
     phase6_nav,
     refresh_snapshot_state,
     render_phase6_page,
+    update_selection,
 )
 from examples.list_lhb_candidates import build_lhb_candidates
 
@@ -768,6 +769,16 @@ class WebAppHandler(BaseHTTPRequestHandler):
         if page in PHASE6_PAGES:
             phase6_state = self._phase6_state()
             phase6_query = parse_qs(parsed.query)
+            if page in {
+                "adaptive-v13-cache","adaptive-v13-backtest","adaptive-v13-paper",
+            } and ({"universe_kind","date_kind"} & set(phase6_query)):
+                update_selection(
+                    phase6_state,
+                    {
+                        key: ",".join(values) if key == "market_scopes" else values[-1]
+                        for key,values in phase6_query.items() if values
+                    },
+                )
             if phase6_query.get("run_id"):
                 phase6_state.run_id = phase6_query["run_id"][-1]
             if page == "adaptive-v13-runs":
@@ -781,6 +792,8 @@ class WebAppHandler(BaseHTTPRequestHandler):
                 }
                 if submitted_filters:
                     phase6_state.run_filters = submitted_filters
+                    if not phase6_query.get("run_id"):
+                        phase6_state.run_id = ""
             if PHASE6_CONTROLLER is not None and page in {
                 "adaptive-v13-cache","adaptive-v13-backtest","adaptive-v13-paper",
             }:
@@ -921,7 +934,10 @@ class WebAppHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length).decode("utf-8")
         values = parse_qs(raw, keep_blank_values=True)
-        return {key: ",".join(value) if key == "market_range" else value[-1] for key, value in values.items()}
+        return {
+            key: ",".join(value) if key in {"market_range","market_scopes"} else value[-1]
+            for key, value in values.items()
+        }
 
     def _send_page(self, body: str) -> None:
         encoded = body.encode("utf-8")

@@ -10,6 +10,9 @@ from stock_picker.strategies.adaptive_trend_v1_3 import (
     RunConfig, RunMode, RunStore, UniverseSnapshot, create_run,
     generate_run_report,
 )
+from stock_picker.strategies.adaptive_trend_v1_3.run_reporting import (
+    _validate_manifest_sources,
+)
 
 
 def setup_store(tmp_path):
@@ -66,3 +69,21 @@ def test_report_is_rebuildable_from_store(tmp_path):
     (first/"backtest_report.xlsx").unlink()
     second=generate_run_report(store,"run",tmp_path)
     assert (second/"backtest_report.xlsx").exists()
+
+
+def test_report_metadata_allows_explicitly_empty_rule_and_fee_snapshot_lists():
+    config = {
+        "git_commit_sha":"a" * 40,"schema_version":3,"strategy_version":"V1.3.13",
+        "account_snapshot_id":"account","universe_snapshot_id":"universe",
+        "data_snapshot_id":"data","date_range":{"trading_dates":["2026-08-06"]},
+    }
+    account = {"snapshot_hash":"account-hash"}
+    universe = {"snapshot_hash":"universe-hash"}
+    data = {
+        "snapshot_hash":"data-hash","partition_metadata":[["partition"]],
+        "rule_snapshot_ids":[],"fee_snapshot_ids":[],
+        "price_basis_id":"RAW_UNADJUSTED_V1",
+        "required_trade_dates":["2026-08-06"],"readiness_status":"READY",
+    }
+
+    _validate_manifest_sources(config,account,universe,data)

@@ -11,7 +11,7 @@ import time
 import pytest
 
 from stock_picker.strategies.adaptive_trend_v1_3.phase5_models import (
-    AccountProfile, DataReadinessReport, DataSnapshot, DateRangeSpec, ResolvedDateRange,
+    AccountProfile, DataReadinessReport, DataSnapshot, DateRangeSpec, Phase5Error, ResolvedDateRange,
     ResolvedUniverse, RunMode, UniverseSnapshot, UniverseSpec,
 )
 from stock_picker.strategies.adaptive_trend_v1_3.phase6_controller import ERRORS, Phase6Controller
@@ -33,7 +33,8 @@ from stock_picker.strategies.adaptive_trend_v1_3.phase6_app_factory import (
     create_phase6_application,
 )
 from stock_picker.strategies.adaptive_trend_v1_3.phase6_web import (
-    PHASE6_PAGES, Phase6WebState, render_phase6_page, update_selection,
+    PHASE6_PAGES, Phase6WebState, handle_phase6_action, refresh_snapshot_state,
+    render_phase6_page, update_selection,
 )
 from stock_picker.user import WatchlistStore
 
@@ -179,6 +180,81 @@ def test_six_phase6_pages_render_without_database_access(page):
     body = render_phase6_page(page, None, Phase6WebState())
     assert f'data-page="{page}"' in body
     assert "sqlite" not in body.lower()
+
+
+def test_ready_snapshot_association_survives_controller_restart(tmp_path):
+    profiles = AccountProfileStore(tmp_path / "profiles.json")
+    profiles.save(PROFILE)
+    first = Phase6Controller(
+        service=FakeService(),profile_store=profiles,
+        watchlist_store=WatchlistStore(tmp_path / "user"),
+        provider_registry=ProviderRegistry(()),
+        idempotency_store=Phase6IdempotencyStore(tmp_path / "runs.sqlite3"),
+    )
+    universe = UniverseSpec("MANUAL",("600000.SH",))
+    dates = DateRangeSpec("RECENT_MONTHS",value=3)
+    _, ready = first.prepare_cache(universe,dates,"default",RunMode.BACKTEST)
+
+    recreated = Phase6Controller(
+        service=FakeService(),profile_store=profiles,
+        watchlist_store=WatchlistStore(tmp_path / "user"),
+        provider_registry=ProviderRegistry(()),
+        idempotency_store=Phase6IdempotencyStore(tmp_path / "runs-2.sqlite3"),
+    )
+    restored = recreated.restore_prepared_snapshot(
+        universe,dates,"default",RunMode.BACKTEST,
+    )
+    assert restored is not None
+    assert restored.data_snapshot_id == ready.data_snapshot_id
+    assert recreated.load_account_summary("default").latest_readiness_status == "READY"
+
+
+def test_refresh_restores_mode_specific_ready_snapshot(controller):
+    state = Phase6WebState()
+    controller.prepare_cache(
+        state.universe_spec,state.date_range_spec,"default",RunMode.DAILY_PAPER,
+    )
+    assert refresh_snapshot_state(controller,state,RunMode.DAILY_PAPER)
+    assert state.readiness_status == "READY"
+    assert state.data_snapshot_id == "data-1"
+
+
+def test_phase5_error_detail_is_visible_to_user(controller):
+    error = controller.get_error_view(
+        Phase5Error("INVALID_DATE_RANGE","data_max_date:2026-08-06")
+    )
+    body = render_phase6_page("adaptive-v13-cache",controller,Phase6WebState(),error=error)
+    assert "当前数据最多支持到 2026-08-06" in body
+    assert "技术详情" not in body
+
+
+def test_preview_renders_resolved_universe_dates_and_warmup(controller):
+    state = Phase6WebState()
+    page,message = handle_phase6_action(
+        "/adaptive-v13-preview",{
+            "universe_kind":"MANUAL","manual_symbols":"600000.SH",
+            "date_kind":"RECENT_MONTHS","date_value":"3",
+        },controller,state,
+    )
+    body = render_phase6_page(page,controller,state,message=message)
+    assert "候选股票" in body and "必需股票" in body
+    assert "实际交易日" in body and "预热范围" in body
+
+
+def test_provider_test_only_probes_configured_priority():
+    calls = []
+    registry = ProviderRegistry((
+        ProviderDescriptor(
+            "one","One","1",("daily",),("1d",),"all","Asia/Shanghai",
+            "RAW",("daily",),lambda: calls.append("one"),configured=True,enabled=True,
+        ),
+        ProviderDescriptor(
+            "two","Two","1",("daily",),("1d",),"all","Asia/Shanghai",
+            "RAW",("daily",),lambda: calls.append("two"),configured=True,enabled=True,
+        ),
+    ))
+    registry.test_connections(priorities=("one",))
+    assert calls == ["one"]
 
 
 @pytest.mark.parametrize(
@@ -327,6 +403,27 @@ def test_cache_and_backtest_reuse_identical_specs_and_snapshot(controller):
         ready.data_snapshot_id,state.universe_spec,state.date_range_spec,
         "default",RunMode.BACKTEST,
     )
+
+
+def test_daily_paper_prepare_returns_to_paper_and_keeps_run_button_enabled(controller):
+    state = Phase6WebState()
+    page,_message = handle_phase6_action(
+        "/adaptive-v13-cache-prepare",
+        {
+            "run_mode":"DAILY_PAPER",
+            "universe_kind":"MANUAL",
+            "manual_symbols":"600000.SH",
+            "date_kind":"RECENT_MONTHS",
+            "date_value":"3",
+        },
+        controller,state,
+    )
+
+    assert page == "adaptive-v13-paper"
+    assert refresh_snapshot_state(controller,state,RunMode.DAILY_PAPER)
+    body = render_phase6_page(page,controller,state)
+    assert state.readiness_status == "READY"
+    assert '<button class="primary" disabled>' not in body
 
 
 @pytest.mark.parametrize("change", ["account","universe","date","mode","position"])
@@ -556,7 +653,7 @@ def test_selector_restores_watchlist_and_preset_without_irrelevant_fields():
     body = render_phase6_page("adaptive-v13-cache",None,state)
     assert 'value="WATCHLIST" selected' in body
     assert 'value="3" selected' in body
-    assert 'name="watchlist_names" value="核心"' in body
+    assert 'name="watchlist_names"' in body and 'value="核心"' in body
     assert 'name="manual_symbols"' not in body
     assert 'name="start_date"' not in body
 

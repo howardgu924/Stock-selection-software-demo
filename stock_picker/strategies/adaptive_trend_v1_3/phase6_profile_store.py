@@ -95,6 +95,47 @@ class Phase6PreferenceStore:
             raise Phase5Error("INVALID_CONFIG", "phase6_preference_store_invalid") from exc
 
 
+class Phase6PreparedInputStore:
+    """Persist the minimal READY input-to-snapshot association across restarts."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._lock = RLock()
+
+    def load(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            if not self.path.exists():
+                return {}
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise TypeError
+                result: dict[str, dict[str, Any]] = {}
+                for signature, value in raw.items():
+                    if not isinstance(signature, str) or not isinstance(value, dict):
+                        raise TypeError
+                    result[signature] = dict(value)
+                return result
+            except (OSError, ValueError, TypeError) as exc:
+                raise Phase5Error(
+                    "INVALID_CONFIG", "phase6_prepared_input_store_invalid"
+                ) from exc
+
+    def save(self, signature: str, value: Mapping[str, Any]) -> None:
+        if not signature:
+            raise Phase5Error("INVALID_CONFIG", "prepared_input_signature_required")
+        with self._lock:
+            raw = self.load()
+            raw[signature] = dict(value)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(raw, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            temporary.replace(self.path)
+
+
 def _preference_identifier(value: object) -> str:
     identifier = str(value).strip()
     if not identifier:

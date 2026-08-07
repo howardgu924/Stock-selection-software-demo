@@ -17,11 +17,15 @@ def resolve_date_range(
     trading_calendar: Iterable[date | str | pd.Timestamp],
     *,
     as_of: date | str | pd.Timestamp | None = None,
+    latest_available_date: date | str | pd.Timestamp | None = None,
 ) -> ResolvedDateRange:
     calendar = _calendar(trading_calendar)
     if not calendar:
         raise Phase5Error("INVALID_DATE_RANGE", "empty_trading_calendar")
-    end_hint = _date(as_of) if as_of is not None else calendar[-1]
+    latest = _date(latest_available_date) if latest_available_date is not None else calendar[-1]
+    if latest is None:
+        raise Phase5Error("INVALID_DATE_RANGE", "invalid_latest_available_date")
+    end_hint = _date(as_of) if as_of is not None else latest
     if end_hint is None:
         raise Phase5Error("INVALID_DATE_RANGE", "invalid_as_of")
     try:
@@ -33,10 +37,14 @@ def resolve_date_range(
         requested_start, requested_end = _date(spec.start_date), _date(spec.end_date)
         if requested_start is None or requested_end is None or requested_start > requested_end:
             raise Phase5Error("INVALID_DATE_RANGE", "invalid_custom_range")
+        if requested_end > latest:
+            raise Phase5Error("INVALID_DATE_RANGE", f"data_max_date:{latest.isoformat()}")
     else:
         if type(spec.value) is not int or spec.value <= 0:
             raise Phase5Error("INVALID_DATE_RANGE", "invalid_recent_value")
         requested_end = end_hint
+        if requested_end > latest:
+            requested_end = latest
         offset = pd.DateOffset(months=spec.value) if kind == DateRangeKind.RECENT_MONTHS else pd.DateOffset(years=spec.value)
         requested_start = (pd.Timestamp(requested_end) - offset).date()
 

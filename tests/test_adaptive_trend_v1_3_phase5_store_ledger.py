@@ -44,6 +44,74 @@ def test_legacy_non_atomic_create_run_is_rejected(tmp_path):
     assert caught.value.code=="INVALID_CONFIG"
 
 
+def test_multiple_runs_reuse_identical_immutable_snapshots(tmp_path):
+    store=RunStore(tmp_path/"runs.sqlite3")
+
+    def create(run_id, fingerprint, created_at):
+        config={
+            "strategy_version":"v","report_directory":"x",
+            "account_snapshot_id":"account","universe_snapshot_id":"universe",
+            "data_snapshot_id":"data",
+        }
+        store.create_run_bundle(
+            run_id,fingerprint,config,
+            account_snapshot={
+                "account_snapshot_id":"account","snapshot_hash":"account-hash",
+                "created_at":created_at,"cash":"10000","positions":(),
+            },
+            universe_snapshot={
+                "universe_snapshot_id":"universe","snapshot_hash":"universe-hash",
+                "created_at":created_at,
+            },
+            data_snapshot={
+                "data_snapshot_id":"data","snapshot_hash":"data-hash",
+                "created_at":created_at,"price_basis_id":"RAW_UNADJUSTED_V1",
+                "partition_hashes":(),
+            },
+            created_at=created_at,
+        )
+
+    create("r1","fp1","2025-01-01T00:00:00+08:00")
+    create("r2","fp2","2025-01-02T00:00:00+08:00")
+
+    assert len(store.list_runs()) == 2
+    with sqlite3.connect(store.db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM adaptive_v13_account_snapshots"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM adaptive_v13_universe_snapshots"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM adaptive_v13_data_snapshots"
+        ).fetchone()[0] == 1
+
+
+def test_reused_snapshot_id_rejects_changed_semantic_hash(tmp_path):
+    store=RunStore(tmp_path/"runs.sqlite3")
+    make_run(store)
+    config={
+        "strategy_version":"v","report_directory":"x",
+        "account_snapshot_id":"account","universe_snapshot_id":"universe",
+        "data_snapshot_id":"data",
+    }
+    with pytest.raises(Phase5Error) as caught:
+        store.create_run_bundle(
+            "r2","fp2",config,
+            account_snapshot={
+                "account_snapshot_id":"account","snapshot_hash":"changed",
+                "cash":"10000","positions":(),
+            },
+            universe_snapshot={"universe_snapshot_id":"universe"},
+            data_snapshot={
+                "data_snapshot_id":"data","price_basis_id":"RAW_UNADJUSTED_V1",
+                "partition_hashes":(),
+            },
+            created_at="2025-01-02T00:00:00+08:00",
+        )
+    assert caught.value.code == "RUN_FINGERPRINT_MISMATCH"
+
+
 def test_schema_migration_is_idempotent(tmp_path):
     RunStore(tmp_path/"runs.sqlite3")
     RunStore(tmp_path/"runs.sqlite3")

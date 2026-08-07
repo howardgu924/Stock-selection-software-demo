@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import Counter
 from datetime import date
 import html
+import json
 import secrets
 from typing import Mapping
 
@@ -49,16 +51,25 @@ class Phase6WebState:
     paper_operation_token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     resume_operation_token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     run_filters: dict[str, str] = field(default_factory=dict)
+    preview_details: tuple[tuple[str, str], ...] = ()
 
 
 def render_phase6_page(
     page: str, controller: Phase6Controller | None,
     state: Phase6WebState, *, message: str = "", error: ErrorVM | None = None,
 ) -> str:
-    if error is not None:
-        error = f"{error.title} [{error.code}] {error.action} ({error.correlation_id})"
     title = dict(PHASE6_LABELS).get(page,"自适应趋势 V1.3")
-    account = _account_bar(controller,state)
+    page_mode = (
+        RunMode.DAILY_PAPER
+        if page == "adaptive-v13-paper"
+        else RunMode.BACKTEST
+    )
+    if page == "adaptive-v13-runs" and controller is not None and state.run_id:
+        try:
+            page_mode = RunMode(controller.load_run_detail(state.run_id).summary.mode)
+        except Exception:
+            pass
+    account = _account_bar(controller,state,page_mode)
     content = {
         "adaptive-v13-overview": _overview,
         "adaptive-v13-cache": _cache,
@@ -68,7 +79,7 @@ def render_phase6_page(
         "adaptive-v13-account": _account,
     }[page](controller,state)
     notice = (
-        f'<div class="message error"><strong>操作失败</strong><span>{html.escape(error)}</span></div>'
+        _error_notice(error)
         if error else
         (f'<div class="message success">{html.escape(message)}</div>' if message else "")
     )
@@ -78,7 +89,7 @@ def render_phase6_page(
       <h2>{title}</h2></div><span class="status-chip status-{state.readiness_status.lower()}">
       {html.escape(state.readiness_status)}</span></div>
       {account}{notice}{content}
-    </section>"""
+    </section>{_phase6_interaction_script(page)}"""
 
 
 def phase6_nav(current: str) -> str:
@@ -90,6 +101,7 @@ def phase6_nav(current: str) -> str:
 
 
 def update_selection(state: Phase6WebState, form: Mapping[str,str]) -> None:
+    state.preview_details = ()
     state.account_profile_id = form.get("account_profile_id",state.account_profile_id).strip() or "default"
     kind = form.get("universe_kind",str(state.universe_spec.kind))
     manual = _tokens(form.get("manual_symbols",",".join(state.universe_spec.manual_symbols)))
@@ -111,26 +123,39 @@ def refresh_snapshot_state(
     controller: Phase6Controller, state: Phase6WebState, mode: RunMode | str,
 ) -> bool:
     """Revalidate session snapshot and current input hashes on every relevant GET."""
-    if not state.data_snapshot_id:
-        state.readiness_status = "EMPTY"
-        return False
     current_positions: tuple[str, ...] = ()
     if RunMode(mode) is RunMode.DAILY_PAPER:
         paper = controller.paper_state_loader(state.account_profile_id) or {}
         current_positions = tuple((paper.get("positions") or {}).keys())
     try:
-        valid = controller.validate_snapshot(
+        valid = bool(state.data_snapshot_id) and controller.validate_snapshot(
             state.data_snapshot_id,state.universe_spec,state.date_range_spec,
             state.account_profile_id,mode,current_positions=current_positions,
         )
+        if not valid:
+            restored = controller.restore_prepared_snapshot(
+                state.universe_spec,state.date_range_spec,state.account_profile_id,
+                mode,current_positions=current_positions,
+            )
+            if restored is not None:
+                state.data_snapshot_id = restored.data_snapshot_id
+                valid = True
     except Exception:
         valid = False
     if valid:
         state.readiness_status = "READY"
         state.readiness_message = ""
         return True
-    state.readiness_status = "STALE"
-    state.readiness_message = "输入已变化，需要重新缓存"
+    if state.data_snapshot_id:
+        state.readiness_status = "STALE"
+        state.readiness_message = (
+            "每日模拟需要按当前账户状态单独准备当日数据"
+            if RunMode(mode) is RunMode.DAILY_PAPER
+            else "输入已变化，需要重新缓存"
+        )
+    else:
+        state.readiness_status = "EMPTY"
+        state.readiness_message = "尚未为当前输入准备数据"
     return False
 
 
@@ -144,21 +169,35 @@ def handle_phase6_action(
     }:
         update_selection(state,form)
     if path == "/adaptive-v13-preview":
-        controller.preview_universe(
+        universe = controller.preview_universe(
             state.universe_spec,state.account_profile_id,state.date_range_spec,RunMode.BACKTEST,
         )
-        controller.resolve_date_range(
+        dates = controller.resolve_date_range(
             state.date_range_spec,state.account_profile_id,state.universe_spec,RunMode.BACKTEST,
+        )
+        state.preview_details = (
+            ("候选股票", str(len(universe.candidate_symbols))),
+            ("必需股票", str(len(universe.required_symbols))),
+            ("来源", "、".join(universe.sources) or "手动输入"),
+            ("请求日期", f"{dates.requested_range[0]} 至 {dates.requested_range[1]}"),
+            ("实际交易日", f"{dates.actual_range[0]} 至 {dates.actual_range[1]}（{dates.trading_day_count}日）"),
+            ("预热范围", f"{dates.warmup_range[0]} 至 {dates.warmup_range[1]}（{dates.warmup_trading_day_count}日）"),
         )
         return "adaptive-v13-cache","数据需求已预览"
     if path == "/adaptive-v13-cache-prepare":
+        run_mode = RunMode(form.get("run_mode",RunMode.BACKTEST.value))
         _,ready = controller.prepare_cache(
             state.universe_spec,state.date_range_spec,state.account_profile_id,
-            form.get("run_mode",RunMode.BACKTEST.value),
+            run_mode,
         )
         state.data_snapshot_id = ready.data_snapshot_id
         state.readiness_status = ready.status
-        return "adaptive-v13-cache",f"数据状态：{ready.status}"
+        target_page = (
+            "adaptive-v13-paper"
+            if run_mode is RunMode.DAILY_PAPER
+            else "adaptive-v13-cache"
+        )
+        return target_page,f"数据状态：{ready.status}"
     if path == "/adaptive-v13-backtest-run":
         result = controller.submit_backtest(
             state.universe_spec,state.date_range_spec,state.account_profile_id,
@@ -228,12 +267,16 @@ def handle_phase6_action(
     raise ValueError("unsupported_phase6_action")
 
 
-def _account_bar(controller: Phase6Controller | None, state: Phase6WebState) -> str:
+def _account_bar(
+    controller: Phase6Controller | None,
+    state: Phase6WebState,
+    mode: RunMode = RunMode.BACKTEST,
+) -> str:
     if controller is None:
         values = (("账户",state.account_profile_id),("模式","PAPER"),("数据","服务未配置"))
     else:
         try:
-            vm = controller.load_account_summary(state.account_profile_id)
+            vm = controller.load_account_summary(state.account_profile_id,mode)
             values = (
                 ("账户",vm.account_profile_id),("模式",vm.mode),
                 ("回测资金",str(vm.backtest_initial_cash)),("模拟现金",str(vm.paper_cash)),
@@ -264,13 +307,20 @@ def _overview(controller: Phase6Controller | None, state: Phase6WebState) -> str
 
 
 def _cache(controller: Phase6Controller | None, state: Phase6WebState) -> str:
-    return f"""<form method="post" action="/adaptive-v13-cache-prepare" class="panel">
+    preview = ""
+    if state.preview_details:
+        preview = '<div class="account-summary preview-summary">' + "".join(
+            f'<div><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>'
+            for label,value in state.preview_details
+        ) + "</div>"
+    return f"""<form method="post" action="/adaptive-v13-cache-prepare" class="panel" data-long-running="true">
       <h3>一键缓存并验证</h3>{_selectors(state)}
       <div class="data-summary"><span>状态 <strong>{state.readiness_status}</strong></span>
       <span>price_basis <strong>RAW_UNADJUSTED_V1</strong></span>
       <span class="advanced">snapshot <code>{html.escape(state.data_snapshot_id or "尚未生成")}</code></span></div>
       <div class="actions"><button formaction="/adaptive-v13-preview">预览数据需求</button>
       <button class="primary" type="submit">缓存并验证数据</button></div>
+      {preview}<p class="operation-progress" aria-live="polite"></p>
       <p class="hint">缓存和回测复用同一 UniverseSpec、DateRangeSpec 与 data_snapshot。</p>
     </form>{_provider_table(controller,state)}"""
 
@@ -278,13 +328,14 @@ def _cache(controller: Phase6Controller | None, state: Phase6WebState) -> str:
 def _backtest(controller: Phase6Controller | None, state: Phase6WebState) -> str:
     ready = state.readiness_status == "READY" and bool(state.data_snapshot_id)
     disabled = "" if ready else " disabled"
-    return f"""<form method="post" action="/adaptive-v13-backtest-run" class="panel">
+    return f"""<form method="post" action="/adaptive-v13-backtest-run" class="panel" data-long-running="true">
       <input type="hidden" name="operation_token" value="{html.escape(state.backtest_operation_token)}">
       <h3>创建并同步执行回测</h3>{_selectors(state)}
       <fieldset><legend>本次运行设置</legend>
       <label><input type="checkbox" name="override_enabled"> 启用本次运行覆盖（默认关闭）</label>
       <p class="hint">账户资金、费用、Provider 和报告目录默认来自账户设置；执行期间网络策略为 FORBID。</p>
       </fieldset><button class="primary" type="submit"{disabled}>运行回测</button>
+      <p class="operation-progress" aria-live="polite"></p>
       {'' if ready else '<p class="validation">请先缓存并验证数据，当前运行按钮已禁用。</p>'}
     </form>"""
 
@@ -293,11 +344,13 @@ def _paper(controller: Phase6Controller | None, state: Phase6WebState) -> str:
     ready = state.readiness_status == "READY" and bool(state.data_snapshot_id)
     return f"""<section class="panel warning"><strong>模拟运行，不会向券商发送订单。</strong>
       <p>仅支持手动 DAILY_PAPER；不包含自动调度、QMT 或实盘下单。</p></section>
-      <form method="post" action="/adaptive-v13-paper-run" class="panel">{_selectors(state)}
+      <form method="post" action="/adaptive-v13-paper-run" class="panel" data-long-running="true">{_selectors(state)}
       <input type="hidden" name="operation_token" value="{html.escape(state.paper_operation_token)}">
       <input type="hidden" name="run_mode" value="DAILY_PAPER">
       <div class="actions"><button formaction="/adaptive-v13-cache-prepare">准备当日数据</button>
       <button class="primary" {'disabled' if not ready else ''}>运行当日模拟</button></div>
+      <p class="operation-progress" aria-live="polite"></p>
+      {f'<p class="validation">{html.escape(state.readiness_message)}</p>' if not ready and state.readiness_message else ''}
       <div class="empty-state">持仓、SellableQty、TodayBoughtQty、PendingSell 与 Cooldown 从服务层加载。</div>
       </form>"""
 
@@ -307,7 +360,8 @@ def _runs_v1316(controller: Phase6Controller | None, state: Phase6WebState) -> s
     if controller and state.run_id:
         try:
             detail = controller.load_run_detail(state.run_id)
-            files = controller.list_report_files(state.run_id)
+            list_report_files = getattr(controller,"list_report_files",None)
+            files = list_report_files(state.run_id) if callable(list_report_files) else ()
             file_links = "".join(
                 f'<li><a href="/adaptive-v13-report-file?run_id={html.escape(state.run_id)}'
                 f'&name={html.escape(item.name)}">{html.escape(item.name)}</a> '
@@ -352,6 +406,8 @@ def _runs_v1316(controller: Phase6Controller | None, state: Phase6WebState) -> s
 
 def _account(controller: Phase6Controller | None, state: Phase6WebState) -> str:
     watches = controller.list_watchlists() if controller else ()
+    load_settings = getattr(controller,"load_account_settings",None)
+    settings = load_settings(state.account_profile_id) if callable(load_settings) else None
     try:
         legacy_enabled = (
             controller.show_legacy_experimental(state.account_profile_id)
@@ -366,31 +422,29 @@ def _account(controller: Phase6Controller | None, state: Phase6WebState) -> str:
     ) or '<tr><td colspan="3" class="empty-state">暂无自选股组合</td></tr>'
     return f"""<div class="settings-tabs">
       <form method="post" action="/adaptive-v13-account-save" class="panel">
-      <h3>账户默认设置</h3><input type="hidden" name="account_profile_id"
+      <h3>账户默认设置（资金与费用）</h3><input type="hidden" name="account_profile_id"
       value="{html.escape(state.account_profile_id)}"><div class="form-grid">
-      <label>回测初始资金 *<input name="backtest_initial_cash" value="100000" inputmode="decimal"></label>
-      <label>模拟现金 *<input name="paper_cash" value="100000" inputmode="decimal"></label>
-      <label>费用方案 *<input name="fee_schedule_id" value="CN_A_DEFAULT"></label>
-      <label>基础货币 *<input name="base_currency" value="CNY"></label>
-      <label>Provider 优先级 *<input name="provider_priority" value="baostock,akshare"></label>
-      <label>数据目录 *<input name="data_directory" value="data/adaptive_trend_v1_3"></label>
-      <label>报告目录 *<input name="report_directory" value="data/reports/adaptive_trend_v1_3"></label>
+      <label>回测初始资金 *<input name="backtest_initial_cash" value="{html.escape(settings.backtest_initial_cash if settings else '')}" inputmode="decimal"></label>
+      <label>模拟现金 *<input name="paper_cash" value="{html.escape(settings.paper_cash if settings else '')}" inputmode="decimal"></label>
+      <label>费用方案 *<input name="fee_schedule_id" value="{html.escape(settings.fee_schedule_id if settings else '')}"></label>
+      <label>基础货币 *<input name="base_currency" value="{html.escape(settings.base_currency if settings else '')}"></label>
+      <label>Provider 优先级 *<input name="provider_priority" value="{html.escape(settings.provider_priority if settings else '')}"></label>
+      <label>数据目录 *<input name="data_directory" value="{html.escape(settings.data_directory if settings else '')}"></label>
+      <label>报告目录 *<input name="report_directory" value="{html.escape(settings.report_directory if settings else '')}"></label>
       </div><button class="primary">保存账户默认设置</button></form>
       <section class="panel"><h3>概览</h3><p>账户默认值是资金、费用、Provider、目录及默认 Universe 的唯一来源。</p></section>
-      <section class="panel"><h3>资金与费用</h3><div class="form-grid">
-      <label>回测初始资金 *<input name="backtest_initial_cash" inputmode="decimal"></label>
-      <label>模拟现金 *<input name="paper_cash" inputmode="decimal"></label></div></section>
       <section class="panel"><h3>数据源与目录</h3>{_provider_table(controller,state)}
       <form method="post" action="/adaptive-v13-provider-test"><label>超时秒数
-      <input name="timeout_seconds" value="3"></label><button>检测数据源</button>
-      <p class="hint">检测有超时且不会写入缓存，也不会记录密钥、Cookie 或凭证。</p></form></section>
+      <input name="timeout_seconds" value="10"></label><button>检测数据源</button>
+      <p class="hint">仅检测账户已配置 Provider；检测不会写入缓存，也不会记录密钥、Cookie 或凭证。</p></form></section>
       <section class="panel"><h3>自选股组合</h3>
       <form method="post" action="/adaptive-v13-watchlist" class="form-grid">
       <label>操作<select name="watchlist_action"><option value="create">新建</option>
       <option value="add">批量添加</option><option value="remove">删除代码</option>
       <option value="rename">重命名</option><option value="copy">复制</option>
       <option value="set_default">设为默认</option><option value="delete">删除组合</option></select></label>
-      <label>组合名称 *<input name="watchlist_name"></label><label>新名称<input name="new_name"></label>
+      <label>组合名称 *<input name="watchlist_name"></label><label>复制来源<input name="source_name"></label>
+      <label>新名称<input name="new_name"></label>
       <label class="span-2">证券代码<textarea name="symbols"></textarea></label>
       <button>保存</button></form><div class="table-scroll"><table><thead><tr>
       <th>名称</th><th>证券数</th><th>更新时间</th></tr></thead><tbody>{watch_rows}</tbody></table></div></section>
@@ -477,13 +531,13 @@ def _selectors(state: Phase6WebState) -> str:
     if universe_kind in {"MANUAL","COMBINED"}:
         manual = (
             '<label data-dynamic="manual">手动代码'
-            f'<textarea name="manual_symbols">{html.escape(",".join(state.universe_spec.manual_symbols))}'
+            f'<textarea name="manual_symbols" onchange="refreshPhase6Selectors(this)">{html.escape(",".join(state.universe_spec.manual_symbols))}'
             '</textarea></label>'
         )
     watchlist = ""
     if universe_kind in {"WATCHLIST","COMBINED"}:
         watchlist = (
-            '<label>自选股名称<input name="watchlist_names" '
+            '<label>自选股名称<input name="watchlist_names" onchange="refreshPhase6Selectors(this)" '
             f'value="{html.escape(",".join(state.universe_spec.watchlist_names))}"></label>'
         )
     scopes = ""
@@ -495,26 +549,26 @@ def _selectors(state: Phase6WebState) -> str:
             for value in ("沪深A股","上证A股","深证A股","创业板")
         )
         scopes = (
-            '<label>市场范围（可多选）<select name="market_scopes" multiple>'
+            '<label>市场范围（可多选）<select name="market_scopes" multiple onchange="refreshPhase6Selectors(this)">'
             f'{scope_options}</select></label>'
         )
     custom = ""
     if date_kind == "CUSTOM":
         custom = (
             '<div data-dynamic="custom" class="form-grid">'
-            f'<label>开始日期<input type="date" name="start_date" value="{html.escape(str(state.date_range_spec.start_date or ""))}"></label>'
-            f'<label>结束日期<input type="date" name="end_date" value="{html.escape(str(state.date_range_spec.end_date or ""))}"></label>'
+            f'<label>开始日期<input type="date" name="start_date" onchange="refreshPhase6Selectors(this)" value="{html.escape(str(state.date_range_spec.start_date or ""))}"></label>'
+            f'<label>结束日期<input type="date" name="end_date" onchange="refreshPhase6Selectors(this)" value="{html.escape(str(state.date_range_spec.end_date or ""))}"></label>'
             '</div>'
         )
     preset = "" if date_kind == "CUSTOM" else (
-        f'<label>数值<select name="date_value">{date_values}</select></label>'
+        f'<label>数值<select name="date_value" onchange="refreshPhase6Selectors(this)">{date_values}</select></label>'
     )
     return (
         f'<input type="hidden" name="account_profile_id" value="{html.escape(state.account_profile_id)}">'
         '<div class="selector-grid"><fieldset><legend>股票池 *</legend>'
-        f'<label>来源<select name="universe_kind">{universe_options}</select></label>'
+        f'<label>来源<select name="universe_kind" onchange="refreshPhase6Selectors(this)">{universe_options}</select></label>'
         f'{manual}{watchlist}{scopes}</fieldset><fieldset><legend>日期范围 *</legend>'
-        f'<label>预设<select name="date_kind">{date_options}</select></label>{preset}{custom}'
+        f'<label>预设<select name="date_kind" onchange="refreshPhase6Selectors(this)">{date_options}</select></label>{preset}{custom}'
         '<p class="hint">实际交易日及320交易日预热由Phase 5统一解析。</p>'
         '</fieldset></div>'
     )
@@ -548,10 +602,95 @@ def _runs(controller: Phase6Controller | None, state: Phase6WebState) -> str:
                     f'<input type="hidden" name="operation_token" value="{html.escape(state.resume_operation_token)}">'
                     '<button class="primary">从检查点恢复</button></form>'
                 )
+            summary = detail.summary
+            date_range = getattr(summary,"date_range",("",""))
+            metric_labels = {
+                "trade_date":"结果日期","cash":"模拟现金","equity":"总权益",
+                "exposure":"仓位敞口","stress":"压力值",
+                "realized_pnl":"已实现盈亏","unrealized_pnl":"未实现盈亏",
+            }
+            metrics = "".join(
+                f'<div><span>{html.escape(metric_labels.get(str(key),str(key)))}</span>'
+                f'<strong>{html.escape(str(value))}</strong></div>'
+                for key,value in getattr(summary,"metrics",())
+            )
+            result_counts = (
+                ("决策",len(getattr(detail,"decisions",()))),
+                ("订单",len(getattr(detail,"orders",()))),
+                ("成交",len(getattr(detail,"fills",()))),
+                ("持仓版本",len(getattr(detail,"positions",()))),
+            )
+            counts = "".join(
+                f'<div><span>{label}</span><strong>{value}</strong></div>'
+                for label,value in result_counts
+            )
+            decision_rows = [_row_mapping(row) for row in getattr(detail,"decisions",())]
+            breakdown = Counter(
+                (str(row.get("decision_type","未知")), str(row.get("status","未知")))
+                for row in decision_rows
+            )
+            breakdown_rows = "".join(
+                f'<tr><td>{html.escape(kind)}</td><td>{html.escape(status)}</td><td>{count}</td></tr>'
+                for (kind,status),count in sorted(breakdown.items())
+            ) or '<tr><td colspan="3">没有决策记录</td></tr>'
+            recent_decisions = "".join(
+                '<tr>'
+                f'<td>{html.escape(str(row.get("symbol","") or "全局"))}</td>'
+                f'<td>{html.escape(str(row.get("decision_type","")))}</td>'
+                f'<td>{html.escape(str(row.get("status","")))}</td>'
+                f'<td>{html.escape(_decision_reason(row))}</td></tr>'
+                for row in decision_rows[-50:]
+            ) or '<tr><td colspan="4">没有决策记录</td></tr>'
+            equity_by_date = dict(getattr(detail,"equity",()))
+            exposure_by_date = dict(getattr(detail,"exposure",()))
+            positions_by_date = dict(getattr(detail,"position_count",()))
+            equity_rows = "".join(
+                f'<tr><td>{html.escape(day)}</td><td>{html.escape(value)}</td>'
+                f'<td>{html.escape(exposure_by_date.get(day,""))}</td>'
+                f'<td>{html.escape(positions_by_date.get(day,""))}</td></tr>'
+                for day,value in tuple(equity_by_date.items())[-20:]
+            ) or '<tr><td colspan="4">没有日终权益快照</td></tr>'
+            outcome = (
+                '<p class="validation"><strong>本次没有生成订单。</strong>'
+                '决策节点已正常执行；下表展示评估类型、状态和拒绝原因。原因为空表示该节点完成但未形成交易请求。</p>'
+                if not getattr(detail,"orders",()) else
+                '<p class="message success">本次已生成订单，请查看订单与成交统计。</p>'
+            )
+            list_report_files = getattr(controller,"list_report_files",None)
+            files = list_report_files(state.run_id) if callable(list_report_files) else ()
+            file_links = "".join(
+                f'<li><a href="/adaptive-v13-report-file?run_id={html.escape(state.run_id)}'
+                f'&name={html.escape(item.name)}">{html.escape(item.name)}</a></li>'
+                for item in files if item.valid
+            ) or '<li>尚未生成报告</li>'
             detail_html = (
                 '<section class="panel"><h3>Run详情</h3>'
                 f'<p><code>{html.escape(state.run_id)}</code> '
-                f'<strong>{html.escape(detail.summary.status)}</strong></p>{resume}</section>'
+                f'<strong>{html.escape(summary.status)}</strong></p>'
+                '<div class="data-summary">'
+                f'<span>模式 <strong>{html.escape(getattr(summary,"mode",""))}</strong></span>'
+                f'<span>策略 <strong>{html.escape(getattr(summary,"strategy_version",""))}</strong></span>'
+                f'<span>日期 <strong>{html.escape(str(date_range[0]))}—{html.escape(str(date_range[1]))}</strong></span>'
+                f'<span>price_basis <strong>{html.escape(getattr(summary,"price_basis_id",""))}</strong></span>'
+                '</div>'
+                f'<h4>运行结果</h4><div class="account-summary">{metrics}{counts}</div>'
+                f'{outcome}'
+                '<h4>决策结果汇总</h4><div class="table-scroll"><table><thead><tr>'
+                '<th>决策类型</th><th>状态</th><th>数量</th></tr></thead>'
+                f'<tbody>{breakdown_rows}</tbody></table></div>'
+                '<details open><summary>最近决策及原因（最多50条）</summary>'
+                '<div class="table-scroll"><table><thead><tr><th>股票</th><th>类型</th>'
+                '<th>状态</th><th>原因</th></tr></thead>'
+                f'<tbody>{recent_decisions}</tbody></table></div></details>'
+                '<details open><summary>最近日终权益（最多20日）</summary>'
+                '<div class="table-scroll"><table><thead><tr><th>交易日</th><th>权益</th>'
+                '<th>仓位敞口</th><th>持仓数</th></tr></thead>'
+                f'<tbody>{equity_rows}</tbody></table></div></details>'
+                f'<h4>报告</h4><ul>{file_links}</ul>'
+                '<form method="post" action="/adaptive-v13-report">'
+                f'<input type="hidden" name="run_id" value="{html.escape(state.run_id)}">'
+                '<button>生成/刷新报告</button></form>'
+                f'{resume}</section>'
             )
         except Exception as exc:
             view = controller.get_error_view(exc)
@@ -596,6 +735,22 @@ def _optional_bool(value: str) -> bool | None:
     return None
 
 
+def _row_mapping(row) -> dict[str, object]:
+    return {str(key): value for key,value in row}
+
+
+def _decision_reason(row: Mapping[str, object]) -> str:
+    raw = row.get("reasons_json", "")
+    if raw:
+        try:
+            parsed = json.loads(str(raw))
+            if isinstance(parsed, list) and parsed:
+                return "、".join(map(str, parsed))
+        except ValueError:
+            return str(raw)
+    return "未形成交易请求"
+
+
 def _bounded_int(value: str, default: int, maximum: int) -> int:
     try:
         parsed = int(value)
@@ -614,7 +769,7 @@ def _filter_select(name: str, current: str, values: tuple[str,...]) -> str:
 
 def _error_notice(error: ErrorVM) -> str:
     detail = (
-        f'<details><summary>技术详情</summary>{html.escape(error.detail)}</details>'
+        f'<span class="error-detail">{html.escape(error.detail)}</span>'
         if error.detail else ""
     )
     return (
@@ -623,3 +778,25 @@ def _error_notice(error: ErrorVM) -> str:
         f'<span>{html.escape(error.action)}</span>{detail}'
         f'<small>correlation_id={html.escape(error.correlation_id)}</small></div>'
     )
+
+
+def _phase6_interaction_script(page: str) -> str:
+    target = json.dumps("/" + page)
+    return """<script>
+    function refreshPhase6Selectors(select) {
+      const form = select.form;
+      const params = new URLSearchParams(new FormData(form));
+      window.location.href = __TARGET__ + "?" + params.toString();
+    }
+    document.querySelectorAll('form[data-long-running="true"]').forEach((form) => {
+      form.addEventListener('submit', (event) => {
+        const submitter = event.submitter;
+        const progress = form.querySelector('.operation-progress');
+        if (progress) {
+          const label = submitter && submitter.textContent ? submitter.textContent.trim() : '操作';
+          progress.textContent = label + '已提交，正在处理，请勿重复点击或关闭页面…';
+        }
+        form.querySelectorAll('button').forEach((button) => button.disabled = true);
+      });
+    });
+    </script>""".replace("__TARGET__",target)

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 import json
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Callable, Iterable, Mapping
+
+import pandas as pd
 
 from stock_picker.user import WatchlistStore
 
@@ -18,6 +21,7 @@ from .phase6_controller import Phase6Controller
 from .phase6_profile_store import AccountProfileStore
 from .phase6_provider_registry import ProviderRegistry
 from .run_store import RunStore
+from .runtime_data_adapter import RuntimeDataAdapter, normalize_baostock_minute_frame
 
 
 def create_phase6_application(
@@ -64,14 +68,17 @@ def create_phase6_application(
         loaded_profiles = profiles.load()
 
     registry = provider_registry or ProviderRegistry.existing()
-    calendar = tuple(
-        trading_calendar or _production_calendar(registry,priorities,data_root)
-    )
+    if trading_calendar is None:
+        calendar, latest_available_date = _production_calendar(registry,priorities,data_root)
+    else:
+        calendar = tuple(trading_calendar)
+        latest_available_date = max(calendar, default=None)
     phase5 = service or Phase5Service(
         cache=MarketCache(data_root / "market_cache.sqlite3"),
         run_store=RunStore(data_root / "runs.sqlite3"),
         account_profiles=loaded_profiles,
         trading_calendar=calendar,
+        latest_available_date=latest_available_date,
         watchlist_loader=lambda name: (
             tuple(item.symbols) if (item := watches.get(name)) is not None else None
         ),
@@ -81,14 +88,18 @@ def create_phase6_application(
     return Phase6Controller(
         service=phase5,profile_store=profiles,watchlist_store=watches,
         provider_registry=registry,
-        dependency_factory=dependency_factory or _runtime_data_unavailable,
+        dependency_factory=dependency_factory or (
+            lambda run_id: RuntimeDataAdapter(
+                phase5.cache, phase5.run_store, run_id
+            ).dependencies()
+        ),
         paper_state_loader=paper_state_loader,
     )
 
 
 def _production_calendar(
     registry: ProviderRegistry, priorities: tuple[str,...], data_root: Path,
-) -> tuple[date,...]:
+) -> tuple[tuple[date,...], date]:
     """Use a persisted exchange calendar, fetching it read-only only when absent."""
     path = data_root / "trading_calendar.json"
     if path.is_file():
@@ -96,7 +107,11 @@ def _production_calendar(
             values = json.loads(path.read_text(encoding="utf-8"))
             parsed = tuple(sorted({date.fromisoformat(str(item)) for item in values}))
             if parsed:
-                return parsed
+                latest = _provider_latest_trade_date(registry, priorities)
+                cutoff = latest or max((item for item in parsed if item <= date.today()), default=None)
+                if cutoff is None:
+                    raise Phase5Error("INVALID_CONFIG","trading_calendar_no_completed_date")
+                return tuple(item for item in parsed if item <= cutoff), cutoff
         except (OSError,ValueError,TypeError):
             raise Phase5Error("INVALID_CONFIG","trading_calendar_cache_invalid") from None
     end = date.today() + timedelta(days=370)
@@ -116,12 +131,50 @@ def _production_calendar(
                 json.dumps([item.isoformat() for item in parsed],ensure_ascii=False),
                 encoding="utf-8",
             )
-            return parsed
+            if parsed:
+                latest = max(parsed)
+                return tuple(item for item in parsed if item <= latest), latest
     raise Phase5Error("INVALID_CONFIG","trading_calendar_provider_unavailable")
 
 
-def _runtime_data_unavailable(_run_id: str):
-    raise Phase5Error("DATA_NOT_READY", "runtime_data_adapter_not_prepared")
+def _provider_latest_trade_date(
+    registry: ProviderRegistry, priorities: tuple[str, ...]
+) -> date | None:
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    completed_cutoff = (
+        now.date() if now.time() >= time(15, 10) else now.date() - timedelta(days=1)
+    )
+    calendar_fallback: date | None = None
+    for descriptor in registry.partition_providers(
+        priorities, dataset_type="daily", frequency="1d", price_basis="RAW",
+    ):
+        method = getattr(descriptor.provider, "get_trade_dates", None)
+        if not callable(method):
+            continue
+        try:
+            values = method("20000101", completed_cutoff.strftime("%Y%m%d"))
+            parsed = [date.fromisoformat(str(item)[:10]) for item in values]
+        except Exception:
+            continue
+        available = [item for item in parsed if item <= completed_cutoff]
+        if available:
+            candidate = max(available)
+            calendar_fallback = max(calendar_fallback or candidate,candidate)
+            history = getattr(descriptor.provider,"get_history",None)
+            if not callable(history):
+                continue
+            try:
+                frame = history(
+                    "600000.SH",(candidate - timedelta(days=14)).strftime("%Y%m%d"),
+                    candidate.strftime("%Y%m%d"),adjust="",
+                )
+                column = "date" if "date" in frame.columns else "trade_date"
+                actual = pd.to_datetime(frame[column],errors="coerce").dropna()
+            except Exception:
+                continue
+            if not actual.empty:
+                return min(actual.max().date(),candidate)
+    return calendar_fallback
 
 
 def _partition_planner(registry: ProviderRegistry):
@@ -186,7 +239,12 @@ def _daily_fetch(method, symbol: str, start: str, end: str, adjusted_argument: b
 
 
 def _minute_fetch(method, symbol: str, start: str, end: str):
-    return lambda: method(symbol,start,end,period="5",adjust="")
+    def fetch():
+        frame = method(symbol,start,end,period="5",adjust="")
+        if isinstance(frame, pd.DataFrame) and "datetime" in frame:
+            return normalize_baostock_minute_frame(frame, symbol)
+        return frame
+    return fetch
 
 
 def _load_market_scope(

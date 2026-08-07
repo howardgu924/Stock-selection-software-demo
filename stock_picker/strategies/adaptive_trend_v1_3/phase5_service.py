@@ -48,6 +48,7 @@ class Phase5Service:
         self, *, cache: MarketCache, run_store: RunStore,
         account_profiles: Mapping[str, AccountProfile],
         trading_calendar: Iterable[object],
+        latest_available_date: object | None = None,
         watchlist_loader: Callable[[str], Iterable[str] | None] | None = None,
         market_scope_loader: Callable[[str], Iterable[str] | None] | None = None,
         partition_planner: Callable[[Any, Any, AccountProfile, RunMode], Sequence[PartitionRequest]] | None = None,
@@ -56,6 +57,7 @@ class Phase5Service:
         self.run_store = run_store
         self.account_profiles = dict(account_profiles)
         self.trading_calendar = tuple(trading_calendar)
+        self.latest_available_date = latest_available_date
         self.watchlist_loader = watchlist_loader
         self.market_scope_loader = market_scope_loader
         self.partition_planner = partition_planner
@@ -67,7 +69,10 @@ class Phase5Service:
     ) -> tuple[Any, Any, AccountProfile, RunMode]:
         profile = self._profile(account_profile_id)
         run_mode = RunMode(mode)
-        date_range = resolve_date_range(date_range_spec,self.trading_calendar)
+        date_range = resolve_date_range(
+            date_range_spec, self.trading_calendar,
+            latest_available_date=self.latest_available_date,
+        )
         universe = resolve_universe(
             universe_spec,watchlist_loader=self.watchlist_loader,
             market_scope_loader=self.market_scope_loader,current_positions=current_positions,

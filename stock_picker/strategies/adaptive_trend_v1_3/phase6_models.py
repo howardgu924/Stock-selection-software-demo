@@ -34,6 +34,18 @@ class AccountSummaryVM:
 
 
 @dataclass(frozen=True)
+class AccountSettingsVM:
+    account_profile_id: str
+    backtest_initial_cash: str
+    paper_cash: str
+    fee_schedule_id: str
+    base_currency: str
+    provider_priority: str
+    data_directory: str
+    report_directory: str
+
+
+@dataclass(frozen=True)
 class UniverseSelectionVM:
     specification: UniverseSpec
     candidate_symbols: tuple[str, ...]
